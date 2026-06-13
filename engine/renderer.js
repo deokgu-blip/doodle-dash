@@ -424,7 +424,7 @@ export class Renderer {
     // Pull the camera more to the +z side so the two legs straddling the cube
     // in depth (z = ±LEG_Z_OFFSET) are visibly separated (one near, one far),
     // not stacked dead-on. Keep it behind (-x) and above (+y) for the 3/4 chase.
-    const camX = x - 5.5;
+    const camX = x - 9.0;
     // SMOOTH VERTICAL FOLLOW: the body snaps up at each stair step (so the foot
     // never penetrates — structural 0). Tracking that snapped y directly jolts
     // the whole view ("화면이 튀어"). Easing a separate _camY toward the cube's
@@ -440,13 +440,15 @@ export class Renderer {
     // point BETWEEN the two lanes (biased to the player side so the player stays
     // dominant lower-centre). With no rival we keep the original single-lane aim.
     const racing = Math.abs(this.rivalLaneZ) > 1e-3;
-    const camY = this._camY + (racing ? 7.2 : 6.4);
-    const camZ = racing ? 9.5 : 8.0;
+    const camY = this._camY + (racing ? 12.0 : 11.0);
+    const camZ = racing ? 15.0 : 13.0;
     this.camera.position.set(camX, camY, camZ);
     // look-at z: 0 (single lane) OR a point ~35% of the way toward the rival lane
     // (between the lanes, player-biased) so both lanes are diagonally visible.
+    // Aim FURTHER ahead (x+4) so a long stretch of track recedes into frame
+    // (reference framing: small cube, long winding track visible ahead).
     const lookZ = racing ? this.rivalLaneZ * 0.35 : 0;
-    this.camera.lookAt(x + 1.5, this._camY - 1.0, lookZ);
+    this.camera.lookAt(x + 4.0, this._camY - 1.5, lookZ);
   }
 
   render() { this.renderer.render(this.scene, this.camera); }

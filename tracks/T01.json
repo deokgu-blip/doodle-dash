@@ -2,11 +2,15 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 26,
+  "finishX": 55,
   "segments": [
-    { "kind": "flat",   "length": 8,  "rough": 0.9 },
+    { "kind": "flat",   "length": 10, "rough": 0.9 },
     { "kind": "stairs", "length": 4,  "height": 0.9, "steps": 2, "rough": 0.9 },
-    { "kind": "flat",   "length": 18, "rough": 0.9 }
+    { "kind": "flat",   "length": 9,  "rough": 0.9 },
+    { "kind": "stairs", "length": 4,  "height": 0.6, "steps": 2, "rough": 0.9 },
+    { "kind": "flat",   "length": 13, "rough": 0.9 },
+    { "kind": "stairs", "length": 6,  "height": 1.2, "steps": 3, "rough": 0.9 },
+    { "kind": "flat",   "length": 17, "rough": 0.9 }
   ],
   "rival": { "legPreset": "limb", "pace": 1.0, "laneOffset": 7.0, "name": "BOLT" }
 }

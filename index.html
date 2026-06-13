@@ -124,6 +124,8 @@
 
   const game = new Game({ canvas: gl, drawCanvas: drawcanvas, hud });
   window.game = game;
+  // expose Matter for headless tuning harness (no effect on gameplay)
+  import('./engine/vendor/matter.module.js').then((m) => { window.Matter = m.default || m; });
 
   function resizeGL(){
     const r = gl.getBoundingClientRect();

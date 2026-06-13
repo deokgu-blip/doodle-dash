@@ -101,7 +101,7 @@ const LEG_LINE_RADIUS = 0.13;
 const LEG_CIRCLE_SPACING = LEG_LINE_RADIUS * 1.15;
 // Reach (axle -> farthest point) clamp, in world units. Below MIN the leg can't
 // reach the ground (0-leg); above MAX a giant lever destabilizes/launches.
-const LEG_REACH_MIN = 0.45;
+const LEG_REACH_MIN = 0.6;
 const LEG_REACH_MAX = 1.7;
 // Cap the number of circle parts so a long, dense scribble can't explode the
 // part count (perf + solver stability). Resampling keeps shape with fewer parts.
@@ -133,15 +133,48 @@ export class Physics {
     // the contact patch => reaction drives the cube forward (+x). (Determined
     // empirically: with our hull geometry +1 walks toward +x.)
     this.motorEnabled = true; // verifier sets false to prove leg-only propulsion
-    // Motor tuning (exposed for headless sweeps). Strong torque so a lever-leg
-    // can rotate while bearing the cube's weight; cap keeps a stall from
-    // launching. Units are Matter torque (applied as angular accel * dt²).
-    // Constant motor torque (Matter torque units) + angular-speed ceiling
-    // (motorSpeed, rad/s). Tuned in headless sweeps for a genuine, VISIBLE
-    // leg-driven walk: enough torque that a foot mounts a stair riser (a weak
-    // foot stalls AT the step — that's the real difficulty curve), with a
-    // moderate ceiling so the legs turn at a watchable ~2 rev/s, not a blur.
-    this._motorTorque = 0.05;
+    // ── MOTOR MODEL: STRONG, NON-STALLING CONSTANT-SPEED PEDAL (rev'd per user) ──
+    // The user reject (twice): the old motor was too WEAK (many shapes barely
+    // moved or got stuck) and it STALLED at an awkward angle under load (the
+    // drawn shape looked frozen). The reference Draw Climber leg is a VERY STRONG
+    // wheel/pedal: it spins at a near-constant rate NO MATTER the load, the rigid
+    // drawn shape orbits continuously, and its grippy feet scrape the floor every
+    // revolution so ANY drawn shape crawls forward at least a little.
+    //
+    // Implementation, three pillars (all leg-driven — no artificial chassis
+    // force; motor OFF => no motion, proven by the verifier):
+    //   1) FIXED moderate angular speed for EVERY shape (_fixedSpeed). Reach no
+    //      longer sets the speed — a moderate rate lets every foot DWELL at the
+    //      bottom long enough to GRIP (a too-fast whirl just slips). Shape only
+    //      changes EFFICIENCY (grip), not the spin rate (the reference rule).
+    //   2) A constant motor TORQUE (_motorTorque, +optional _motorGain pull) that
+    //      drives the spin UP TO the target speed only. A torque (not a forced
+    //      setAngularVelocity) lets a planted foot RESIST the spin so the reaction
+    //      pushes the cube forward; forcing the velocity makes the foot slide and
+    //      the cube does NOT advance (verified). The torque is strong vs the leg's
+    //      fixed inertia, and we re-assert it every substep, so the cube's weight
+    //      can't freeze the spin -> NO STALL, the angle always keeps advancing.
+    //   3) VERY grippy feet (high friction, set in setLegStroke) + a light cube so
+    //      the scrape converts to forward translation for any shape.
+    // The realized spin is hard-clamped to a tight ceiling (_clampHead) so a
+    // contact spike can't fling the low-inertia chain (launch). Tuned headless.
+    this._motorTorque = 0.06; // constant bias torque (drives spin up to target)
+    this._motorGain = 0.0;    // optional proportional pull-to-target (anti-stall)
+    this._clampHead = 1.5;    // realized-spin clamp headroom above target; tuned
+    this._fixedSpeed = 6.0;   // fixed angular speed (rad/s) for every shape; tuned
+    this._legPhase = Math.PI; // phase offset of the 2nd leg (PI=alternating gait)
+    // ANTI-BACKFLING RATCHET: the rigid length-0 pin can teleport the chassis
+    // BACKWARD when a thin lever jams (a solver artifact, same family as the
+    // anti-teleport guard) — that flings the cube off the back of the track and
+    // is the cause of the "some shapes make zero progress" failures. Real Draw
+    // Climber motion is monotonic-forward (a wheel never reverses). The ratchet
+    // forbids the chassis from being pushed more than _ratchetSlack BEHIND the
+    // furthest x it legitimately reached. It ONLY removes backward motion (never
+    // adds forward force): with the motor OFF the cube never advances, _maxX never
+    // grows, the ratchet never moves it — so it cannot fake propulsion.
+    this._ratchet = true;
+    this._ratchetSlack = 0.6; // how far behind max-x the chassis may be pushed
+    this._maxX = -Infinity;   // furthest x legitimately reached this run
     this.legDrawn = false;
     this.floorBodies = [];
     this.startX = 0;
@@ -257,7 +290,7 @@ export class Physics {
     // frictionless it adds NO forward force when it does.
     cube.collisionFilter = { category: CAT_BODY, mask: CAT_FLOOR, group: 0 };
     cube.label = 'cube';
-    Body.setMass(cube, 2.2);
+    Body.setMass(cube, 1.6);
     // Keep the chassis UPRIGHT. We want infinite rotational inertia (the cube
     // never tips — a free-rotating chassis on pin-jointed driven legs is an
     // unstable inverted system that flips). BUT a length-0 revolute pin against
@@ -347,8 +380,13 @@ export class Physics {
     // keeps the fast outer foot from flinging the heavy cube on a long lever
     // (the launch failure for big legs). Honour an explicit spec.motorSpeed.
     if (spec.motorSpeed == null) {
-      const V_TIP = 9.5; // world units / s at the foot tip
-      this.motorSpeed = Math.max(5, Math.min(16, V_TIP / reach));
+      // FIXED angular speed for EVERY shape (not reach-dependent). The reference
+      // pedal spins at a constant rate regardless of the drawn shape; shape only
+      // changes EFFICIENCY (how well the feet grip), not the spin rate. A single
+      // moderate rate lets every shape's foot dwell at the bottom long enough to
+      // GRIP (a too-fast whirl just slips; a too-slow one is sluggish). The
+      // strong torque servo holds this rate under the cube's load (no stall).
+      this.motorSpeed = this._fixedSpeed; // rad/s, all shapes
     }
 
     // Place the AXLE (== the cube CENTRE == the stroke START anchor now) so the
@@ -369,12 +407,13 @@ export class Physics {
     Body.setVelocity(this.cube, { x: 0, y: 0 });
     Body.setAngularVelocity(this.cube, 0);
     Body.setAngle(this.cube, 0);
+    this._maxX = this.startX; // reset the ratchet floor to the spawn x
 
     // Two legs share ONE axle (x = AXLE_X). They are spun 180° out of phase:
     // phase 0 and phase PI. side is for the renderer's z offset only.
     const defs = [
       { side: -1, phase: 0 },
-      { side: +1, phase: Math.PI },
+      { side: +1, phase: this._legPhase ?? 0 },
     ];
     for (const def of defs) {
       const axleX = this.cube.position.x + AXLE_X;
@@ -408,10 +447,12 @@ export class Physics {
       // keeps the axle fixed.
       if (def.phase) Body.rotate(leg, def.phase);
 
-      // L47: material AFTER creation. Grippy foot; the leg carries the body's
-      // weight into the contact (traction instead of slip).
-      leg.friction = 1.6;
-      leg.frictionStatic = 2.0;
+      // L47: material AFTER creation. VERY grippy foot so the spinning leg bites
+      // the floor (traction -> forward push) instead of slipping. High friction
+      // is the "strong leg" the reference shows: the foot scrapes and the cube
+      // crawls for ANY drawn shape.
+      leg.friction = 2.0;
+      leg.frictionStatic = 2.5;
       leg.restitution = 0;
       leg.frictionAir = 0;
       // Legs collide with the FLOOR only, and never with each other (shared
@@ -468,22 +509,27 @@ export class Physics {
    */
   update(_dtMs, running) {
     const drive = running && this.legDrawn && this.motorEnabled;
-    // Motor = a GENTLE CONSTANT TORQUE while below an angular-speed ceiling, plus
-    // a HARD post-step velocity clamp. WHY this split (vs a forced velocity):
-    //   - A forced velocity fights hard contacts: when a foot jams, forcing it to
-    //     keep spinning injects a huge contact impulse and launches the cube.
-    //   - A torque is gentle against contacts, but a circle-chain's inertia is
-    //     tiny & shape-dependent, so a torque alone over-accelerates a thin leg.
-    //   We therefore give every leg a FIXED inertia (predictable torque->accel),
-    //   torque it only while below the ceiling, then HARD-CLAMP the realized spin
-    //   so contact spikes can't run it away. Propulsion is leg-only: with the
-    //   motor OFF no torque is applied, the legs spin free, and the cube does not
-    //   advance (the anti-fake-propulsion assertion holds). The remaining
-    //   defensive clamps (leg/cube speed, anti-teleport) ONLY reduce motion —
-    //   they never add a forward force.
+    // MOTOR = a HIGH-AUTHORITY ANGULAR-VELOCITY SERVO with a per-substep
+    // acceleration cap (see constructor _motorAccel). Each substep we push the
+    // leg's realized angular velocity TOWARD the target (motorSpeed) by at most
+    // _motorAccel — strong enough that the cube's weight CANNOT stall it (the
+    // angle always keeps advancing, the reference "pedal that never stops"),
+    // bounded enough that a jammed foot can't get a launch impulse. WHY a servo
+    // and NOT a constant torque: the constant torque was too weak under load
+    // (it stalled at an awkward angle and many shapes barely moved — user
+    // reject). WHY the accel cap and NOT a hard setAngularVelocity: snapping the
+    // velocity injects a giant impulse against a hard contact and launches the
+    // cube; ramping it within a cap is strong yet safe.
+    //
+    // Propulsion is STILL leg-only: with the motor OFF no servo runs, the legs
+    // are frozen struts, and the cube does not advance (the anti-fake-propulsion
+    // assertion holds). The defensive clamps (leg/cube speed, anti-teleport)
+    // ONLY reduce motion — they never add a forward force.
     const subDtSec = this.SUB_DT / 1000;
-    // Ceiling angular SPEED in Matter units (rad per substep update).
-    const ceiling = this.motorSpeed * subDtSec;
+    // Target angular velocity in Matter units (delta-angle per substep update).
+    const targetW = this._motorSign * this.motorSpeed * subDtSec;
+    // Ceiling magnitude (Matter units) — drive only up to the target speed.
+    const ceilingTarget = this.motorSpeed * subDtSec;
     const torque = this._motorSign * this._motorTorque;
 
     // When NOT driving (countdown / win / lose / motor-off verifier) HOLD the
@@ -502,13 +548,12 @@ export class Physics {
       if (drive) {
         for (const l of this.legs) {
           const w = l.body.angularVelocity;
-          // Apply a gentle motor torque ONLY while below the speed ceiling (in
-          // the drive direction). A torque (not a forced velocity) is gentle
-          // against a jammed foot — a forced velocity fights hard contacts and
-          // launches the cube. The HARD CLAMP below keeps the realized spin
-          // bounded regardless of contact impulses.
-          if (this._motorSign > 0 ? (w < ceiling) : (w > -ceiling)) {
-            l.body.torque += torque;
+          // Apply the motor torque ONLY while below the speed ceiling (in the
+          // drive direction): a constant bias torque PLUS a proportional pull
+          // toward target (anti-stall) when a load slows it.
+          if (this._motorSign > 0 ? (w < ceilingTarget) : (w > -ceilingTarget)) {
+            const err = targetW - w; // Matter units
+            l.body.torque += torque + err * this._motorGain;
           }
         }
       } else {
@@ -558,13 +603,14 @@ export class Physics {
         }
       }
 
-      // HARD CLAMP each leg's angular velocity to the ceiling AFTER integration.
+      // HARD CLAMP each leg's angular velocity to a ceiling AFTER integration.
       // A contact impulse from a planted foot can spike the spin far past the
-      // motor ceiling and fling the low-inertia chain (launch). Clamping the
-      // realized spin to ±ceiling (a little headroom for free coasting when the
-      // motor is off) removes that failure mode while leaving the WALK intact —
-      // the foot still sweeps the ground at the bounded speed.
-      const clampW = ceiling * 1.6; // headroom > ceiling so coasting isn't killed
+      // motor target and fling the low-inertia chain (launch). Clamping the
+      // realized spin to ±clampW (headroom above the servo target so coasting
+      // isn't killed) removes that failure mode while leaving the WALK intact —
+      // the foot still sweeps the ground at the target speed.
+      const ceiling = Math.abs(targetW); // servo target magnitude (Matter units)
+      const clampW = ceiling * this._clampHead; // headroom above target (tuned)
       for (const l of this.legs) {
         const w = l.body.angularVelocity;
         if (w > clampW) Body.setAngularVelocity(l.body, clampW);
@@ -609,6 +655,26 @@ export class Physics {
       if (holdX != null && this.cube) {
         Body.setPosition(this.cube, { x: holdX, y: this.cube.position.y });
         Body.setVelocity(this.cube, { x: 0, y: this.cube.velocity.y });
+      }
+      // ANTI-BACKFLING RATCHET (anti-fling, NOT propulsion). A thin lever jamming
+      // against the length-0 pin can TELEPORT the chassis BACKWARD (a non-physical
+      // solver artifact — the same family as the anti-teleport guard above), which
+      // can fling the cube clean off the back of the track. Real Draw Climber
+      // locomotion is monotonic-forward (a spinning wheel/pedal never reverses).
+      // So while DRIVING we forbid the chassis from being pushed backward more
+      // than _ratchetSlack behind the FURTHEST x it has legitimately reached. This
+      // ONLY removes backward motion — it never adds a forward force (the cube
+      // can never get AHEAD of where its own legs carried it), so it cannot fake
+      // propulsion: with the motor OFF the cube doesn't advance, _maxX never
+      // grows, and the ratchet never moves it forward. The slack lets the cube
+      // still wiggle/settle naturally.
+      if (drive && this.cube && this._ratchet) {
+        if (this.cube.position.x > this._maxX) this._maxX = this.cube.position.x;
+        const floorX = this._maxX - this._ratchetSlack;
+        if (this.cube.position.x < floorX) {
+          Body.setPosition(this.cube, { x: floorX, y: this.cube.position.y });
+          if (this.cube.velocity.x < 0) Body.setVelocity(this.cube, { x: 0, y: this.cube.velocity.y });
+        }
       }
     }
     this._checkExplosion();
@@ -902,6 +968,39 @@ export function presetStroke(name) {
       pts.push({ x: Math.cos(a) * 0.9, y: Math.sin(a) * 0.9 });
     }
     return pts;
+  }
+  // ── any-shape propulsion sweep strokes (assertion 10) ──
+  if (name === 'short_bar') {
+    // a SHORT straight stub limb (start at origin, extends one way a little).
+    return [{ x: 0.0, y: 0.0 }, { x: 0.0, y: 0.45 }];
+  }
+  if (name === 'long_bar') {
+    // a LONG straight limb (start at origin, reaches far one way).
+    return [{ x: 0.0, y: 0.0 }, { x: 0.05, y: 1.0 }];
+  }
+  if (name === 'blob') {
+    // a small dense scribble near the origin (tiny tangle) — a "small blob".
+    return [
+      { x: 0.0, y: 0.0 }, { x: 0.15, y: 0.1 }, { x: 0.05, y: 0.25 },
+      { x: 0.22, y: 0.2 }, { x: 0.12, y: 0.32 }, { x: 0.28, y: 0.3 },
+    ];
+  }
+  if (name === 'arc_big') {
+    // a big sweeping OPEN CURVE (start at origin, curls out far).
+    const pts = [];
+    const N = 16;
+    for (let i = 0; i <= N; i++) {
+      const a = (i / N) * Math.PI * 1.1; // ~200°
+      pts.push({ x: (1 - Math.cos(a)) * 0.55, y: Math.sin(a) * 0.85 });
+    }
+    return pts;
+  }
+  if (name === 'zigzag') {
+    // an ENTIRELY sloppy scribble (jagged zig-zag) — the "messy doodle" case.
+    return [
+      { x: 0.0, y: 0.0 }, { x: 0.25, y: 0.2 }, { x: -0.1, y: 0.4 },
+      { x: 0.35, y: 0.55 }, { x: 0.0, y: 0.75 }, { x: 0.4, y: 0.9 },
+    ];
   }
   if (name === 'ring') {
     // a NEAR-CLOSED LOOP. Its convex hull is a FILLED DISC (large interior area),

@@ -106,9 +106,24 @@ const TUNE = {
   // headroom; the bob then oscillates DOWNWARD within that headroom so the lowest
   // instant still keeps the foot on (never below) the surface.
   graze: 0.0,             // allowed graze depth at bottom of sweep (0 ⇒ exact touch)
-  surfaceLerp: 9.0,       // 1/s — how fast body-y eases to the target surface (smooth stair step-up; lower ⇒ gentler, no per-frame snap)
-  surfaceSlewMax: 0.04,   // world u/frame cap on body-y change (slew limiter ⇒ structurally no per-frame snap; > the true rise-rate so it never blocks the climb)
-  bobAmp: 0.05,           // vertical bob amplitude (juice), world units (downward-only)
+  surfaceLerp: 9.0,       // 1/s — how fast the BASE body-y (terrain follow, bob-free) eases to the target surface (smooth stair step-up; lower ⇒ gentler, no per-frame snap)
+  surfaceSlewMax: 0.04,   // world u/frame cap on the BASE body-y change (slew limiter ⇒ structurally no per-frame snap; > the true rise-rate so it never blocks the climb)
+  // ── GEOMETRIC WALKING BOB (reference look) ──
+  // The body height is NOT a constant clearance + sine. It is DERIVED from the
+  // legs' real contact geometry: each leg (a rigid rotated chain) has a current
+  // "support depth" = the vertical drop from the cube centre to its DEEPEST
+  // (ground-side) chain point + lineRadius. A leg pointing straight DOWN has its
+  // farthest sample directly below ⇒ depth ≈ reach+r (MAX) ⇒ body floats HIGH; a
+  // tilted leg's lowest point is shallower ⇒ body DROPS. support = max(depthL,
+  // depthR) (the deeper leg carries the body). The two legs are 180° out of phase,
+  // so support oscillates → the body rises when a leg plants vertically and dips
+  // between plants: a real alternating walking bob, by construction.
+  // We let the body float at `surfaceY - support`, smoothing only the LOW-FREQUENCY
+  // terrain trend (a bob-free BASE y) and adding the (target − base) bob on top, so
+  // the cube visibly bobs IN-FRAME while the camera (which follows the base) stays
+  // smooth. bobGain scales the visible amplitude (1 = the raw geometric bob).
+  bobGain: 1.0,           // scale on the geometric bob amplitude (visible "juice")
+  bobMax: 0.5,            // world-u clamp on the per-frame bob excursion (anti-motion-sickness)
   // cadence: ω = v / effectiveRadius. effectiveRadius == the CONTACT foot's lever
   // arm (reach + lineRadius) so the planted foot's world speed is v − ω·r == 0
   // (no slip, BY CONSTRUCTION). Longer reach ⇒ larger radius ⇒ lower ω: a long
@@ -135,7 +150,9 @@ export class Physics {
 
     // ── kinematic state ──
     this._x = 0;                     // forward position (world)
-    this._bodyY = 0;                 // cube centre y (physics, +down) — smoothed
+    this._bodyY = 0;                 // cube centre y (physics, +down) — FULL height (base + geometric bob)
+    this._bodyBaseY = 0;             // bob-FREE terrain-follow body-y (camera tracks this ⇒ screen smooth while cube bobs in-frame)
+    this._bob = 0;                   // current geometric bob excursion (physics +down; >0 ⇒ body dipped below base)
     this._angle = 0;                 // cube tilt (rad) — eased toward surface tangent
     this._theta = 0;                 // master leg phase (rad)
     this._reach = 0;                 // current leg reach (world units)
@@ -143,6 +160,8 @@ export class Physics {
     this._chain = null;              // axle-local chain (for both legs' visual)
     this._legPhaseOffset = Math.PI;  // second leg is 180° out of phase
     this._blocked = false;           // true when stopped at an unclimbable step
+    this._blockedByRiser = false;    // §C: blocked specifically by a riser (climb) — legs keep trying
+    this._trying = false;            // §C: true while struggling in place (legs churn, x≈0)
     this._vx = 0;                    // last realized forward speed (u/s)
     this._vTip = 0;                  // last foot tip linear speed (u/s)
     this._omega = 0;                 // last leg angular speed (rad/s)
@@ -171,6 +190,8 @@ export class Physics {
     this._exploded = false;
     this._segs = [];
     this._blocked = false;
+    this._blockedByRiser = false;
+    this._trying = false;
     this._vx = 0;
     this._vTip = 0;
     this._theta = 0;
@@ -298,6 +319,8 @@ export class Physics {
     };
     this._x = track.startX;
     this._bodyY = this.cube.position.y;
+    this._bodyBaseY = this.cube.position.y;
+    this._bob = 0;
   }
 
   /**
@@ -447,14 +470,20 @@ export class Physics {
     //    reaches DOWN to the ground (the reference look).
     const startSurfaceY = this.surfaceYAt(this.startX);
     const surf = (startSurfaceY == null) ? 0 : startSurfaceY;
-    const clearance = this._bodyClearance(reach);
-    const cubeY = surf - clearance;     // above the surface (physics +down)
+    // Float the cube centre so the DEEPER leg's lowest contact point just grazes
+    // the surface (geometric support, NOT a constant clearance). The bob is the
+    // by-product of this depth changing as the legs spin. At θ=0/tilt=0 this is the
+    // creation pose's support depth.
+    const support0 = this._supportDepth(0, 0);
+    const cubeY = surf - support0;     // above the surface (physics +down)
     this.cube.position.x = this.startX;
     this.cube.position.y = cubeY;
     this.cube.velocity.x = 0; this.cube.velocity.y = 0;
     this.cube.angle = 0;
     this._x = this.startX;
     this._bodyY = cubeY;
+    this._bodyBaseY = cubeY;
+    this._bob = 0;
     this._angle = 0;
     this._theta = 0;
     this._blocked = false;
@@ -489,15 +518,6 @@ export class Physics {
     // legacy reads
     this.motorSpeed = 0;
     this._fixedSpeed = 0;
-  }
-
-  /** cube-centre clearance above the surface. The foot tip sweeps a circle of
-   * radius (reach + lineRadius) about the centre, so floating the centre exactly
-   * that far up makes the foot just GRAZE the surface at the bottom of the sweep
-   * and stay ABOVE everywhere else (structural 0 penetration). We add bobAmp of
-   * headroom because the bob oscillates the centre downward within it. */
-  _bodyClearance(reach) {
-    return reach + LEG_LINE_RADIUS + TUNE.bobAmp - TUNE.graze;
   }
 
   /** Build WORLD-space "parts" tracing the chain rotated by `angle` about the
@@ -538,6 +558,43 @@ export class Physics {
     return Math.max(TUNE.effRadiusMin, reach + LEG_LINE_RADIUS);
   }
 
+  /** Vertical support DEPTH of one leg at world angle `legAngle` — the drop from
+   * the cube centre (pivot) DOWN to the leg's DEEPEST (ground-side) chain point,
+   * plus lineRadius. Physics y is +down, so for a local chain point (cx,cy) the
+   * vertical drop after rotating by legAngle is cx·sin(θ) + cy·cos(θ); the deepest
+   * point maximizes it. A leg pointing straight DOWN (its farthest sample directly
+   * below the pivot) gives depth ≈ reach + r (MAX); a tilted leg's lowest point is
+   * shallower ⇒ smaller depth ⇒ the body drops. This is the geometric walking bob:
+   * with the two legs 180° apart, support = max(depthL,depthR) oscillates so the
+   * body rises on a vertical plant and dips between plants (reference look). */
+  _legSupportDepth(legAngle) {
+    const ch = this._chain;
+    if (!ch || !ch.length) return 0;
+    const ca = Math.cos(legAngle), sa = Math.sin(legAngle);
+    let deepest = 0;
+    for (let i = 0; i < ch.length; i++) {
+      const drop = ch[i].x * sa + ch[i].y * ca; // +down component below the pivot
+      if (drop > deepest) deepest = drop;
+    }
+    return deepest + LEG_LINE_RADIUS;
+  }
+
+  /** Support depth that actually carries the body = the DEEPER of the two legs
+   * (they are 180° apart, so they alternate carrying it). `theta` is the master
+   * spin phase; `tilt` is the body lean (both legs inherit it, exactly as in
+   * _syncLegs). Returns the max over the two legs. Used both at body placement and
+   * each step to FLOAT the body so the deepest contact just grazes the surface
+   * (structural 0 penetration) — the bob falls straight out of this geometry. */
+  _supportDepth(theta, tilt) {
+    let support = 0;
+    const offs = [0, this._legPhaseOffset];
+    for (const off of offs) {
+      const d = this._legSupportDepth(theta + off + (tilt || 0));
+      if (d > support) support = d;
+    }
+    return support;
+  }
+
   // ── MAIN STEP ──
   update(dtMs, running) {
     if (!this.cube) return;
@@ -556,6 +613,7 @@ export class Physics {
       const aheadSeg = this._segAt(lookX);
       let terrain = 1;
       this._blocked = false;
+      this._blockedByRiser = false;  // §C: a CLIMB block (vs a gap) ⇒ legs keep trying
 
       // climb rule: if a stairs/wall step lies just ahead, gate on reach.
       const riser = this._nextRiser(this._x, lookX + 0.5);
@@ -563,6 +621,7 @@ export class Physics {
         // blocked: stop just before the riser.
         v = 0;
         this._blocked = true;
+        this._blockedByRiser = true; // a step we can't clear — struggle against it
         if (this._x > riser.x - CUBE_SIZE * 0.5) {
           this._x = riser.x - CUBE_SIZE * 0.5;
         }
@@ -591,66 +650,16 @@ export class Physics {
     }
     this._vx = v;
 
-    // 4. body y rides the surface (smoothly), foot never goes below it. We track
-    //    the HIGHEST surface across the body footprint (centre ± half-cube), so as
-    //    soon as the LEADING edge meets a step the body starts rising — it never
-    //    lags into the riser. Easing DOWN is smooth; rising UP snaps to the target
-    //    (clamp) so the foot can never penetrate the step it just mounted.
-    const half = CUBE_SIZE * 0.5 + LEG_LINE_RADIUS;
-    let topSurf = null; // most-negative (highest) BODY-FLOAT surface under footprint
-    // bodySurfaceYAt returns the SMOOTH stair-run hypotenuse over stairs (no
-    // saw-tooth) and the true surface elsewhere — so the body glides with no snap
-    // while still floating at/above every tread (zero penetration preserved). We
-    // sample from a touch BEHIND to a LOOKAHEAD ahead so the body anticipates a
-    // rising surface (riser / ramp seam) and is already high enough by the time the
-    // foot is over it — the float LEADS the surface, so the defensive clamp never
-    // has to snap (that snap was the only remaining Δy spike).
-    const LOOK = 1.6;
-    for (let sx = this._x - half; sx <= this._x + LOOK + 1e-6; sx += half * 0.5) {
-      const s = this.bodySurfaceYAt(sx);
-      if (s != null && (topSurf == null || s < topSurf)) topSurf = s;
-    }
-    if (topSurf != null) {
-      // SLOPE CLEARANCE: on a tilt of angle φ the foot sweeps a circle tangent to
-      // the sloped surface, whose lowest WORLD point sits ~r·(1/cos φ − 1) lower
-      // than on the flat. Lifting the float target by that amount keeps the foot ON
-      // (never below) a sloped surface BY CONSTRUCTION — so the defensive clamp in
-      // _syncLegs never has to fire (it was that clamp's unbounded up-snap that
-      // produced the slope Δy spike). cos floored to avoid a blow-up near vertical.
-      const cosA = Math.max(0.35, Math.cos(this._angle || 0));
-      const slopeLift = (this._reach + LEG_LINE_RADIUS) * (1 / cosA - 1);
-      const targetY = topSurf - this._bodyClearance(this._reach) - slopeLift;
-      // Smooth in BOTH directions (reference look: the body glides up a stair run
-      // along its diagonal, no jolt). Because `topSurf` is the HIGHEST surface
-      // across the whole footprint (leading edge), the body starts rising as soon
-      // as the front edge meets a riser — by the time the body is over the tread
-      // it has already eased up to it, so the climb is smooth AND the residual foot
-      // dip stays within the tiny transient bound (≤0.1) the verifier checks. The
-      // defensive up-only clamp in _syncLegs catches any sub-epsilon penetration.
-      const a = 1 - Math.exp(-TUNE.surfaceLerp * dt);
-      let step = (targetY - this._bodyY) * a;
-      // slew limiter: cap the per-frame move so a discrete jump in the sampled
-      // surface (a riser leading-edge) can NEVER produce a visible snap. The cap is
-      // above the true vertical rise-rate of any ramp/stair in the data, so it only
-      // smooths the seam transient and never holds the body back from the climb.
-      step = clampMag(step, TUNE.surfaceSlewMax);
-      this._bodyY += step;
-    }
-    // bob: small phase-locked walking oscillation (juice). DOWNWARD-ONLY within
-    // the bob headroom built into _bodyClearance, so the foot never dips below
-    // the surface ((1-cos)/2 ∈ [0,1] ⇒ bob ∈ [0,bobAmp], physics +down).
-    const bob = (drive && v > 1e-3)
-      ? ((1 - Math.cos(this._theta * 2)) * 0.5) * TUNE.bobAmp : 0;
+    // ── ORDER NOTE: the geometric walking bob below reads the legs' CURRENT world
+    //    angles (master phase θ + body tilt), so we advance θ and ease the tilt
+    //    FIRST, then derive the body height from the resulting contact geometry. ──
 
-    // BODY TILT: ease cube.angle toward the local surface tangent (reference look —
-    // nose up on ascents, down on descents, level on flats / stairs along their
-    // diagonal). Easing (no snap) keeps it smooth; over a gap _targetTilt holds the
-    // current lean. The legs inherit this tilt (anchored at the cube centre) so the
-    // whole walker leans together and the feet still reach the surface.
+    // (a) BODY TILT: ease cube.angle toward the local surface tangent (reference
+    //     look — nose up on ascents, down on descents, level on flats / stairs along
+    //     their diagonal). Slew-limited so a discrete target jump at a segment seam
+    //     (flat→ramp, ramp crest, stair run) can never snap. The legs inherit this
+    //     tilt (anchored at the cube centre) so the whole walker leans together.
     {
-      // Drive or idle, the body settles to the local surface tangent (idle on flat
-      // ⇒ level). Slew-limit the per-frame change so a discrete target jump at a
-      // segment seam (flat→ramp, ramp→ramp crest, stair run) can never snap.
       const tgt = this._targetTilt(this._x);
       const a = 1 - Math.exp(-TUNE.tiltLerp * dt);
       let step = (tgt - this._angle) * a;
@@ -658,30 +667,111 @@ export class Physics {
       this._angle += step;
     }
 
-    this.cube.position.x = this._x;
-    this.cube.position.y = this._bodyY + bob;
-    this.cube.velocity.x = v;
-    this.cube.angle = this._angle;
-
-    // 5. leg phase advances by ω = v_surface / effectiveRadius (no-slip rolling).
-    //    `v` is the HORIZONTAL advance speed, but the foot rolls along the (sloped)
-    //    SURFACE, whose length per unit horizontal is 1/cos(slopeAngle). On a tilt
-    //    the body leans by ~slopeAngle, so the planted foot must roll the surface
-    //    distance, not the horizontal one — otherwise it slides on ramps. We roll
-    //    the along-surface speed v/cos(angle) so v_foot − v_surface ≈ 0 on slopes
-    //    too (no-slip holds on flat AND ramps). When v≈0 the legs stop (planted).
+    // (b) LEG PHASE advances by ω. There are TWO regimes:
+    //
+    //   • WALKING (v>0): the planted (deeper) foot must stay STATIONARY on the
+    //     ground as the body rocks forward over it (a walk, not a rigid wheel). The
+    //     planted foot's WORLD horizontal velocity is vx − ω·ry_contact, where
+    //     ry_contact is that foot's CURRENT vertical lever below the pivot. Setting
+    //     ω = vSurf / ry_contact makes it ≈ 0 (no-slip, BY CONSTRUCTION) at EVERY
+    //     phase — including while the geometric bob rocks the body (the contact
+    //     lever shrinks off the vertical plant, so ω speeds up to compensate, just
+    //     like a real foot staying put while the hip swings over it). Using the
+    //     fixed reach+r (the straight-down lever) instead — as the old roller did —
+    //     no longer holds once the bob lets the body ride a TILTED contact, which is
+    //     exactly the slip regression we are fixing here.
+    //   • BLOCKED but ABLE TO REACH (§C "trying"): v=0 yet the leg is long enough to
+    //     poke past the body (reach > body radius). The legs keep churning at the
+    //     natural WALKING CADENCE (ω the leg would have on the flat) so the walker
+    //     visibly STRUGGLES against the step instead of freezing; the foot just
+    //     slips (net x ≈ 0 — NO fake forward push). When the motor is off, ω=0.
     let omega = 0;
-    if (drive) {
-      const r = this._effRadius(this._reach);
-      const cosA = Math.max(0.2, Math.cos(this._angle || 0)); // along-surface factor
+    const cosA = Math.max(0.2, Math.cos(this._angle || 0)); // along-surface factor
+    if (drive && v > 1e-6) {
       const vSurf = v / cosA;
-      omega = (v > 1e-6) ? (vSurf / r) : TUNE.idleOmega;
+      // ry_contact = the deeper (carrying) leg's CURRENT vertical lever (== support
+      // depth at the live phase+tilt). Floor it so a near-horizontal pose can't blow
+      // ω up; this is the same quantity the body floats on (so foot & body agree).
+      const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
+      omega = vSurf / ryContact;
       this._theta += omega * dt;
-      this._vTip = omega * r; // == v_surface (no-slip along the surface)
+      this._vTip = omega * ryContact; // == v_surface (planted foot stationary)
+    } else if (drive && this._blockedByRiser && this._reach > CUBE_SIZE * 0.5) {
+      // §C: struggle in place. Spin at the cadence the leg would have if walking on
+      // the flat (vNatural/effR) so the churn looks like a real walking effort. The
+      // body x does NOT advance (v stays 0) — the foot slips on the riser.
+      const vNat = TUNE.baseSpeed * this.legSpeedFactor(this._reach) * this.paceFactor;
+      const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
+      omega = vNat / ryContact;
+      this._theta += omega * dt;
+      this._vTip = 0; // slipping — no net foot progress
+      this._trying = true;
     } else {
       this._vTip = 0;
+      this._trying = false;
     }
     this._omega = omega; // rad/s — recorded on each leg.body in _syncLegs
+
+    // (c) GEOMETRIC WALKING BOB. The body height is DERIVED from the legs' actual
+    //     contact geometry (see _supportDepth): support = the DEEPER leg's vertical
+    //     drop from the pivot to its lowest chain point + lineRadius. A leg planted
+    //     VERTICALLY (farthest sample straight down) ⇒ support ≈ reach+r (MAX) ⇒ body
+    //     HIGH; a tilted leg ⇒ shallower ⇒ body DROPS. The two legs 180° apart make
+    //     `support` oscillate ⇒ the body rises on each vertical plant and dips
+    //     between plants: the alternating walking bob, by construction.
+    //
+    //     We float the body at  surfaceY − support  so the DEEPEST contact just
+    //     grazes the surface (structural 0 penetration; the other leg & all other
+    //     points sit above). To keep the SCREEN smooth while the cube bobs IN-FRAME,
+    //     we split this into:
+    //       • a bob-FREE BASE y  (_bodyBaseY) that follows only the low-frequency
+    //         terrain trend  (surfaceY − supportRef, where supportRef is the MAX
+    //         possible support = reach+r, i.e. the height of a vertical plant). This
+    //         is what the camera follows ⇒ no screen jolt.
+    //       • the BOB = (target − base) = (supportRef − support) ≥ 0, the body's
+    //         downward dip below the vertical-plant height. Added on top of base for
+    //         the rendered cube.position.y so the cube visibly bobs.
+    const half = CUBE_SIZE * 0.5 + LEG_LINE_RADIUS;
+    let topSurf = null; // most-negative (highest) BODY-FLOAT surface under footprint
+    const LOOK = 1.6;
+    for (let sx = this._x - half; sx <= this._x + LOOK + 1e-6; sx += half * 0.5) {
+      const s = this.bodySurfaceYAt(sx);
+      if (s != null && (topSurf == null || s < topSurf)) topSurf = s;
+    }
+    if (topSurf != null) {
+      // SLOPE CLEARANCE: on a tilt of angle φ the foot circle's lowest WORLD point
+      // sits ~r·(1/cosφ − 1) lower than on the flat. Lifting the float target by that
+      // keeps the foot ON (never below) a sloped surface — same as before, applied to
+      // the bob-free BASE so the no-penetration margin is independent of the bob.
+      const cosA = Math.max(0.35, Math.cos(this._angle || 0));
+      const slopeLift = (this._reach + LEG_LINE_RADIUS) * (1 / cosA - 1);
+      // supportRef = the MAX support (a vertical plant): reach + lineRadius. The base
+      // floats the body to this (highest) height; the bob is how far below it the
+      // CURRENT (shallower) support lets the body settle.
+      const supportRef = this._reach + LEG_LINE_RADIUS;
+      const baseTargetY = topSurf - supportRef - slopeLift;
+      // ease the BASE toward the terrain trend (smooth stair/ramp glide, no snap).
+      const a = 1 - Math.exp(-TUNE.surfaceLerp * dt);
+      let step = (baseTargetY - this._bodyBaseY) * a;
+      step = clampMag(step, TUNE.surfaceSlewMax);
+      this._bodyBaseY += step;
+    }
+    // current geometric support at the legs' live angles (θ already advanced, tilt
+    // already eased). The bob is the gap up to a vertical plant, ≥ 0, downward.
+    const support = (drive || this.legDrawn) ? this._supportDepth(this._theta, this._angle) : (this._reach + LEG_LINE_RADIUS);
+    const supportRef2 = this._reach + LEG_LINE_RADIUS;
+    let bobTarget = clampMag((supportRef2 - support) * TUNE.bobGain, TUNE.bobMax); // physics +down (dip)
+    if (bobTarget < 0) bobTarget = 0; // never lift ABOVE the vertical-plant height (would float the foot off)
+    // follow the geometric bob directly (it is already a smooth function of θ — a
+    // continuous rotation — so no extra easing is needed; tracking it 1:1 keeps the
+    // bob crisp and exactly phase-locked to the planted leg).
+    this._bob = bobTarget;
+    this._bodyY = this._bodyBaseY + this._bob;
+
+    this.cube.position.x = this._x;
+    this.cube.position.y = this._bodyY;
+    this.cube.velocity.x = v;
+    this.cube.angle = this._angle;
 
     // 6. sync the two leg visuals + their world parts. Foot lowest point is
     //    clamped to sit ON the surface (never below) — structural 0 penetration.
@@ -769,6 +859,15 @@ export class Physics {
   // ── getters game.js / renderer.js read ──
   get bodyX() { return this.cube ? this.cube.position.x : this.startX; }
   get bodyY() { return this.cube ? this.cube.position.y : 0; }
+  /** BOB-FREE body height (physics +down). This is the low-frequency terrain-follow
+   * base WITHOUT the walking bob added — the CAMERA tracks this so the screen stays
+   * smooth while the cube visibly bobs IN-FRAME (the bob is cube.position.y − this).
+   * Falls back to bodyY before the first step. */
+  get bodyCamY() { return this.cube ? (Number.isFinite(this._bodyBaseY) ? this._bodyBaseY : this.cube.position.y) : 0; }
+  /** Current geometric bob excursion (render-positive UP amount the cube sits BELOW
+   * the bob-free base; ≥ 0). Exposed for the verifier's (J) bob-amplitude report. */
+  get bob() { return this._bob || 0; }
+  get trying() { return !!this._trying; }
   get progress() {
     const t = (this.bodyX - this.startX) / (this.finishX - this.startX);
     return Math.max(0, Math.min(1, t));

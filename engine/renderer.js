@@ -42,7 +42,11 @@ const RIBBON_DX = 0.5;
 // Two legs straddle the cube in DEPTH (z). The cube is ~1.08 deep; legs sit
 // just outside its faces so they clearly read as a left and a right leg.
 const LEG_THICK = 0.30;       // per-leg extrusion depth (slim — two legs, not 1 wheel)
-const LEG_Z_OFFSET = 0.62;    // z distance of each leg from the cube center
+// z distance of each leg from the cube centre. Widened (was 0.62) so the two legs
+// sit CLEARLY to the LEFT (z<0) and RIGHT (z>0) of the cube instead of piling up in
+// the middle — the old close spacing + the 180° splay read as a tangle of "4 legs"
+// in the 3/4 view; this separates them into an unambiguous left foot + right foot.
+const LEG_Z_OFFSET = 0.82;
 
 export class Renderer {
   constructor(canvas) {
@@ -551,9 +555,13 @@ export class Renderer {
    * cube stays framed as the band snakes. Keeps the smooth _camY vertical glide. */
   updateCamera(physics) {
     const x = physics.cube ? physics.cube.position.x : physics.startX;
-    const cubeRenderY = (physics.cube ? -physics.cube.position.y : 0.9);
+    // Track the BOB-FREE base height (physics.bodyCamY), NOT the bobbing cube y, so
+    // the camera glides with the terrain trend only — the cube bobs IN-FRAME (a
+    // walking juice) while the SCREEN never jolts up/down with each foot-plant.
+    const baseRenderY = (physics.cube ? -physics.bodyCamY : 0.9);
+    const cubeRenderY = baseRenderY;
     // SMOOTH VERTICAL FOLLOW (kept): the body snaps up at each stair step (so the
-    // foot never penetrates). Easing a separate _camY toward the cube's render-y
+    // foot never penetrates). Easing a separate _camY toward the bob-free base
     // turns the step-up into a glide so the screen never jolts.
     if (this._camY == null || !Number.isFinite(this._camY)) this._camY = cubeRenderY;
     else this._camY += (cubeRenderY - this._camY) * 0.10;

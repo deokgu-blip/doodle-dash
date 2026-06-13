@@ -136,6 +136,30 @@ const TUNE = {
   effRadiusMin: 0.32,
   // idle ω when v≈0 but a leg exists (so the foot doesn't sit dead) — tiny.
   idleOmega: 0.0,
+
+  // ── AIRBORNE / CREST JUMP (designed, physical) ──
+  // The reference walker, when it hits a CONVEX crest (flat/up → sudden steep
+  // down, a hilltop) WITH SPEED, LAUNCHES off the edge and flies a ballistic arc,
+  // landing further down the descent — it does NOT glue to the surface. We model
+  // this as a designed state: while GROUNDED the body rides surfaceY; at a crest
+  // where the surface's downward acceleration (v²·curvature) exceeds gravity, the
+  // foot can no longer push on the ground → we switch to AIRBORNE and integrate a
+  // true parabola (x keeps its forward v, y under gravity g) until the arc meets
+  // the surface again (LAND → GROUNDED). Faster / sharper crest ⇒ farther flight;
+  // gentle slopes or low speed never trigger (no false jumps on the flat).
+  gravity: 26.0,         // world u/s² downward (physics +down) — arc fall rate
+  crestLookDx: 0.7,      // half-window (world u) to finite-difference the surface slope around the body for crest detection
+  crestAheadDx: 0.7,     // how far AHEAD (world u) to measure the post-crest slope (the descent the body would have to follow)
+  // LAUNCH condition: the surface curls DOWN by Δslope over the crest window. The
+  // ground's downward acceleration if the body STAYED on it is a_surf ≈ v²·dSlope/dx.
+  // When a_surf > gravity·launchMargin the foot would have to be PULLED down faster
+  // than free-fall (impossible — no glue) ⇒ the body leaves the surface. margin>1
+  // gives a little hysteresis so only a real, speed-backed crest launches (no jitter).
+  launchMargin: 1.0,     // a_surf must exceed gravity·this to launch (≥1 ⇒ true ballistic departure)
+  minLaunchSpeed: 3.5,   // u/s — below this horizontal speed the body never launches (slow walks stay grounded)
+  minDropSlope: 0.18,    // the post-crest descent slope (physics +down, downhill>0) must exceed this — gentle dips don't launch
+  airTiltLerp: 6.0,      // 1/s — in the air the body eases its lean toward the FLIGHT-PATH angle (atan(vy/vx)) for a natural arc pose
+  landMergeLerp: 14.0,   // 1/s — on LAND, how fast the body re-settles onto the ground support (a soft touchdown, no snap)
 };
 
 export class Physics {
@@ -171,6 +195,14 @@ export class Physics {
     this._vTip = 0;                  // last foot tip linear speed (u/s)
     this._omega = 0;                 // last leg angular speed (rad/s)
 
+    // ── AIRBORNE state (crest jump) ──
+    this._air = false;               // true while in a ballistic flight (off the ground)
+    this._vy = 0;                    // vertical velocity of the GROUND-CONTACT level (physics +down; up = negative)
+    this._footBaseY = 0;             // y of the foot-contact level (surfaceY-equivalent the body floats on); grounded == surfaceY, airborne == ballistic
+    this._prevFootBaseY = 0;         // previous frame's foot-contact level (to estimate vertical velocity at launch)
+    this._airFrames = 0;             // frames spent airborne in the current flight (diagnostic)
+    this._landMerge = 0;             // 0..1 touchdown re-settle blend (1 right after landing → eases to 0)
+
     // gate used by the verifier's leg-driven assertion (motor-off ⇒ no motion).
     this.motorEnabled = true;
     // RIVAL/RACE: a forward-speed multiplier (1 = the leg's natural pace). The
@@ -201,6 +233,10 @@ export class Physics {
     this._vTip = 0;
     this._theta = 0;
     this._angle = 0;
+    this._air = false;
+    this._vy = 0;
+    this._airFrames = 0;
+    this._landMerge = 0;
   }
 
   // ── TERRAIN: build floor slabs (for the renderer) + a height model. ──
@@ -326,6 +362,13 @@ export class Physics {
     this._bodyY = this.cube.position.y;
     this._bodyBaseY = this.cube.position.y;
     this._bob = 0;
+    this._air = false;
+    this._vy = 0;
+    this._airFrames = 0;
+    this._landMerge = 0;
+    const startSurf0 = this.surfaceYAt(track.startX);
+    this._footBaseY = (startSurf0 == null) ? groundY : startSurf0;
+    this._prevFootBaseY = this._footBaseY;
   }
 
   /**
@@ -341,6 +384,19 @@ export class Physics {
       if (best == null || y < best) best = y;
     }
     return best;
+  }
+
+  /** Local surface SLOPE (d(physY)/dx, physics +down ⇒ downhill > 0) at px. Prefers
+   * the segment's ANALYTIC slope (ramps are linear) to avoid a finite-difference
+   * spike at a seam; falls back to a small central difference over a gap/unknown. */
+  surfaceSlopeAt(px) {
+    const s = this._segAt(px);
+    if (s && s.kind === 'ramp') return s.slope;        // downhill > 0 (y +down)
+    if (s && (s.kind === 'flat' || s.kind === 'wall' || s.kind === 'stairs')) return 0;
+    const dx = 0.35;
+    const yR = this.surfaceYAt(px + dx), yL = this.surfaceYAt(px - dx);
+    if (yR == null || yL == null) return 0;
+    return (yR - yL) / (2 * dx);
   }
 
   /** Surface height used to FLOAT THE BODY (not the physical surface). Over stairs
@@ -511,11 +567,28 @@ export class Physics {
       this._blocked = false;
       this._vx = 0;
       this._vTip = 0;
+      this._air = false;
+      this._vy = 0;
+      this._airFrames = 0;
+      this._landMerge = 0;
+      this._footBaseY = surf;
+      this._prevFootBaseY = surf;
+    } else if (this._air) {
+      // CONTINUE while AIRBORNE: a mid-flight redraw must NOT teleport the body to the
+      // ground (that would be a fake landing). Keep the flight going — x / θ / tilt /
+      // _vy / _footBaseY (the ballistic level) all PRESERVED. Only the leg shape (reach)
+      // changed; the arc continues and the next update() step keeps integrating gravity.
+      this.cube.velocity.x = 0; this.cube.velocity.y = 0;
+      this.cube.angle = this._angle;
+      this._blocked = false;
+      this._vx = 0;
+      this._vTip = 0;
+      // _x, _theta, _angle, _air, _vy, _footBaseY, _bodyY, _bodyBaseY all PRESERVED.
     } else {
-      // CONTINUE: re-float vertically at the current x for the new leg's reach. x,
-      // _theta, _angle, progress are all preserved (carry on running). The next
-      // update() step will smoothly re-settle _bodyBaseY anyway, but we set it now so
-      // a redraw while paused/inspected reads a consistent (non-penetrating) pose.
+      // CONTINUE (GROUNDED): re-float vertically at the current x for the new leg's
+      // reach. x, _theta, _angle, progress are all preserved (carry on running). The
+      // foot grazes the surface continuously (no float), so we place the cube so the
+      // CURRENT support touches the surface.
       const curX = this._x;
       const surfNow = this.surfaceYAt(curX);
       const surf = (surfNow == null) ? this.cube.position.y : surfNow;
@@ -531,6 +604,8 @@ export class Physics {
       this._blocked = false;
       this._vx = 0;
       this._vTip = 0;
+      this._footBaseY = surf;
+      this._prevFootBaseY = surf;
       // _x, _theta, _angle intentionally PRESERVED.
     }
 
@@ -639,6 +714,81 @@ export class Physics {
     return support;
   }
 
+  /** EXACT GROUNDED PLACEMENT. Given the cube at forward x with the legs rotated by
+   * (theta + tilt), find the cube-centre y so the DEEPEST foot point just GRAZES the
+   * surface directly beneath it (gap ≈ 0 — no float, no penetration), on flat OR a
+   * slope. We rotate every chain sample of both legs into world (axle-local, +tilt),
+   * then for each the surface under its world x is surfaceYAt(axleX+rx). The required
+   * cube y is the one that makes  min over samples of (surfaceUnder − (centreY+ry+r))
+   * == 0, i.e. centreY = min over samples of (surfaceUnder − ry − r). Returns that
+   * centreY (physics +down). Falls back to surfaceY−support if the surface is null.
+   * This replaces the vertical-drop `support`+`slopeLift` approximation that floated
+   * the foot on slopes (the "floating" the user reported). */
+  _groundedCubeY(axleX, theta, tilt) {
+    const ch = this._chain;
+    if (!ch || !ch.length) {
+      const s = this.surfaceYAt(axleX);
+      return (s == null) ? this._bodyY : s - (this._reach + LEG_LINE_RADIUS);
+    }
+    const offs = [0, this._legPhaseOffset];
+    let bestY = null; // the LOWEST (most-negative, highest body) centreY that still grazes
+    for (const off of offs) {
+      const a = theta + off + (tilt || 0);
+      const ca = Math.cos(a), sa = Math.sin(a);
+      for (let i = 0; i < ch.length; i++) {
+        const rx = ch[i].x * ca - ch[i].y * sa;   // world offset from axle (x)
+        const ry = ch[i].x * sa + ch[i].y * ca;   // world offset from axle (y, +down)
+        const surfUnder = this.surfaceYAt(axleX + rx);
+        if (surfUnder == null) continue;
+        // centreY that puts THIS sample's bottom (ry + lineRadius) exactly on the
+        // surface under it: centreY = surfUnder − ry − lineRadius. The body must sit
+        // at the MIN such centreY (highest body) so NO sample dips below its surface.
+        const cY = surfUnder - ry - LEG_LINE_RADIUS;
+        if (bestY == null || cY < bestY) bestY = cY;
+      }
+    }
+    if (bestY == null) {
+      const s = this.surfaceYAt(axleX);
+      return (s == null) ? this._bodyY : s - (this._reach + LEG_LINE_RADIUS);
+    }
+    return bestY;
+  }
+
+  /** CREST LAUNCH TEST (called only when GROUNDED). At a CONVEX crest the surface
+   * curls DOWN: the downhill slope just AHEAD is steeper than just BEHIND. If the
+   * body kept following that surface its downward acceleration would be
+   *     a_surf ≈ v² · d(slope)/dx        (curvature × forward-speed²)
+   * which is the centripetal demand of riding a convex hump. A foot can only PUSH,
+   * not PULL — so once a_surf exceeds gravity the foot leaves the ground and the
+   * body flies a parabola (the reference's "speed off a hilltop" launch). We set
+   * the launch vertical velocity to the body's CURRENT along-surface vertical speed
+   * (v·slopeBehind, physics +down) so the arc tangentially continues the pre-crest
+   * motion (smooth departure, no pop). Returns true if it switched to AIRBORNE.
+   * Gated by minLaunchSpeed and minDropSlope so the FLAT (slope≈0, curvature 0) and
+   * slow walks NEVER launch (no false jumps). */
+  _maybeLaunch(v) {
+    if (v < TUNE.minLaunchSpeed) return false;        // too slow → stay grounded
+    const x = this._x;
+    const slopeBehind = this.surfaceSlopeAt(x - TUNE.crestLookDx); // up<0, down>0
+    const slopeAhead = this.surfaceSlopeAt(x + TUNE.crestAheadDx);
+    const dSlope = slopeAhead - slopeBehind;          // convex crest ⇒ +（curls down）
+    if (dSlope <= 0) return false;                     // concave / flat / climbing — no launch
+    if (slopeAhead < TUNE.minDropSlope) return false;  // the descent ahead is too gentle
+    const dxSpan = TUNE.crestLookDx + TUNE.crestAheadDx;
+    const curvature = dSlope / dxSpan;                 // d(slope)/dx
+    const aSurf = v * v * curvature;                   // downward accel demanded to stay glued
+    if (aSurf <= TUNE.gravity * TUNE.launchMargin) return false; // gravity can hold it → grounded
+    // LAUNCH. Vertical velocity = current along-surface vertical speed (tangential).
+    // On a hump the body is usually near-flat/rising at the crest, so vy0 is small
+    // or slightly upward; gravity then arcs it down onto the descent. Clamp so a
+    // freak slope can't fling it absurdly.
+    this._air = true;
+    this._airFrames = 0;
+    this._vy = clampMag(v * slopeBehind, v); // physics +down; rising crest ⇒ negative (up)
+    this._landMerge = 0;
+    return true;
+  }
+
   // ── MAIN STEP ──
   update(dtMs, running) {
     if (!this.cube) return;
@@ -704,10 +854,24 @@ export class Physics {
     //     (flat→ramp, ramp crest, stair run) can never snap. The legs inherit this
     //     tilt (anchored at the cube centre) so the whole walker leans together.
     {
-      const tgt = this._targetTilt(this._x);
-      const a = 1 - Math.exp(-TUNE.tiltLerp * dt);
+      let tgt, lerp;
+      if (this._air) {
+        // AIRBORNE: lean to the FLIGHT-PATH angle (nose follows the arc) — rising at
+        // launch (nose up), pitching down through the apex onto the descent. physics
+        // y +down, so atan(vy/vx): vy<0 (up) ⇒ nose-up (negative), vy>0 ⇒ nose-down.
+        const vxNow = Math.max(1e-3, this._vx);
+        tgt = clampMag(Math.atan2(this._vy, vxNow), TUNE.tiltMax);
+        lerp = TUNE.airTiltLerp;
+      } else {
+        tgt = this._targetTilt(this._x);
+        lerp = TUNE.tiltLerp;
+      }
+      const a = 1 - Math.exp(-lerp * dt);
       let step = (tgt - this._angle) * a;
-      step = clampMag(step, TUNE.tiltSlewMax);
+      // keep the per-frame slew cap on the GROUND (anti-snap at seams). In the air the
+      // arc pose may need to swing a touch faster; allow ~2× the cap so the nose can
+      // pitch over the apex (still bounded — no snap).
+      step = clampMag(step, this._air ? TUNE.tiltSlewMax * 2 : TUNE.tiltSlewMax);
       this._angle += step;
     }
 
@@ -756,65 +920,106 @@ export class Physics {
     }
     this._omega = omega; // rad/s — recorded on each leg.body in _syncLegs
 
-    // (c) GEOMETRIC WALKING BOB. The body height is DERIVED from the legs' actual
-    //     contact geometry (see _supportDepth): support = the DEEPER leg's vertical
-    //     drop from the pivot to its lowest chain point + lineRadius. A leg planted
-    //     VERTICALLY (farthest sample straight down) ⇒ support ≈ reach+r (MAX) ⇒ body
-    //     HIGH; a tilted leg ⇒ shallower ⇒ body DROPS. The two legs 180° apart make
-    //     `support` oscillate ⇒ the body rises on each vertical plant and dips
-    //     between plants: the alternating walking bob, by construction.
+    // (c) BODY HEIGHT — TWO STATES: GROUNDED (the foot DEFINITELY touches the
+    //     ground, no float) and AIRBORNE (a ballistic arc launched off a crest).
     //
-    //     We float the body at  surfaceY − support  so the DEEPEST contact just
-    //     grazes the surface (structural 0 penetration; the other leg & all other
-    //     points sit above). To keep the SCREEN smooth while the cube bobs IN-FRAME,
-    //     we split this into:
-    //       • a bob-FREE BASE y  (_bodyBaseY) that follows only the low-frequency
-    //         terrain trend  (surfaceY − supportRef, where supportRef is the MAX
-    //         possible support = reach+r, i.e. the height of a vertical plant). This
-    //         is what the camera follows ⇒ no screen jolt.
-    //       • the BOB = (target − base) = (supportRef − support) ≥ 0, the body's
-    //         downward dip below the vertical-plant height. Added on top of base for
-    //         the rendered cube.position.y so the cube visibly bobs.
-    const half = CUBE_SIZE * 0.5 + LEG_LINE_RADIUS;
-    let topSurf = null; // most-negative (highest) BODY-FLOAT surface under footprint
-    const LOOK = 1.6;
-    for (let sx = this._x - half; sx <= this._x + LOOK + 1e-6; sx += half * 0.5) {
-      const s = this.bodySurfaceYAt(sx);
-      if (s != null && (topSurf == null || s < topSurf)) topSurf = s;
+    //     `_footBaseY` is the LEVEL the support foot rests on:
+    //       • GROUNDED: the actual surfaceY under the footprint (foot grazes it).
+    //       • AIRBORNE: a parabola integrated under gravity (the foot is in the air).
+    //     The cube centre is placed at `_footBaseY − support − slopeLift` so the
+    //     DEEPEST leg's lowest point sits EXACTLY on `_footBaseY` (grounded ⇒ on the
+    //     surface, gap≈0 every frame — no more floating headroom). The bob is then
+    //     INTRINSIC: as `support` oscillates with the spinning legs the cube centre
+    //     itself rises (vertical plant) and dips (tilted leg) — the real walking bob.
+    //     The CAMERA tracks `_bodyBaseY`, a low-passed (smoothed) version so the
+    //     screen never jolts while the cube bobs / flies in-frame.
+    const reachR = this._reach + LEG_LINE_RADIUS;
+    // EXACT grounded cube centre: the y that makes the DEEPEST foot point graze the
+    // surface beneath it (flat OR slope) — gap ≈ 0, no float, no penetration. This is
+    // the #1 fix (replaces the vertical-drop `support`+`slopeLift` that floated the
+    // foot on slopes). The bob is intrinsic: as the legs spin, the grazing y rises on
+    // a vertical plant and dips on a tilted leg (a real alternating walking bob).
+    const groundedY = (drive || this.legDrawn)
+      ? this._groundedCubeY(this._x, this._theta, this._angle)
+      : (this._footBaseY - reachR);
+
+    // surface under the body (its own x) — the level the contact foot rests on. Used
+    // for the airborne clearance and the camera trend.
+    let groundSurf = this.surfaceYAt(this._x);
+    if (groundSurf == null) groundSurf = this._footBaseY; // over a gap: keep last level
+
+    this._prevFootBaseY = this._footBaseY;
+
+    if (!this._air) {
+      // ── GROUNDED ──
+      // CREST DETECTION: if the body keeps following the surface, its downward
+      // acceleration would be a_surf ≈ v²·d(slope)/dx (curvature × speed²). At a
+      // CONVEX crest (slope drops: flat/up → steep down) a_surf can exceed gravity —
+      // then the foot can no longer be held down (no glue) and the body LAUNCHES.
+      const launched = this._maybeLaunch(v);
+      if (!launched) {
+        // ride the surface: foot grazes it EVERY frame (no float). The grazing y is
+        // the bob (support oscillation). Track the contact level + its vertical speed.
+        this._footBaseY = groundSurf;
+        this._vy = (this._footBaseY - this._prevFootBaseY) / Math.max(1e-4, dt);
+        this._bodyY = groundedY;
+        // soft touchdown re-settle (decays after a landing) — eases any residual.
+        if (this._landMerge > 1e-3) this._landMerge *= Math.exp(-TUNE.landMergeLerp * dt);
+        else this._landMerge = 0;
+      }
     }
-    if (topSurf != null) {
-      // SLOPE CLEARANCE: on a tilt of angle φ the foot circle's lowest WORLD point
-      // sits ~r·(1/cosφ − 1) lower than on the flat. Lifting the float target by that
-      // keeps the foot ON (never below) a sloped surface — same as before, applied to
-      // the bob-free BASE so the no-penetration margin is independent of the bob.
-      const cosA = Math.max(0.35, Math.cos(this._angle || 0));
-      const slopeLift = (this._reach + LEG_LINE_RADIUS) * (1 / cosA - 1);
-      // supportRef = the MAX support (a vertical plant): reach + lineRadius. The base
-      // floats the body to this (highest) height; the bob is how far below it the
-      // CURRENT (shallower) support lets the body settle.
-      const supportRef = this._reach + LEG_LINE_RADIUS;
-      const baseTargetY = topSurf - supportRef - slopeLift;
-      // ease the BASE toward the terrain trend (smooth stair/ramp glide, no snap).
+    if (this._air) {
+      // ── AIRBORNE — integrate the ballistic arc of the CONTACT LEVEL. ──
+      this._vy += TUNE.gravity * dt;            // gravity pulls DOWN (physics +down)
+      this._footBaseY += this._vy * dt;          // the level the body would land on
+      this._airFrames++;
+      // LAND when the descending arc meets the surface DIRECTLY UNDER THE BODY (its
+      // own x), NOT the lead-window min (which still includes the higher ground we
+      // just launched off — that would re-ground us on the launch frame). On a
+      // downhill crest the surface ahead drops away below the arc, so footBaseY (the
+      // contact level) stays ABOVE it (clearance) until the parabola descends onto
+      // the descent: touchdown then. Skip the very first airborne frame so a launch
+      // from a flat lip (vy0≈0) can't instantly re-land before the arc lifts clear.
+      const landSurf = this.surfaceYAt(this._x);
+      const canLand = this._airFrames > 1 && this._vy > 0 && landSurf != null;
+      if (canLand && this._footBaseY >= landSurf - 1e-4) {
+        // TOUCHDOWN → GROUNDED. Snap the contact level onto the surface and re-settle.
+        this._footBaseY = landSurf;
+        this._air = false;
+        this._vy = 0;
+        this._landMerge = 1; // mark a fresh landing (cosmetic ease in the renderer/tilt)
+      }
+      // cube centre rides the arc: it is the grounded pose RAISED by the clearance of
+      // the ballistic contact level above the ground under the body (the legs still
+      // spin in the air, so the bob continues — it just isn't touching anything).
+      const clearance = groundSurf - this._footBaseY; // ≥0 ⇒ contact level above ground
+      this._bodyY = groundedY - Math.max(0, clearance);
+    }
+
+    // CAMERA BASE: low-pass the cube height so the SCREEN is smooth (no per-foot
+    // bob jolt, no jump snap). The camera follows the GROUND trend — NOT the
+    // airborne arc — so while the cube flies in-frame the screen keeps gliding along
+    // the terrain (the reference look: the world scrolls smoothly, the cube hops).
+    // Target = the grounded vertical-plant height over the ground under the body.
+    {
+      const baseTargetY = groundSurf - reachR;
       const a = 1 - Math.exp(-TUNE.surfaceLerp * dt);
       let step = (baseTargetY - this._bodyBaseY) * a;
-      step = clampMag(step, TUNE.surfaceSlewMax);
+      step = clampMag(step, TUNE.surfaceSlewMax); // gentle slew on the camera → no snap
       this._bodyBaseY += step;
     }
-    // current geometric support at the legs' live angles (θ already advanced, tilt
-    // already eased). The bob is the gap up to a vertical plant, ≥ 0, downward.
-    const support = (drive || this.legDrawn) ? this._supportDepth(this._theta, this._angle) : (this._reach + LEG_LINE_RADIUS);
-    const supportRef2 = this._reach + LEG_LINE_RADIUS;
-    let bobTarget = clampMag((supportRef2 - support) * TUNE.bobGain, TUNE.bobMax); // physics +down (dip)
-    if (bobTarget < 0) bobTarget = 0; // never lift ABOVE the vertical-plant height (would float the foot off)
-    // follow the geometric bob directly (it is already a smooth function of θ — a
-    // continuous rotation — so no extra easing is needed; tracking it 1:1 keeps the
-    // bob crisp and exactly phase-locked to the planted leg).
-    this._bob = bobTarget;
-    this._bodyY = this._bodyBaseY + this._bob;
+    // BOB (the walking juice, reported for the verifier (J)): the GEOMETRIC dip of the
+    // body below a vertical-plant pose = reachR − support. It is HIGH (body dipped)
+    // when the carrying leg is TILTED (shallow support) and ≈0 on a vertical plant —
+    // a clean function of leg phase, so it correlates with verticality and is free of
+    // camera-base lag (which the old cube−base definition picked up at landings).
+    const supportNow = (drive || this.legDrawn) ? this._supportDepth(this._theta, this._angle) : reachR;
+    this._bob = Math.max(0, reachR - supportNow);
 
     this.cube.position.x = this._x;
     this.cube.position.y = this._bodyY;
     this.cube.velocity.x = v;
+    this.cube.velocity.y = this._air ? this._vy : 0;
     this.cube.angle = this._angle;
 
     // 6. sync the two leg visuals + their world parts. Foot lowest point is
@@ -872,26 +1077,28 @@ export class Physics {
       l.body.angularVelocity = angVelMatter;
       l.body.parts = this._buildParts(axleX, axleY, angle, l.chain);
     }
-    // defensive up-only clamp against the local surface under the foot.
-    const surf = this.surfaceYAt(this.cube.position.x);
-    if (surf == null) return;
-    let lowY = -Infinity;
+    // defensive UP-ONLY clamp against the surface UNDER EACH FOOT POINT (its own x —
+    // NOT the surface at the body centre, which is wrong on a slope and would falsely
+    // LIFT the body when a leg sample trails over lower ground, re-introducing the
+    // "floating on slopes" gap). While AIRBORNE the body is meant to be above the
+    // surface (positive clearance), so the clamp is skipped entirely.
+    if (this._air) return;
+    let below = 0; // worst penetration of any foot point below ITS local surface
     for (const l of this.legs) {
       for (let i = 1; i < l.body.parts.length; i++) {
-        const py = l.body.parts[i].position.y + l.lineRadius;
-        if (py > lowY) lowY = py;
+        const p = l.body.parts[i];
+        const su = this.surfaceYAt(p.position.x);
+        if (su == null) continue;
+        const d = (p.position.y + l.lineRadius) - su; // >0 ⇒ this point is below its surface
+        if (d > below) below = d;
       }
     }
-    const below = lowY - surf; // >0 ⇒ penetrating (should be ~0 by construction)
     if (below > 1e-6) {
-      // SLEW-LIMITED up-only correction. The body float already leads the surface
-      // (footprint leading-edge + slope-lift), so any residual dip is a tiny seam
-      // transient (e.g. stair→flat where the lean is still easing). Snapping it out
-      // in one frame produced the only remaining Δy spike, so we correct it at the
-      // same per-frame cap as the float ease — the dip stays a bounded transient
-      // (≤ the cap accumulated over the very few easing frames, well under 0.1) and
-      // the screen never jolts. Penetration is bounded, not exactly 0, by design.
+      // up-only correction: lift the body so the deepest penetrating point sits on its
+      // surface. _groundedCubeY already makes this ≈0 by construction; this only mops
+      // up sub-epsilon round-off (or a one-frame seam transient). Tiny, bounded.
       this.cube.position.y -= below;
+      this._bodyY = this.cube.position.y;
       const nAxleY = this.cube.position.y + AXLE_Y;
       for (const m of this.legs) {
         m.body.position.y = nAxleY;
@@ -912,6 +1119,29 @@ export class Physics {
    * the bob-free base; ≥ 0). Exposed for the verifier's (J) bob-amplitude report. */
   get bob() { return this._bob || 0; }
   get trying() { return !!this._trying; }
+  /** True while the walker is in a ballistic flight (off the ground at a crest). */
+  get airborne() { return !!this._air; }
+  /** Vertical velocity (physics +down; up = negative) — non-zero only while airborne. */
+  get vy() { return this._vy || 0; }
+  /** Clearance of the support foot's lowest point ABOVE the surface under the body
+   * (world units; >0 ⇒ in the air, ≈0 ⇒ grounded/grazing). For (O)/(P) diagnostics. */
+  footClearance() {
+    if (!this.legs.length || !this.cube) return null;
+    // closest approach of ANY foot point to the surface UNDER THAT point (its own x).
+    // >0 ⇒ the foot is above the surface everywhere (clearance, e.g. airborne);
+    // ≈0 ⇒ grazing; <0 ⇒ a point is below its local surface (penetration).
+    let closest = Infinity;
+    for (const l of this.legs) {
+      for (let i = 1; i < l.body.parts.length; i++) {
+        const p = l.body.parts[i];
+        const su = this.surfaceYAt(p.position.x);
+        if (su == null) continue;
+        const gap = su - (p.position.y + l.lineRadius);
+        if (gap < closest) closest = gap;
+      }
+    }
+    return closest === Infinity ? null : closest;
+  }
   get progress() {
     const t = (this.bodyX - this.startX) / (this.finishX - this.startX);
     return Math.max(0, Math.min(1, t));

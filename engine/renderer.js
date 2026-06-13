@@ -138,44 +138,105 @@ export class Renderer {
    * Both legs share the SAME single bottom-center axle in physics, so we offset
    * them in z (depth) by their `side` (-1 = far / left, +1 = near / right) to
    * read as two legs straddling the cube. They are 180° out of phase so one
-   * foot plants while the other lifts — the alternating walking gait. Each leg
-   * is a single SOLID convex body, extruded from the body's rest shape. */
+   * foot plants while the other lifts — the alternating walking gait.
+   *
+   * WYSIWYG: each leg is drawn as a THIN LINE RIBBON tracing the user's stroke
+   * polyline (NOT a filled convex hull). The same polyline the physics models as
+   * an overlapping circle-chain is extruded here with a small width (==2x the
+   * physics circle radius), so the visible line == the physics shape == the
+   * drawn stroke. Open/curved strokes stay open & curved; long strokes -> long
+   * legs (the polyline carries the preserved drawn length). */
   rebuildLegs(physics) {
     for (const lg of this.legGroups) { this.scene.remove(lg.mesh); this._disposeMesh(lg.mesh); }
     this.legGroups = [];
     for (const l of physics.legs) {
       const body = l.body;
-      // The leg is a COMPOUND limb (chain of box parts). Build a Three.Group
-      // holding one extruded box per part, each placed in the leg's LOCAL frame
-      // (about body.position, un-rotated by the body's current angle which
-      // includes its 180° phase). The whole group is positioned & rotated each
-      // frame in sync().
       const grp = new THREE.Group();
-      const a = body.angle;
-      const cosA = Math.cos(-a), sinA = Math.sin(-a);
-      const px = body.position.x, py = body.position.y;
-      // Matter compound: body.parts[0] is the whole-body proxy; real parts are
-      // parts[1..]. Each part has .vertices (world) and .position.
-      const parts = body.parts.length > 1 ? body.parts.slice(1) : body.parts;
-      for (const part of parts) {
-        const shape = new THREE.Shape();
-        const verts = part.vertices;
-        for (let i = 0; i < verts.length; i++) {
-          const dx = verts[i].x - px, dy = verts[i].y - py;
-          const lx = dx * cosA - dy * sinA;
-          const ly = dx * sinA + dy * cosA;
-          const rx = lx, ry = -ly; // render y = -physY
-          if (i === 0) shape.moveTo(rx, ry); else shape.lineTo(rx, ry);
-        }
-        shape.closePath();
-        const geo = new THREE.ExtrudeGeometry(shape, { depth: LEG_THICK, bevelEnabled: false });
-        geo.translate(0, 0, -LEG_THICK / 2);
-        grp.add(new THREE.Mesh(geo, this._legMat));
-      }
+      // The stored chain is in the leg's AXLE-LOCAL frame (axle at origin). The
+      // body's transform is about its CENTROID; the axle sits at pinLocal from
+      // the centroid in the rest frame. So a chain point's offset from the
+      // centroid (rest frame, angle 0) is pinLocal + chainPoint. We render in
+      // that centroid-relative frame; sync() then applies body.position/angle.
+      const pin = l.pinLocal || { x: 0, y: 0 };
+      const pts = l.chain.map((c) => ({ x: pin.x + c.x, y: pin.y + c.y }));
+      const halfW = (l.lineRadius || 0.16);
+      const mesh = this._buildStrokeRibbon(pts, halfW);
+      if (mesh) grp.add(mesh);
       this.scene.add(grp);
       // z offset by side so the two legs straddle the cube (read as two legs).
       this.legGroups.push({ mesh: grp, body, side: l.side, z: l.side * LEG_Z_OFFSET });
     }
+  }
+
+  /** Build a thin LINE ribbon (rounded polyline) of half-width `halfW` along the
+   * centroid-relative polyline `pts` (physics y, +down). Returns a single mesh.
+   * The ribbon is built from quads between consecutive points plus round caps/
+   * joints (circles) so it reads as a smooth pen stroke, not a chain of dots. */
+  _buildStrokeRibbon(pts, halfW) {
+    if (!pts || pts.length < 1) return null;
+    const positions = [];
+    const idx = [];
+    let base = 0;
+    const pushTri = (a, b, c) => { idx.push(a, b, c); };
+    // Segment quads.
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      dx /= len; dy /= len;
+      // normal (perp), in physics frame
+      const nx = -dy * halfW, ny = dx * halfW;
+      // render y = -physY for each corner
+      const aL = { x: a.x + nx, y: -(a.y + ny) };
+      const aR = { x: a.x - nx, y: -(a.y - ny) };
+      const bL = { x: b.x + nx, y: -(b.y + ny) };
+      const bR = { x: b.x - nx, y: -(b.y - ny) };
+      positions.push(aL.x, aL.y, aR.x, aR.y, bL.x, bL.y, bR.x, bR.y);
+      pushTri(base, base + 1, base + 2);
+      pushTri(base + 1, base + 3, base + 2);
+      base += 4;
+    }
+    // Round joints/caps: a small disc at every point so corners & ends are round.
+    const SEG = 8;
+    for (const p of pts) {
+      const cx = p.x, cy = -p.y;
+      const center = base;
+      positions.push(cx, cy);
+      for (let k = 0; k <= SEG; k++) {
+        const a = (k / SEG) * Math.PI * 2;
+        positions.push(cx + Math.cos(a) * halfW, cy + Math.sin(a) * halfW);
+      }
+      for (let k = 0; k < SEG; k++) pushTri(center, center + 1 + k, center + 2 + k);
+      base += SEG + 2;
+    }
+    // 2D triangle soup -> extrude in z into a slim 3D leg (front+back faces).
+    const geo = this._thicken2D(positions, idx, LEG_THICK);
+    return new THREE.Mesh(geo, this._legMat);
+  }
+
+  /** Turn a flat 2D triangle soup (positions[x,y...], idx) into a thin extruded
+   * slab of `depth` (front face at +d/2, back at -d/2, plus side walls along the
+   * outline is skipped — front+back read fine for a slim leg at this scale). */
+  _thicken2D(positions2, idx2, depth) {
+    const n = positions2.length / 2;
+    const d = depth / 2;
+    const pos = new Float32Array(n * 2 * 3);
+    for (let i = 0; i < n; i++) {
+      const x = positions2[i * 2], y = positions2[i * 2 + 1];
+      pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = d;          // front
+      pos[(n + i) * 3] = x; pos[(n + i) * 3 + 1] = y; pos[(n + i) * 3 + 2] = -d; // back
+    }
+    const tri = [];
+    for (let i = 0; i < idx2.length; i += 3) {
+      const a = idx2[i], b = idx2[i + 1], c = idx2[i + 2];
+      tri.push(a, b, c);                       // front (CCW)
+      tri.push(n + a, n + c, n + b);           // back (reversed)
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setIndex(tri);
+    geo.computeVertexNormals();
+    return geo;
   }
 
   /** Sync all meshes from physics bodies (call every frame). */

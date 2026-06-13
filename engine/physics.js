@@ -1,19 +1,31 @@
 // engine/physics.js
 // 2D side-view physics for Draw Climber (Matter.js) — LEG-DRIVEN locomotion.
 //
-// Mechanic (POC §4 — REDESIGNED per user reject):
+// Mechanic (POC §4 — REDESIGNED twice per user rejects):
 //   - Body = an upright cube. At the bottom-CENTER it has ONE horizontal axle
 //     (perpendicular to the travel direction). The axle carries TWO legs
 //     (left/right). In the 2D side-view plane both legs pin to the SAME point;
 //     the renderer offsets them in z so they read as two legs straddling the
 //     cube. They are spun 180° OUT OF PHASE so one foot plants while the other
 //     lifts -> the cube WALKS (alternating gait), it does not slide.
-//   - A "leg" = the user's drawn stroke -> the CONVEX HULL of the stroke points
-//     (plus the axle center) as a single SOLID convex body, pinned to the axle
-//     by a revolute (length-0) constraint so it can only spin about the axle. A
-//     solid polygon has real rotational inertia and is numerically STABLE; a
-//     thin one-end-pinned limb whips and launches the cube (verified). The hull
-//     of a drawn line is a thin paddle whose far corner is a FOOT.
+//   - A "leg" = the user's drawn stroke modeled as a CHAIN OF SMALL CIRCLES laid
+//     along the stroke polyline (a Matter COMPOUND of circle parts), pinned to
+//     the axle by a revolute (length-0) constraint so it can only spin about the
+//     axle. WHY circles-along-the-line and NOT a convex hull:
+//       * A convex hull FILLS the drawn curve into a solid polygon (a paddle) —
+//         the user drew a LINE, not a filled blob. REJECTED.
+//       * A single thin bar / center-spoke whips & launches the cube (a thin,
+//         one-end-pinned limb has ~no rotational inertia and tunnels). REJECTED.
+//       * Circles never present a degenerate edge normal, so a chain of small
+//         circles can be THIN yet numerically STABLE (no tunneling), and the
+//         chain TRACES the drawn stroke -> it LOOKS like the line the user drew
+//         (open curves stay open, bars stay bars). Each circle's radius == the
+//         rendered line's half-thickness, so visible line == physics shape.
+//   - SCALE IS PRESERVED: the normalized [-1,1] stroke is mapped to world by a
+//     FIXED world-scale (not re-fit to a constant size), so a LONG drawing makes
+//     a LONG leg (big reach/stride) and a SHORT drawing a SHORT leg. Only a
+//     min/max reach CLAMP bounds it (avoid a 0-length or runaway leg); between
+//     the clamps the leg length is continuous in the drawn length.
 //   - The two legs DO NOT collide with each other (shared negative collision
 //     group) but BOTH collide with the floor.
 //   - Motor = a CONSTANT (open-loop) torque on the legs, capped by an angular-
@@ -64,6 +76,27 @@ const AXLE_Y = CUBE_SIZE * 0.5 + 0.06; // axle just below the cube bottom face
 // whole slab in one substep (per-substep travel is small, see SUBSTEPS).
 const FLOOR_THICK = 4.0;
 
+// ── Leg (circle-chain) geometry ──
+// Map normalized stroke coords [-1,1] -> world units by this FIXED scale. This
+// is what PRESERVES the drawn length: we never re-fit the stroke to a constant
+// size, so longer drawings yield longer legs. A full-box stroke (|coord|~1)
+// gives reach ~= WORLD_SCALE.
+const LEG_WORLD_SCALE = 1.0;
+// Half-thickness of the rendered line == physics circle radius. Small -> the
+// leg reads as a THIN LINE, not a filled blob. Big enough to stay stable (a
+// circle never tunnels at this radius given the substep foot travel ~0.026).
+const LEG_LINE_RADIUS = 0.13;
+// Spacing between circle centers along the stroke. Overlapping circles
+// (spacing < 2*radius) form a continuous, gap-free thin tube along the line.
+const LEG_CIRCLE_SPACING = LEG_LINE_RADIUS * 1.15;
+// Reach (axle -> farthest point) clamp, in world units. Below MIN the leg can't
+// reach the ground (0-leg); above MAX a giant lever destabilizes/launches.
+const LEG_REACH_MIN = 0.45;
+const LEG_REACH_MAX = 1.7;
+// Cap the number of circle parts so a long, dense scribble can't explode the
+// part count (perf + solver stability). Resampling keeps shape with fewer parts.
+const LEG_MAX_CIRCLES = 40;
+
 export class Physics {
   constructor() {
     this.engine = Engine.create();
@@ -98,7 +131,7 @@ export class Physics {
     // leg-driven walk: enough torque that a foot mounts a stair riser (a weak
     // foot stalls AT the step — that's the real difficulty curve), with a
     // moderate ceiling so the legs turn at a watchable ~2 rev/s, not a blur.
-    this._motorTorque = 0.012;
+    this._motorTorque = 0.05;
     this.legDrawn = false;
     this.floorBodies = [];
     this.startX = 0;
@@ -214,12 +247,15 @@ export class Physics {
     cube.collisionFilter = { category: CAT_BODY, mask: CAT_FLOOR, group: 0 };
     cube.label = 'cube';
     Body.setMass(cube, 2.2);
-    // LOCK chassis rotation (infinite rotational inertia). In Draw Climber the
-    // cube stays upright and only translates while the legs spin under it. A
-    // free-rotating chassis on pin-jointed driven legs is an unstable inverted
-    // system that flips/launches. Locking rotation removes that failure mode and
-    // matches the game's look. The legs still spin freely about their pins, and
-    // the cube is still free to translate in x and y from the feet pushing.
+    // Keep the chassis UPRIGHT. We want infinite rotational inertia (the cube
+    // never tips — a free-rotating chassis on pin-jointed driven legs is an
+    // unstable inverted system that flips). BUT a length-0 revolute pin against
+    // an Infinity-inertia body is ill-conditioned: when a long leg's foot JAMS
+    // the solver dumps the whole correction into the cube's TRANSLATION and
+    // teleports it (launch). A LARGE-but-FINITE inertia keeps the pin solve
+    // well-conditioned (the tiny residual rotation is zeroed every substep by the
+    // upright clamp), so the cube stays upright AND can't be flung. The legs
+    // still spin freely about their pins; the cube is free to translate in x/y.
     Body.setInertia(cube, Infinity);
     Composite.add(this.world, cube);
     this.cube = cube;
@@ -229,20 +265,25 @@ export class Physics {
 
   /**
    * Set / replace the legs from a normalized stroke (box [-1,1]^2).
-   * Builds TWO solid convex bodies pinned to the SINGLE bottom-center axle, spun
-   * 180° out of phase (alternating gait). The legs share a negative collision
-   * group so they never collide with each other, only the floor.
+   * Builds TWO circle-chain compound bodies pinned to the SINGLE bottom-center
+   * axle, spun 180° out of phase (alternating gait). The legs share a negative
+   * collision group so they never collide with each other, only the floor.
+   *
+   * The drawn stroke is mapped to world at a FIXED scale (length preserved) and
+   * traced by a chain of small overlapping circles -> the leg LOOKS like the
+   * drawn LINE (open curves stay open; no hull fill), is THIN, and is stable.
+   *
    * @param {{x:number,y:number}[]} points  normalized polyline
-   * @param {{thickness?:number, scale?:number, motorSpeed?:number}} [spec]
+   * @param {{scale?:number, motorSpeed?:number}} [spec]
    */
   setLegStroke(points, spec = {}) {
     if (!this.cube) return;
-    const scale = spec.scale ?? 1.0;        // [-1,1] box -> world radius
+    const scale = (spec.scale ?? 1.0) * LEG_WORLD_SCALE; // [-1,1] -> world
     // Motor angular-speed CEILING (rad/s). The constant motor torque pushes the
     // foot until it reaches this ceiling, then backs off — high enough that the
     // foot keeps slipping/biting the ground (continuous propulsion) instead of
     // capping early and free-spinning to a stop, but bounded so it can't launch.
-    this.motorSpeed = spec.motorSpeed ?? 14;
+    this.motorSpeed = spec.motorSpeed ?? 12;
 
     // remove previous legs
     for (const c of this.legConstraints) Composite.remove(this.world, c);
@@ -252,38 +293,47 @@ export class Physics {
 
     if (!points || points.length < 2) { this.legDrawn = false; return; }
 
-    // ── Build the leg as a SOLID CONVEX foot (the convex hull of the stroke +
-    // the axle center). A solid polygon has real rotational inertia, so it is
-    // numerically STABLE (a thin one-end-pinned limb whips and launches the
-    // cube — verified). The hull of a DRAWN LINE is a thin paddle/triangle whose
-    // far corner is a FOOT; spun about the axle that foot plants and sweeps the
-    // ground backward -> friction WALKS the cube. The leg shape (so the gait)
-    // still varies with the drawing -> data-driven mechanic preserved. ──
-    const world = points.map((p) => ({ x: p.x * scale, y: p.y * scale }));
-    world.push({ x: 0, y: 0 }); // include the axle center -> closed shape
+    // ── 1. Map the normalized stroke to WORLD, preserving its real extent. ──
+    // No re-fit: |coord|~1 -> ~scale world units, so a long drawing -> long leg.
+    const stroke = points.map((p) => ({ x: p.x * scale, y: p.y * scale }));
 
-    let hull = Vertices.hull(Vertices.create(world, null));
-    if (!hull || hull.length < 3) {
-      // collinear stroke (e.g. a flat bar): give it a thin lens so it has area.
-      const a = world[0], b = world[world.length - 2] || world[0];
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const nx = -dy / len * 0.12, ny = dx / len * 0.12;
-      const padded = [];
-      for (const p of world) padded.push({ x: p.x + nx, y: p.y + ny }, { x: p.x - nx, y: p.y - ny });
-      hull = Vertices.hull(Vertices.create(padded, null));
+    // Resample the polyline at LEG_CIRCLE_SPACING so circles overlap evenly into
+    // a continuous thin tube (and so the part count is bounded & shape-faithful).
+    // The axle sits at the box origin {0,0}; reach is measured from there.
+    let chain = resamplePolyline(stroke, LEG_CIRCLE_SPACING, LEG_MAX_CIRCLES);
+    if (chain.length < 2) { this.legDrawn = false; return; }
+
+    // Reach = farthest sample from the axle (origin). Clamp ONLY the extremes;
+    // between the clamps reach is continuous in the drawn length. If the raw
+    // reach is out of band, uniformly rescale the whole chain to the clamp so
+    // shape (open/closed, curvature) is preserved while length is bounded.
+    let rawReach = 0;
+    for (const c of chain) rawReach = Math.max(rawReach, Math.hypot(c.x, c.y));
+    if (rawReach < 1e-4) { this.legDrawn = false; return; }
+    const reach = Math.max(LEG_REACH_MIN, Math.min(LEG_REACH_MAX, rawReach));
+    if (Math.abs(reach - rawReach) > 1e-6) {
+      const k = reach / rawReach;
+      chain = chain.map((c) => ({ x: c.x * k, y: c.y * k }));
     }
 
-    // farthest hull vertex from the axle (for placing the cube on the surface).
-    let radius = 0;
-    for (const v of hull) radius = Math.max(radius, Math.hypot(v.x, v.y));
-    if (!hull || hull.length < 3 || radius < 1e-3) { this.legDrawn = false; return; }
+    // Spin ceiling from a roughly CONSTANT foot-tip linear speed: w = v_tip /
+    // reach. A long leg therefore spins SLOWER (big, slow strides) and a short
+    // leg FASTER (quick, small strides) — the natural Draw Climber feel — and it
+    // keeps the fast outer foot from flinging the heavy cube on a long lever
+    // (the launch failure for big legs). Honour an explicit spec.motorSpeed.
+    if (spec.motorSpeed == null) {
+      const V_TIP = 9.5; // world units / s at the foot tip
+      this.motorSpeed = Math.max(5, Math.min(16, V_TIP / reach));
+    }
 
-    // Place the AXLE one radius above the surface so a foot bottom sits on the
-    // surface; +0.02 keeps it from starting penetrated. Cube center is AXLE_Y
-    // above the axle.
+    // Place the AXLE so the LOWEST point of the chain (a circle bottom = its
+    // center reach + the circle radius) sits just ABOVE the surface. Using
+    // `reach + LEG_LINE_RADIUS` (not just `reach`) is essential: ignoring the
+    // circle radius spawns the foot 0.16 BELOW the surface, and resolving that
+    // penetration on frame 0 launches the cube backward (verified). The -0.04
+    // clearance keeps it from starting penetrated. Cube center is AXLE_Y above.
     const startSurfaceY = 0; // first segment surface (groundY)
-    const desiredAxleY = startSurfaceY - radius + 0.02;
+    const desiredAxleY = startSurfaceY - (reach + LEG_LINE_RADIUS) - 0.04;
     const desiredCubeY = desiredAxleY - AXLE_Y;
     Body.setPosition(this.cube, { x: this.startX, y: desiredCubeY });
     Body.setVelocity(this.cube, { x: 0, y: 0 });
@@ -300,25 +350,48 @@ export class Physics {
       const axleX = this.cube.position.x + AXLE_X;
       const axleY = this.cube.position.y + AXLE_Y;
 
-      // Solid convex foot from the hull, centered at the axle.
-      const verts = hull.map((v) => ({ x: v.x, y: v.y }));
-      const leg = Bodies.fromVertices(axleX, axleY, [verts], {}, true);
-      if (!leg) { continue; }
-      Body.setPosition(leg, { x: axleX, y: axleY });
-      // Stagger the starting rotation by the phase so the two feet alternate.
-      Body.setAngle(leg, def.phase);
+      // Build the leg as a COMPOUND of small circles laid along the stroke
+      // (circle centers placed about the axle == box origin {0,0}).
+      const parts = chain.map((c) =>
+        Bodies.circle(axleX + c.x, axleY + c.y, LEG_LINE_RADIUS)
+      );
+      const leg = Body.create({ parts });
+      if (!leg || !leg.parts) { continue; }
+      // FORCE the leg's ROTATION PIVOT to the AXLE (not the geometric centroid).
+      // Body.setCentre moves body.position to the axle WITHOUT moving the parts,
+      // so the leg spins ABOUT THE AXLE. This is critical: for an asymmetric
+      // drawing (hook / L) the true centroid is offset from the axle, and a leg
+      // spun about an offset centroid makes its mass ORBIT the pin — the
+      // oscillating centrifugal load resonates through the rigid pin and launches
+      // the cube. Pivoting at the axle removes that whole failure mode, so EVERY
+      // drawn shape is stable. The pin then attaches at the leg's local origin.
+      Body.setCentre(leg, { x: axleX, y: axleY }, false);
+      const pinLocal = { x: 0, y: 0 };
 
-      // L47: material AFTER creation. Grippy foot; heavy so it carries the
-      // body's weight into the contact (traction instead of slip).
+      // Stagger the starting rotation by the phase so the two feet alternate.
+      // Rotation is now about body.position (== the axle), so a plain rotate
+      // keeps the axle fixed.
+      if (def.phase) Body.rotate(leg, def.phase);
+
+      // L47: material AFTER creation. Grippy foot; the leg carries the body's
+      // weight into the contact (traction instead of slip).
       leg.friction = 1.6;
       leg.frictionStatic = 2.0;
       leg.restitution = 0;
       leg.frictionAir = 0;
       // Legs collide with the FLOOR only, and never with each other (shared
-      // negative group overrides category/mask between the two legs).
-      leg.collisionFilter = { category: CAT_LEG, mask: CAT_FLOOR, group: GROUP_LEGS };
+      // negative group overrides category/mask between the two legs). For a
+      // compound the filter must be set on EVERY part (parts collide, not the
+      // parent proxy).
+      setFilterDeep(leg, { category: CAT_LEG, mask: CAT_FLOOR, group: GROUP_LEGS });
       leg.label = 'leg';
       Body.setMass(leg, 1.4);
+      // Give the leg a FIXED, shape-independent rotational inertia. The chain's
+      // computed inertia is tiny (~0.07) and varies with the drawing, so a fixed
+      // motor torque would over-accelerate a thin leg and launch it. A larger,
+      // constant inertia makes the torque->spin response gentle & predictable for
+      // ANY drawn shape (the hard clamp still bounds the top speed).
+      Body.setInertia(leg, 0.6);
 
       Composite.add(this.world, leg);
 
@@ -326,14 +399,19 @@ export class Physics {
         bodyA: this.cube,
         pointA: { x: AXLE_X, y: AXLE_Y },
         bodyB: leg,
-        pointB: { x: 0, y: 0 }, // leg centroid == axle (recentered)
+        pointB: pinLocal, // the box-origin (axle) point in the leg's local frame
         length: 0,
         stiffness: 1,
         damping: 0.1,
       });
       Composite.add(this.world, pin);
 
-      this.legs.push({ body: leg, pin, side: def.side, radius, phase: def.phase });
+      // Keep the stroke polyline (leg-local frame, axle at origin) so the
+      // renderer can draw a thin LINE ribbon — WYSIWYG: same stroke as physics.
+      this.legs.push({
+        body: leg, pin, side: def.side, radius: reach, phase: def.phase,
+        chain, lineRadius: LEG_LINE_RADIUS, pinLocal,
+      });
       this.legConstraints.push(pin);
     }
     this.legDrawn = this.legs.length > 0;
@@ -355,33 +433,124 @@ export class Physics {
    */
   update(_dtMs, running) {
     const drive = running && this.legDrawn && this.motorEnabled;
-    // Governed CONSTANT torque (open-loop) with an angular-speed ceiling. A
-    // constant torque keeps the foot pushing the ground backward every instant,
-    // so propulsion is CONTINUOUS (a PD-to-target torque drops to ~0 once at
-    // speed and the wheel then coasts/slips to a stop — verified). The ceiling
-    // (targetW) stops the spin running away into a launch: while |w| < ceiling
-    // apply the motor torque; once past it, stop adding torque. The torque is
-    // applied to the LEG only — the cube moves solely via the foot's friction.
-    const targetW = this._motorSign * (this.motorSpeed * this.SUB_DT) / 1000;
+    // Motor = a GENTLE CONSTANT TORQUE while below an angular-speed ceiling, plus
+    // a HARD post-step velocity clamp. WHY this split (vs a forced velocity):
+    //   - A forced velocity fights hard contacts: when a foot jams, forcing it to
+    //     keep spinning injects a huge contact impulse and launches the cube.
+    //   - A torque is gentle against contacts, but a circle-chain's inertia is
+    //     tiny & shape-dependent, so a torque alone over-accelerates a thin leg.
+    //   We therefore give every leg a FIXED inertia (predictable torque->accel),
+    //   torque it only while below the ceiling, then HARD-CLAMP the realized spin
+    //   so contact spikes can't run it away. Propulsion is leg-only: with the
+    //   motor OFF no torque is applied, the legs spin free, and the cube does not
+    //   advance (the anti-fake-propulsion assertion holds). The remaining
+    //   defensive clamps (leg/cube speed, anti-teleport) ONLY reduce motion —
+    //   they never add a forward force.
+    const subDtSec = this.SUB_DT / 1000;
+    // Ceiling angular SPEED in Matter units (rad per substep update).
+    const ceiling = this.motorSpeed * subDtSec;
     const torque = this._motorSign * this._motorTorque;
 
     for (let s = 0; s < this.SUBSTEPS; s++) {
       if (drive) {
         for (const l of this.legs) {
           const w = l.body.angularVelocity;
-          // only push while below the ceiling (in the drive direction).
-          if (this._motorSign > 0 ? (w < targetW) : (w > targetW)) {
+          // Apply a gentle motor torque ONLY while below the speed ceiling (in
+          // the drive direction). A torque (not a forced velocity) is gentle
+          // against a jammed foot — a forced velocity fights hard contacts and
+          // launches the cube. The HARD CLAMP below keeps the realized spin
+          // bounded regardless of contact impulses.
+          if (this._motorSign > 0 ? (w < ceiling) : (w > -ceiling)) {
             l.body.torque += torque;
           }
         }
+      } else {
+        // Motor OFF (countdown / win / lose / motor-off verifier): the leg's
+        // axle is a BRAKED bearing, not a free-spinning one — bleed the leg's
+        // angular velocity toward 0 each substep. Without this the foot circles
+        // free-roll under gravity and inch the cube forward over time, which
+        // would (wrongly) look like propulsion with the motor off. Braking the
+        // free leg keeps the motor-OFF cube essentially STATIONARY, so the
+        // leg-driven (anti-fake-propulsion) assertion measures real propulsion.
+        for (const l of this.legs) {
+          Body.setAngularVelocity(l.body, l.body.angularVelocity * 0.5);
+        }
       }
+      // Snapshot the chassis position BEFORE integration so we can detect (and
+      // undo) a single-substep TELEPORT from the pin solver (see anti-teleport
+      // guard below).
+      const preX = this.cube ? this.cube.position.x : 0;
+      const preY = this.cube ? this.cube.position.y : 0;
+
       // No motor (countdown / win / lose / motor-off): legs are FREE (no torque
       // applied) — gravity & contact settle them and the cube does not advance.
       Engine.update(this.engine, this.SUB_DT);
-      // Keep the chassis perfectly upright (inertia is locked, but clamp the
-      // angle defensively against constraint drift). This does NOT move the body
-      // forward, so it cannot mask a stall or a fall.
-      if (this.cube && this.cube.angle !== 0) Body.setAngle(this.cube, 0);
+
+      // ANTI-TELEPORT (the definitive launch guard). When a foot JAMS, Matter's
+      // length-0 pin solver writes a LARGE correction straight into body.position
+      // within ONE substep — a teleport that a velocity clamp can't catch (it
+      // reads the velocity only AFTER the jump). If the chassis moved more than a
+      // physically plausible amount in this sub-dt, we RE-CLAMP its position to
+      // that max step along the move direction and zero its velocity. Max plausi-
+      // ble = STEP_MAX (a foot tip never advances the chassis more than this per
+      // sub-dt in real walking). This only ever PULLS BACK a runaway; it never
+      // pushes the chassis forward, so it can't fake propulsion or mask a fall.
+      if (this.cube) {
+        const dx = this.cube.position.x - preX;
+        const dy = this.cube.position.y - preY;
+        const d = Math.hypot(dx, dy);
+        const STEP_MAX = 0.12; // ~ 43 u/s at sub-dt=1/360s — far above walking
+        if (d > STEP_MAX) {
+          const k = STEP_MAX / d;
+          Body.setPosition(this.cube, { x: preX + dx * k, y: preY + dy * k });
+          Body.setVelocity(this.cube, { x: 0, y: 0 });
+        }
+      }
+
+      // HARD CLAMP each leg's angular velocity to the ceiling AFTER integration.
+      // A contact impulse from a planted foot can spike the spin far past the
+      // motor ceiling and fling the low-inertia chain (launch). Clamping the
+      // realized spin to ±ceiling (a little headroom for free coasting when the
+      // motor is off) removes that failure mode while leaving the WALK intact —
+      // the foot still sweeps the ground at the bounded speed.
+      const clampW = ceiling * 1.6; // headroom > ceiling so coasting isn't killed
+      for (const l of this.legs) {
+        const w = l.body.angularVelocity;
+        if (w > clampW) Body.setAngularVelocity(l.body, clampW);
+        else if (w < -clampW) Body.setAngularVelocity(l.body, -clampW);
+        // DEFENSIVE LEG LINEAR-SPEED CLAMP (anti-fling). When a foot JAMS on a
+        // step edge the rigid pin can fling the leg (and, through the pin, the
+        // chassis) at huge speed. A planted foot's tip moves at most ~V_TIP, so
+        // capping the leg's linear speed to LEGVMAX (generous headroom) stops the
+        // runaway at the source without affecting normal striding. Only reduces
+        // speed; never adds force -> no fake propulsion.
+        const lv = l.body.velocity, LEGVMAX = 16;
+        const lsp = Math.hypot(lv.x, lv.y);
+        if (lsp > LEGVMAX) Body.setVelocity(l.body, { x: lv.x / lsp * LEGVMAX, y: lv.y / lsp * LEGVMAX });
+      }
+      // DEFENSIVE SPEED CLAMP on the cube (anti-fling safety net). A long leg
+      // whose foot JAMS on a stair riser can make the rigid length-0 pin inject
+      // a large positional correction that teleports the heavy chassis (launch).
+      // We cap the chassis SPEED to a sane walking ceiling. This only ever
+      // REDUCES speed — it never adds a forward force — so it cannot fake
+      // propulsion (the motor-OFF cube, which is ~stationary, is unaffected) and
+      // it cannot mask a fall (a falling cube is slowed, not lifted). Walking vx
+      // is ~1-2 u/s so the cap (8 u/s) is pure headroom in normal play.
+      if (this.cube) {
+        const v = this.cube.velocity, VMAX = 8;
+        const sp = Math.hypot(v.x, v.y);
+        if (sp > VMAX) Body.setVelocity(this.cube, { x: v.x / sp * VMAX, y: v.y / sp * VMAX });
+      }
+      // Keep the chassis perfectly UPRIGHT every substep: zero BOTH the angle
+      // AND the angular velocity. With a finite inertia the pin solve leaves a
+      // small residual spin; if we zero only the angle (not the spin) that spin
+      // re-accumulates and fights the clamp -> energy buildup / launch. Zeroing
+      // both makes the cube a pure upright translator. This does NOT move the
+      // body forward, so it cannot mask a stall or a fall.
+      if (this.cube) {
+        if (this.cube.angle !== 0) Body.setAngle(this.cube, 0);
+        if (this.cube.angularVelocity !== 0) Body.setAngularVelocity(this.cube, 0);
+      }
     }
     this._checkExplosion();
   }
@@ -424,9 +593,106 @@ export class Physics {
     }
     return best;
   }
+
+  /**
+   * Geometry metrics of leg[0] in its LOCAL (axle-at-origin) frame — for
+   * verification of (a) length proportion and (b) line-vs-fill representation.
+   * Returns:
+   *   reach        farthest chain sample from the axle (drawn-length proxy)
+   *   strokeLen    arc length of the chain polyline
+   *   lineRadius   physics circle radius (== rendered line half-thickness)
+   *   bboxArea     axis-aligned bbox area of the chain polyline
+   *   lineArea     area actually occupied by the thin stroke ribbon
+   *                (strokeLen * 2*lineRadius + end caps) — the WYSIWYG line area
+   *   hullFillArea area of the CONVEX HULL of the chain + axle (what a filled
+   *                "blob" leg would occupy). lineArea << hullFillArea proves the
+   *                leg is a thin LINE, not a filled polygon.
+   *   parts        number of circle parts (chain length).
+   */
+  legMetrics() {
+    const l = this.legs[0];
+    if (!l) return null;
+    const ch = l.chain, r = l.lineRadius;
+    let reach = 0, strokeLen = 0;
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (let i = 0; i < ch.length; i++) {
+      const c = ch[i];
+      reach = Math.max(reach, Math.hypot(c.x, c.y));
+      minx = Math.min(minx, c.x); maxx = Math.max(maxx, c.x);
+      miny = Math.min(miny, c.y); maxy = Math.max(maxy, c.y);
+      if (i > 0) strokeLen += Math.hypot(c.x - ch[i - 1].x, c.y - ch[i - 1].y);
+    }
+    const bboxArea = Math.max(0, maxx - minx) * Math.max(0, maxy - miny);
+    const lineArea = strokeLen * 2 * r + Math.PI * r * r; // ribbon + round caps
+    // convex hull (of chain + axle) area — the "filled blob" alternative.
+    const pts = ch.map((c) => ({ x: c.x, y: c.y }));
+    pts.push({ x: 0, y: 0 });
+    const hull = Vertices.hull(Vertices.create(pts, null));
+    let hullFillArea = 0;
+    if (hull && hull.length >= 3) hullFillArea = Math.abs(Vertices.area(hull, true));
+    return {
+      reach, strokeLen, lineRadius: r, bboxArea, lineArea, hullFillArea,
+      parts: ch.length,
+    };
+  }
 }
 
 function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+
+/**
+ * Resample a polyline into points spaced ~`spacing` apart along its arc length.
+ * Returns at most `maxPts` points (if the stroke is longer, spacing grows to
+ * fit). Always keeps the first & last vertex. This makes the circle chain
+ * evenly cover the drawn line regardless of how the user dragged it.
+ * @param {{x:number,y:number}[]} pts
+ * @param {number} spacing
+ * @param {number} maxPts
+ */
+function resamplePolyline(pts, spacing, maxPts) {
+  if (pts.length < 2) return pts.slice();
+  // total arc length
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  if (total < 1e-6) return [pts[0]];
+  // grow spacing so we never exceed maxPts circles.
+  const eff = Math.max(spacing, total / (maxPts - 1));
+  const out = [{ x: pts[0].x, y: pts[0].y }];
+  let acc = 0;        // distance walked since last emitted sample
+  let next = eff;
+  for (let i = 1; i < pts.length; i++) {
+    let ax = pts[i - 1].x, ay = pts[i - 1].y;
+    const bx = pts[i].x, by = pts[i].y;
+    let segLen = Math.hypot(bx - ax, by - ay);
+    while (segLen > 1e-9 && acc + segLen >= next) {
+      const t = (next - acc) / segLen;
+      const nx = ax + (bx - ax) * t, ny = ay + (by - ay) * t;
+      out.push({ x: nx, y: ny });
+      // advance start of remaining segment to the emitted point
+      const consumed = next - acc;
+      ax = nx; ay = ny;
+      segLen -= consumed;
+      acc = next; // we are now AT `next` arc length
+      next += eff;
+    }
+    acc += segLen;
+  }
+  const last = pts[pts.length - 1];
+  const tail = out[out.length - 1];
+  if (Math.hypot(last.x - tail.x, last.y - tail.y) > eff * 0.25) out.push({ x: last.x, y: last.y });
+  return out;
+}
+
+/**
+ * Set the collision filter on a compound body AND all of its parts. Matter
+ * collides PARTS (the parent body.parts[0] is just a proxy bound), so a compound
+ * needs the filter applied to every part to be honoured.
+ */
+function setFilterDeep(body, filter) {
+  body.collisionFilter = { ...filter };
+  if (body.parts && body.parts.length > 1) {
+    for (let i = 0; i < body.parts.length; i++) body.parts[i].collisionFilter = { ...filter };
+  }
+}
 
 /** Built-in leg presets (for AI rival & headless default). Box [-1,1]^2. */
 export function presetStroke(name) {
@@ -453,6 +719,43 @@ export function presetStroke(name) {
       { x: 0.5, y: 0.7 },
       { x: 0.85, y: 0.2 },
     ];
+  }
+  // ── Length-preservation test strokes (verifier) ──
+  if (name === 'short') {
+    // a SHORT straight bar through the origin -> short leg / short reach.
+    return [{ x: -0.32, y: 0.18 }, { x: 0.32, y: -0.18 }];
+  }
+  if (name === 'long') {
+    // a LONG straight bar through the origin -> long leg / long reach.
+    return [{ x: -0.95, y: 0.55 }, { x: 0.95, y: -0.55 }];
+  }
+  if (name === 'L') {
+    // an open 'L' (right angle): NOT a filled blob. Open strokes stay open.
+    return [{ x: -0.2, y: -0.9 }, { x: -0.2, y: 0.5 }, { x: 0.9, y: 0.5 }];
+  }
+  if (name === 'arc') {
+    // a wide OPEN ARC (호). Its convex hull encloses a large 2D area (a fat
+    // segment) but the drawn stroke is a thin curved line along the rim.
+    const pts = [];
+    const N = 14;
+    for (let i = 0; i <= N; i++) {
+      const a = Math.PI * (0.15 + (i / N) * 0.7); // ~150° arc
+      pts.push({ x: Math.cos(a) * 0.9, y: Math.sin(a) * 0.9 });
+    }
+    return pts;
+  }
+  if (name === 'ring') {
+    // a NEAR-CLOSED LOOP. Its convex hull is a FILLED DISC (large interior area),
+    // but the drawn stroke is only the thin RIM. The leg's line-ribbon area is
+    // therefore MUCH smaller than the hull-FILL area -> proves the leg is a LINE
+    // tracing the stroke, NOT the filled convex hull (assertion 6).
+    const pts = [];
+    const N = 22;
+    for (let i = 0; i <= N; i++) {
+      const a = (i / N) * Math.PI * 1.9; // ~342° (open loop)
+      pts.push({ x: Math.cos(a) * 0.9, y: Math.sin(a) * 0.9 });
+    }
+    return pts;
   }
   return [{ x: -0.9, y: 0 }, { x: 0.9, y: 0 }];
 }

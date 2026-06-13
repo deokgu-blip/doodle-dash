@@ -310,14 +310,28 @@ export class Physics {
 
     // Resample the polyline at LEG_CIRCLE_SPACING so circles overlap evenly into
     // a continuous thin tube (and so the part count is bounded & shape-faithful).
-    // The axle sits at the box origin {0,0}; reach is measured from there.
     let chain = resamplePolyline(stroke, LEG_CIRCLE_SPACING, LEG_MAX_CIRCLES);
     if (chain.length < 2) { this.legDrawn = false; return; }
 
-    // Reach = farthest sample from the axle (origin). Clamp ONLY the extremes;
-    // between the clamps reach is continuous in the drawn length. If the raw
-    // reach is out of band, uniformly rescale the whole chain to the clamp so
-    // shape (open/closed, curvature) is preserved while length is bounded.
+    // ── ANCHOR = STROKE START (points[0]), NOT the centroid. ──
+    // The reference Draw Climber attaches the drawn line to the cube by its
+    // FIRST point and the line extends OUT ONE WAY from there (a limb), so the
+    // far end (the foot tip) swings around and plants on the ground. The earlier
+    // build pinned the stroke's CENTROID to the axle, so the line straddled the
+    // cube centre and PUNCHED THROUGH it in both directions (user reject). Fix:
+    // translate the whole chain so chain[0] sits at the box origin {0,0}; the
+    // axle (== cube centre) then coincides with the stroke's START, and every
+    // other sample is OUTBOARD of it -> the limb hangs off one side and sweeps.
+    const anchor = { x: chain[0].x, y: chain[0].y };
+    chain = chain.map((c) => ({ x: c.x - anchor.x, y: c.y - anchor.y }));
+
+    // Reach = farthest sample from the ANCHOR (== origin after re-centring on
+    // points[0]) = the line's length from its START to its tip. THIS is the leg
+    // length: a long line -> a long limb whose tip sweeps a big circle; a short
+    // line -> a short limb. Clamp ONLY the extremes; between the clamps reach is
+    // continuous in the drawn length. If out of band, uniformly rescale the whole
+    // chain (about the anchor at origin) so shape is preserved while length is
+    // bounded.
     let rawReach = 0;
     for (const c of chain) rawReach = Math.max(rawReach, Math.hypot(c.x, c.y));
     if (rawReach < 1e-4) { this.legDrawn = false; return; }
@@ -337,15 +351,17 @@ export class Physics {
       this.motorSpeed = Math.max(5, Math.min(16, V_TIP / reach));
     }
 
-    // Place the AXLE (== the cube CENTRE now) so the LOWEST point of the chain
-    // (a circle bottom = its center reach + the circle radius) sits just ABOVE
-    // the surface. The axle is the cube's geometric centre, so the cube FLOATS
-    // ~reach above the track and the leg sweeps DOWN from the centre to plant on
-    // the floor — exactly the reference. Using `reach + LEG_LINE_RADIUS` (not
-    // just `reach`) is essential: ignoring the circle radius spawns the foot
-    // 0.16 BELOW the surface, and resolving that penetration on frame 0 launches
-    // the cube (verified). The -0.04 clearance keeps it from starting penetrated.
-    // With AXLE_Y == 0 the cube centre IS the axle: cubeY = axleY.
+    // Place the AXLE (== the cube CENTRE == the stroke START anchor now) so the
+    // limb's FOOT TIP (the chain sample farthest from the anchor, at distance
+    // `reach`, plus the circle radius) sits just ABOVE the surface. Because the
+    // anchor is the stroke START and the line extends OUT one way, the tip swings
+    // on a circle of radius `reach` about the cube centre — so the cube FLOATS
+    // ~reach above the track and the limb reaches DOWN to plant on the floor
+    // (exactly the reference). Using `reach + LEG_LINE_RADIUS` (not just `reach`)
+    // is essential: ignoring the circle radius spawns the foot 0.16 BELOW the
+    // surface, and resolving that penetration on frame 0 launches the cube
+    // (verified). The -0.04 clearance keeps it from starting penetrated. With
+    // AXLE_Y == 0 the cube centre IS the axle: cubeY = axleY.
     const startSurfaceY = 0; // first segment surface (groundY)
     const desiredAxleY = startSurfaceY - (reach + LEG_LINE_RADIUS) - 0.04;
     const desiredCubeY = desiredAxleY - AXLE_Y;
@@ -371,14 +387,19 @@ export class Physics {
       );
       const leg = Body.create({ parts });
       if (!leg || !leg.parts) { continue; }
-      // FORCE the leg's ROTATION PIVOT to the AXLE (not the geometric centroid).
-      // Body.setCentre moves body.position to the axle WITHOUT moving the parts,
-      // so the leg spins ABOUT THE AXLE. This is critical: for an asymmetric
-      // drawing (hook / L) the true centroid is offset from the axle, and a leg
-      // spun about an offset centroid makes its mass ORBIT the pin — the
-      // oscillating centrifugal load resonates through the rigid pin and launches
-      // the cube. Pivoting at the axle removes that whole failure mode, so EVERY
-      // drawn shape is stable. The pin then attaches at the leg's local origin.
+      // FORCE the leg's ROTATION PIVOT to the AXLE == the stroke START (chain[0],
+      // which we re-centred to the box origin {0,0}, placed at axleX/axleY). NOT
+      // the geometric centroid. Body.setCentre moves body.position to the axle
+      // WITHOUT moving the parts, so the leg spins ABOUT THE STROKE START. This
+      // is what makes the line a LIMB hanging off the cube centre: the start is
+      // pinned at the centre and the rest of the line orbits it, the foot tip
+      // (reach away) sweeping the floor. It is also critical for stability: the
+      // true centroid of an asymmetric drawing (hook / L) is offset from the
+      // anchor, and spinning about an offset centroid makes the mass ORBIT the
+      // pin — the oscillating centrifugal load resonates through the rigid pin
+      // and launches the cube. Pivoting at the anchor removes that failure mode,
+      // so EVERY drawn shape is stable. The pin attaches at the leg's local origin
+      // (== the stroke start).
       Body.setCentre(leg, { x: axleX, y: axleY }, false);
       const pinLocal = { x: 0, y: 0 };
 
@@ -695,6 +716,53 @@ export class Physics {
       parts: ch.length,
     };
   }
+
+  /**
+   * ANCHOR diagnostics (assertion 8): prove the leg is pinned by the stroke's
+   * START (points[0]), NOT its centroid — i.e. the line hangs off one side and
+   * does NOT straddle/punch through the cube centre.
+   *
+   * Measures, for leg[0]:
+   *   axleToStartWorld  WORLD distance from the cube-side axle anchor to the
+   *                     PART that traces chain[0] (the stroke start). chain[0] is
+   *                     at the leg's local origin (== the pin point), so this is
+   *                     ~0: the START is fixed to the axle.
+   *   reach             the limb length (anchor -> farthest sample).
+   *   centroidToAxle    distance from the axle (local origin == chain[0]) to the
+   *                     stroke's CENTROID. For a one-sided limb the centroid sits
+   *                     well OUTBOARD of the start, so this is LARGE (a meaningful
+   *                     fraction of reach). For the rejected centroid-anchored
+   *                     build it would be ~0 (centroid AT the axle).
+   *   centroidFrac      centroidToAxle / reach — the dimensionless "one-sidedness"
+   *                     of the limb. > 0.25 means the centroid is clearly off the
+   *                     axle => the line extends one way (not straddling).
+   */
+  legAnchorInfo() {
+    const l = this.legs[0];
+    if (!l || !l.body || !l.body.parts) return null;
+    const ch = l.chain;
+    // The part tracing chain[0] is parts[1] (parts[0] is the compound proxy). Use
+    // the body's WORLD position of that part vs the cube-side axle anchor.
+    const axleWorld = {
+      x: this.cube.position.x + AXLE_X,
+      y: this.cube.position.y + AXLE_Y,
+    };
+    const startPart = l.body.parts.length > 1 ? l.body.parts[1] : l.body.parts[0];
+    const axleToStartWorld = Math.hypot(
+      startPart.position.x - axleWorld.x,
+      startPart.position.y - axleWorld.y
+    );
+    // reach + stroke centroid in the LOCAL (anchor-at-origin == chain[0]) frame.
+    let reach = 0, cxs = 0, cys = 0;
+    for (const c of ch) {
+      reach = Math.max(reach, Math.hypot(c.x, c.y));
+      cxs += c.x; cys += c.y;
+    }
+    const cx = cxs / ch.length, cy = cys / ch.length;
+    const centroidToAxle = Math.hypot(cx, cy); // axle is the local origin
+    const centroidFrac = reach > 1e-6 ? centroidToAxle / reach : 0;
+    return { axleToStartWorld, reach, centroidToAxle, centroidFrac };
+  }
 }
 
 function clamp01(v) { return Math.max(0, Math.min(1, v)); }
@@ -778,6 +846,37 @@ export function presetStroke(name) {
       { x: -0.2, y: 0.4 },
       { x: 0.5, y: 0.7 },
       { x: 0.85, y: 0.2 },
+    ];
+  }
+  if (name === 'limb') {
+    // A representative DRAWN LEG: a bent limb (dog-leg). points[0] is the START
+    // that anchors at the cube centre; the line then extends OUT and bends, the
+    // far end being the FOOT. This is the canonical anchor-test shape: its
+    // centroid is well OUTBOARD of points[0] (a one-sided limb), proving the line
+    // hangs off one side and does NOT straddle the cube.
+    return [
+      { x: 0.0, y: 0.0 },
+      { x: 0.0, y: 0.55 },
+      { x: 0.45, y: 0.95 },
+    ];
+  }
+  if (name === 'limb_long') {
+    // A LONG bent limb (for the leg_long screenshot): a long line that starts at
+    // points[0] and reaches far OUT one way, then hooks — a big stride limb.
+    return [
+      { x: 0.0, y: -0.2 },
+      { x: 0.1, y: 0.5 },
+      { x: 0.55, y: 0.95 },
+      { x: 0.95, y: 0.8 },
+    ];
+  }
+  if (name === 'limb_short') {
+    // A SHORT bent limb (for the leg_short screenshot): a short stub that starts
+    // at points[0] and reaches only a little way out one side.
+    return [
+      { x: 0.0, y: 0.0 },
+      { x: 0.18, y: 0.28 },
+      { x: 0.42, y: 0.36 },
     ];
   }
   // ── Length-preservation test strokes (verifier) ──

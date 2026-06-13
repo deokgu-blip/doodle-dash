@@ -23,7 +23,21 @@ const COL = {
 const RIVAL_LANE_SIGN = -1;
 
 const RIBBON_DEPTH = 3.6;     // z-extrusion of the track (narrower lane width — reference-like path)
-const RIBBON_DOWN = 0.5;      // how far below the surface the ribbon goes
+const RIBBON_DOWN = 0.9;      // how far below the surface the ribbon's side face drops (visible thickness)
+
+// ── SERPENTINE CURVE (render-only, §C) ──────────────────────────────────────
+// The original track snakes left/right as it recedes. We bend the WHOLE render
+// world in z by laneCurveZ(x) = AMP * sin(x*FREQ). Physics x / progress / win are
+// untouched — this only offsets the ribbon centre-line, the cubes, the legs and
+// the camera target in z. (Verified: finish time identical curve on/off.)
+const CURVE_AMP = 2.5;        // peak z deflection (world units)
+const CURVE_FREQ = 0.12;      // spatial frequency (rad per world-x unit)
+export function laneCurveZ(x) { return CURVE_AMP * Math.sin(x * CURVE_FREQ); }
+
+// Ribbon sampling step along x (world units). Smaller = smoother curve but more
+// verts; 0.5 keeps the continuous band smooth while staying draw-call cheap (one
+// mesh per lane). Stairs are sampled at their riser/tread edges on top of this.
+const RIBBON_DX = 0.5;
 
 // Two legs straddle the cube in DEPTH (z). The cube is ~1.08 deep; legs sit
 // just outside its faces so they clearly read as a left and a right leg.
@@ -46,7 +60,9 @@ export class Renderer {
     this._buildLights();
 
     // y is UP on screen; physics y is +down, so we render with y = -physY.
-    this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
+    // §D: a slightly WIDER FOV (was 50) so the cube reads bigger from a closer,
+    // lower 3/4 chase (reference framing: character ~1/3 of the screen, big sky).
+    this.camera = new THREE.PerspectiveCamera(58, 1, 0.1, 200);
 
     this.cubeMesh = null;    // player cube (smiley face is a child mesh)
     this.legGroups = [];     // [{ mesh, body, side }] — one extruded disc per wheel
@@ -98,59 +114,27 @@ export class Renderer {
     if (this.rivalCubeMesh) { this.scene.remove(this.rivalCubeMesh); }
     this.trackGroup = new THREE.Group();
 
-    // checkerboard texture for the ribbon top (shared by both lanes — same purple
-    // check, as in the reference). One material set, reused (draw-call friendly).
+    // checkerboard texture for the ribbon top (purple check, as in the reference).
+    // One material set, reused across both lanes (draw-call friendly).
     const checker = this._makeChecker();
-    const sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.8 });
-    const topMat = new THREE.MeshStandardMaterial({ map: checker, roughness: 0.5 });
+    const sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.85 });
+    // emissive-tinted top so the purple check survives the grazing 3/4 light
+    // (a pure StandardMaterial top went near-flat under one steep directional).
+    const topMat = new THREE.MeshStandardMaterial({
+      map: checker, roughness: 0.6, emissive: 0x3A1450, emissiveMap: checker, emissiveIntensity: 0.55,
+    });
 
     // rival lane z-centre (parallel lane, one offset away on the -z side).
     this.rivalLaneZ = rivalSpec
       ? RIVAL_LANE_SIGN * (rivalSpec.laneOffset ?? 7.0) : 0;
 
-    const addLane = (laneZ) => {
-      for (const b of physics.floorBodies) {
-        // BoxGeometry material order: +x,-x,+y,-y,+z,-z. +y is top.
-        const mats = [sideMat, sideMat, topMat, sideMat, sideMat, sideMat];
-        if (b._dcRamp) {
-          // RAMP: a TILTED slab whose TOP face is the sloped surface (reference's
-          // smooth hills). Build a box of along-slope length and rotate it to the
-          // ramp angle (render y = -physY, so a physics up = negative-y becomes
-          // up-right on screen). The slab top sits exactly on the surface centre.
-          const r = b._dcRamp;
-          const slabH = r.slabH + RIBBON_DOWN;
-          const geo = new THREE.BoxGeometry(r.span, slabH, RIBBON_DEPTH);
-          const mesh = new THREE.Mesh(geo, mats);
-          // render angle of the top surface: up-right when ascending forward.
-          const ang = Math.atan2(-(r.topY1 - r.topY0), r.len);
-          // centre = midpoint of the surface, dropped half the slab height ALONG
-          // the slab's local down (perpendicular to the tilted top).
-          const surfMidRenderY = -((r.topY0 + r.topY1) / 2);
-          const cx = (r.x0 + r.x1) / 2;
-          mesh.position.set(
-            cx + Math.sin(ang) * (slabH / 2),
-            surfMidRenderY - Math.cos(ang) * (slabH / 2),
-            laneZ
-          );
-          mesh.rotation.z = ang;
-          this.trackGroup.add(mesh);
-          continue;
-        }
-        const w = b.bounds.max.x - b.bounds.min.x;
-        const h = b.bounds.max.y - b.bounds.min.y;
-        const cx = b.position.x;
-        const cyPhys = b.position.y; // physics y (+down)
-        const geo = new THREE.BoxGeometry(w, h + RIBBON_DOWN, RIBBON_DEPTH);
-        const mesh = new THREE.Mesh(geo, mats);
-        mesh.position.set(cx, -(cyPhys + RIBBON_DOWN / 2), laneZ);
-        this.trackGroup.add(mesh);
-      }
-    };
-    // player lane at z=0 (near the camera).
-    addLane(0);
-    // rival lane behind it (its surface model is identical, so reuse player's
-    // floorBodies geometry shifted in z).
-    if (rivalSpec) addLane(this.rivalLaneZ);
+    // §B+§C: each lane is ONE CONTINUOUS ribbon mesh (a constant-width band of
+    // RIBBON_DEPTH) whose centre-line follows (x, surfaceY(x), laneZ+laneCurveZ(x)).
+    // The surface (flats, ramps, stair steps) is traced unbroken, and the
+    // serpentine z-curve is baked into the same vertices — so B (continuous) and C
+    // (winding) are solved in one builder. Physics x is untouched.
+    this._buildRibbon(physics, 0, topMat, sideMat);
+    if (rivalSpec) this._buildRibbon(physics, this.rivalLaneZ, topMat, sideMat);
     this.scene.add(this.trackGroup);
 
     // ── player cube ──
@@ -167,7 +151,124 @@ export class Renderer {
     }
 
     // finish flag (simple marker at finishX) — spans both lanes when racing.
-    this._buildFinish(track, rivalSpec);
+    this._buildFinish(track, rivalSpec, physics);
+  }
+
+  /** Build the ordered (x, surfaceY) profile of the track surface from the physics
+   * segment model — a CONTINUOUS polyline along x. Flats/ramps emit their two
+   * endpoints; stairs emit each tread as a flat run plus a VERTICAL riser (two
+   * samples at the same x), so steps read as sharp steps inside the smooth band.
+   * Returns [{x, y}] with physics y (+down). Used to extrude the continuous ribbon. */
+  _surfaceProfile(physics) {
+    const segs = physics._segs;
+    if (!segs || !segs.length) return [];
+    const pts = [];
+    const push = (x, y) => {
+      const last = pts[pts.length - 1];
+      if (last && Math.abs(last.x - x) < 1e-6 && Math.abs(last.y - y) < 1e-6) return;
+      pts.push({ x, y });
+    };
+    for (const s of segs) {
+      if (s.kind === 'gap') continue;           // no surface over a gap (skip)
+      const y0 = s.surfFn(s.x0), y1 = s.surfFn(s.x1);
+      if (y0 == null || y1 == null) continue;
+      // a riser: if this sample starts ABOVE (more negative) where the previous
+      // one ended, drop a vertical wall first so a stair step is a true step.
+      push(s.x0, y0);
+      push(s.x1, y1);
+    }
+    pts.sort((a, b) => a.x - b.x);
+    return pts;
+  }
+
+  /** §B+§C — build ONE continuous ribbon mesh for a lane. The band has constant
+   * width RIBBON_DEPTH (in z), its centre-line follows (x, -surfaceY(x), laneZ +
+   * laneCurveZ(x)); the top face carries the purple checker, the front/back/under
+   * faces carry the edge colour (visible thickness). The serpentine z-curve is
+   * baked into every vertex so the whole band snakes left/right while the physics
+   * x stays a clean 1-D line. One mesh per lane ⇒ draw-call cheap. */
+  _buildRibbon(physics, laneZ, topMat, sideMat) {
+    const prof = this._surfaceProfile(physics);
+    if (prof.length < 2) return;
+    // Densify: insert intermediate x samples (RIBBON_DX) between profile points so
+    // the z-curve bends smoothly over long flats/ramps; keep the exact profile pts
+    // (incl. stair risers) so steps stay sharp.
+    const xs = [];
+    for (let i = 0; i < prof.length - 1; i++) {
+      const a = prof[i], b = prof[i + 1];
+      xs.push(a.x);
+      const span = b.x - a.x;
+      if (span > RIBBON_DX * 1.5) {
+        const n = Math.floor(span / RIBBON_DX);
+        for (let k = 1; k < n; k++) {
+          const t = k / n;
+          xs.push(a.x + span * t);
+        }
+      }
+    }
+    xs.push(prof[prof.length - 1].x);
+    // surfaceY at an arbitrary x via the physics sampler (highest surface), with a
+    // hold-last fallback so a momentary null (segment seam round-off) never gaps.
+    let lastY = prof[0].y;
+    const surfY = (x) => {
+      const y = physics.surfaceYAt(x);
+      if (y != null) { lastY = y; return y; }
+      return lastY;
+    };
+    const half = RIBBON_DEPTH / 2;
+
+    // Build a top strip (2 rails) + a bottom strip (2 rails, dropped RIBBON_DOWN) so
+    // we get a top face (check) and the two side walls + a bottom (edge colour).
+    const topPos = [], topUV = [], topIdx = [];
+    const sidePos = [], sideIdx = [];
+    let topV = 0, sideV = 0;
+    let prevX = null;
+    const N = xs.length;
+    // checker repeat: ~0.7 cell/world-u along x, and ~2 cells across the band width
+    // (v 0→2) so the purple check reads clearly on the top (reference look).
+    const uScale = 0.7;
+    for (let i = 0; i < N; i++) {
+      const x = xs[i];
+      const ry = -surfY(x);                 // render y (up)
+      const cz = laneZ + laneCurveZ(x);     // serpentine z centre
+      const zN = cz - half, zF = cz + half; // near / far edges
+      // TOP strip: 2 verts (near, far) at the surface.
+      topPos.push(x, ry, zN, x, ry, zF);
+      topUV.push(x * uScale, 0, x * uScale, 2);
+      // SIDE/bottom strip: top edges (= surface) + bottom edges (dropped).
+      const by = ry - RIBBON_DOWN;
+      sidePos.push(
+        x, ry, zN,  x, by, zN,   // near wall top, bottom
+        x, ry, zF,  x, by, zF    // far wall top, bottom
+      );
+      if (i > 0) {
+        // TOP quad between ring i-1 and i.
+        const a = (i - 1) * 2, b = a + 1, c = i * 2, d = c + 1;
+        topIdx.push(a, c, b, b, c, d);
+        // SIDE walls (near + far) + bottom quad. Each ring has 4 side verts:
+        //   base+0 nearTop, +1 nearBot, +2 farTop, +3 farBot.
+        const p = (i - 1) * 4, q = i * 4;
+        // near wall (facing -z / camera): nearTop/nearBot
+        sideIdx.push(p + 0, p + 1, q + 0, q + 0, p + 1, q + 1);
+        // far wall (facing +z)
+        sideIdx.push(p + 2, q + 2, p + 3, p + 3, q + 2, q + 3);
+        // bottom (facing down): nearBot/farBot
+        sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);
+      }
+      prevX = x;
+    }
+    const topGeo = new THREE.BufferGeometry();
+    topGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(topPos), 3));
+    topGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(topUV), 2));
+    topGeo.setIndex(topIdx);
+    topGeo.computeVertexNormals();
+    this.trackGroup.add(new THREE.Mesh(topGeo, topMat));
+
+    const sideGeo = new THREE.BufferGeometry();
+    sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
+    sideGeo.setIndex(sideIdx);
+    sideGeo.computeVertexNormals();
+    this.trackGroup.add(new THREE.Mesh(sideGeo, sideMat));
   }
 
   /** Build a smiley character cube (body colour + face colour) with a dot-eye
@@ -185,21 +286,27 @@ export class Renderer {
     return cube;
   }
 
-  _buildFinish(track, rivalSpec = null) {
+  _buildFinish(track, rivalSpec = null, physics = null) {
     const flagTex = this._makeChecker(6);
     const lanes = rivalSpec ? [0, this.rivalLaneZ] : [0];
+    // sit the flag ON the surface at finishX (render y = -surfaceY) and on the
+    // serpentine band (z + laneCurveZ) so it stays planted as the track winds.
+    const surfY = physics && physics.surfaceYAt(track.finishX);
+    const baseY = (surfY != null) ? -surfY : 0;
+    const cz = laneCurveZ(track.finishX);
     for (const laneZ of lanes) {
+      const z = laneZ + cz;
       const pole = new THREE.Mesh(
         new THREE.PlaneGeometry(0.15, 3),
         new THREE.MeshBasicMaterial({ color: 0xffffff })
       );
-      pole.position.set(track.finishX, 1.4, laneZ);
+      pole.position.set(track.finishX, baseY + 1.5, z);
       this.trackGroup.add(pole);
       const flag = new THREE.Mesh(
         new THREE.PlaneGeometry(1.2, 0.8),
         new THREE.MeshBasicMaterial({ map: flagTex, side: THREE.DoubleSide })
       );
-      flag.position.set(track.finishX + 0.6, 2.4, laneZ);
+      flag.position.set(track.finishX + 0.6, baseY + 2.5, z);
       this.trackGroup.add(flag);
     }
   }
@@ -248,8 +355,10 @@ export class Renderer {
       const mesh = this._buildStrokeRibbon(pts, halfW);
       if (mesh) grp.add(mesh);
       this.scene.add(grp);
-      // z offset by side (straddle) PLUS the lane centre offset.
-      groups.push({ mesh: grp, body, side: l.side, z: laneZ + l.side * LEG_Z_OFFSET });
+      // z offset by side (straddle) PLUS the lane centre offset. The serpentine
+      // curve z (laneCurveZ(x)) is ADDED per-frame in _syncLegGroups (it depends
+      // on the live x), so we keep the static part here and the dynamic part there.
+      groups.push({ mesh: grp, body, side: l.side, laneZ, z: laneZ + l.side * LEG_Z_OFFSET });
     }
     return groups;
   }
@@ -398,8 +507,9 @@ export class Renderer {
       // drawn in the leg-local frame whose origin == that axle. So the cube mesh
       // centre must sit EXACTLY at the physics cube centre (no drop) — then the
       // drawn leg lines emanate from the cube's middle and sweep down to the
-      // ground (the reference look). render y = -physY.
-      this.cubeMesh.position.set(p.x, -p.y, 0);
+      // ground (the reference look). render y = -physY. §C: the player lane is at
+      // z = laneCurveZ(x) so the cube rides the same serpentine band.
+      this.cubeMesh.position.set(p.x, -p.y, laneCurveZ(p.x));
       this.cubeMesh.rotation.z = -physics.cube.angle;
     }
     this._syncLegGroups(this.legGroups);
@@ -409,7 +519,8 @@ export class Renderer {
   syncRival(rival) {
     if (this.rivalCubeMesh && rival.cube) {
       const p = rival.cube.position;
-      this.rivalCubeMesh.position.set(p.x, -p.y, this.rivalLaneZ);
+      // §C: rival lane base + serpentine curve at its own x.
+      this.rivalCubeMesh.position.set(p.x, -p.y, this.rivalLaneZ + laneCurveZ(p.x));
       this.rivalCubeMesh.rotation.z = -rival.cube.angle;
     }
     this._syncLegGroups(this.rivalLegGroups);
@@ -418,61 +529,62 @@ export class Renderer {
   _syncLegGroups(groups) {
     for (const lg of groups) {
       const body = lg.body;
-      // Both legs share the same physics x/y; the z offset gives the two-leg
-      // (left/right) straddle look while each spins at its own (180°-offset)
+      // Both legs share the same physics x/y; the static z offset gives the
+      // two-leg (left/right) straddle, and §C adds laneCurveZ(x) so the legs ride
+      // the serpentine band with the cube. Each leg spins at its own 180°-offset
       // angle — the alternating walk.
-      lg.mesh.position.set(body.position.x, -body.position.y, lg.z);
+      lg.mesh.position.set(body.position.x, -body.position.y, lg.z + laneCurveZ(body.position.x));
       // render y = -physY -> a CCW physics rotation appears CW on screen.
       lg.mesh.rotation.z = -body.angle;
     }
   }
 
-  /** 3/4 chase camera following the cube. Frames both the cube and the
-   * track ribbon below it. */
+  /** §D — 3/4 chase camera, CLOSER + LOWER than before (reference framing: the
+   * cube fills ~1/3 of the screen, sat in the lower-centre with a big sky above,
+   * the winding ribbon receding ahead). Follows the serpentine z-curve so the
+   * cube stays framed as the band snakes. Keeps the smooth _camY vertical glide. */
   updateCamera(physics) {
     const x = physics.cube ? physics.cube.position.x : physics.startX;
-    const y = physics.cube ? -physics.cube.position.y : 0;
-    // 3/4 chase view. With CUBE_DROP the cube renders ~0.9 above the track
-    // surface (render y 0). Aim between them and keep the camera behind & a bit
-    // above so both the smiley cube and the magenta checkerboard ribbon are in
-    // frame, ribbon receding into the distance.
-    // 3/4 chase view: camera behind (-x) and above (+y), looking at the cube
-    // with a downward tilt so the wide magenta checkerboard ribbon reads as the
-    // ground the cube rolls on, receding ahead.
     const cubeRenderY = (physics.cube ? -physics.cube.position.y : 0.9);
-    // Steeper, higher 3/4 chase. The earlier shallow (~25°) angle saw the flat
-    // ribbon nearly edge-on so it hid behind the cube/legs; the reference views
-    // the lane from ~40° above. Sit behind (-x), well above (+y), a bit to the
-    // side (+z) for the 3/4 feel, and look DOWN the track ahead so the magenta
-    // checkerboard reads clearly as the ground receding forward.
-    // Pull the camera more to the +z side so the two legs straddling the cube
-    // in depth (z = ±LEG_Z_OFFSET) are visibly separated (one near, one far),
-    // not stacked dead-on. Keep it behind (-x) and above (+y) for the 3/4 chase.
-    const camX = x - 9.0;
-    // SMOOTH VERTICAL FOLLOW: the body snaps up at each stair step (so the foot
-    // never penetrates — structural 0). Tracking that snapped y directly jolts
-    // the whole view ("화면이 튀어"). Easing a separate _camY toward the cube's
-    // render-y turns the step-up into a glide, so the screen never jumps while
-    // the body's zero-penetration snap is preserved. (X follows directly — the
-    // forward motion is already smooth.)
+    // SMOOTH VERTICAL FOLLOW (kept): the body snaps up at each stair step (so the
+    // foot never penetrates). Easing a separate _camY toward the cube's render-y
+    // turns the step-up into a glide so the screen never jolts.
     if (this._camY == null || !Number.isFinite(this._camY)) this._camY = cubeRenderY;
     else this._camY += (cubeRenderY - this._camY) * 0.10;
-    // RACE FRAMING: when a rival lane exists (at this.rivalLaneZ, the -z side) we
-    // want BOTH parallel lanes in frame — the player lane near/large in the lower
-    // centre and the rival lane receding behind+up. We do this by (a) pulling the
-    // camera a touch higher + further to +z, and (b) aiming the look-at toward a
-    // point BETWEEN the two lanes (biased to the player side so the player stays
-    // dominant lower-centre). With no rival we keep the original single-lane aim.
+    // §C: the cube rides the serpentine band at z = laneCurveZ(x). Smoothly follow
+    // that z too (ease) so the camera tracks the winding without snapping at the
+    // S-curve peaks. (Camera lateral follow is a render-only effect — physics z=0.)
+    const curveZ = laneCurveZ(x);
+    if (this._camCurveZ == null || !Number.isFinite(this._camCurveZ)) this._camCurveZ = curveZ;
+    else this._camCurveZ += (curveZ - this._camCurveZ) * 0.10;
+
     const racing = Math.abs(this.rivalLaneZ) > 1e-3;
-    const camY = this._camY + (racing ? 12.0 : 11.0);
-    const camZ = racing ? 15.0 : 13.0;
+    // CLOSER + LOWER 3/4 chase (was camX=x-9, camY=+11/12, camZ=13/15). Pull in to
+    // ~6 behind, ~6.5 up, ~7.5 to the +z side: the cube gets bigger and the camera
+    // looks more along the track (lower, flatter) so a tall sky sits above it.
+    const camX = x - 6.0;
+    const camY = this._camY + (racing ? 7.2 : 6.4);
+    const camZ = (racing ? 8.5 : 7.6) + this._camCurveZ;
     this.camera.position.set(camX, camY, camZ);
-    // look-at z: 0 (single lane) OR a point ~35% of the way toward the rival lane
-    // (between the lanes, player-biased) so both lanes are diagonally visible.
-    // Aim FURTHER ahead (x+4) so a long stretch of track recedes into frame
-    // (reference framing: small cube, long winding track visible ahead).
-    const lookZ = racing ? this.rivalLaneZ * 0.35 : 0;
-    this.camera.lookAt(x + 4.0, this._camY - 1.5, lookZ);
+    // Look-at: aim a bit AHEAD (x+3) and at a z biased toward the player lane (plus
+    // the curve offset). Aiming the look-y BELOW the cube pushes the cube up into
+    // the lower-centre of the frame and opens up the sky above (reference look).
+    const lookZ = (racing ? this.rivalLaneZ * 0.30 : 0) + this._camCurveZ;
+    this.camera.lookAt(x + 3.0, this._camY - 0.6, lookZ);
+  }
+
+  /** Debug/verify info: how many meshes the track group holds (continuous ribbon
+   * ⇒ a small fixed count: per lane 1 top + 1 side, plus finish poles/flags — NOT
+   * one slab per segment), and a few serpentine-curve z samples (evidence §B/§C). */
+  ribbonInfo(physics) {
+    const meshes = this.trackGroup ? this.trackGroup.children.filter((c) => c.isMesh).length : 0;
+    const x0 = physics ? physics.startX : 0, x1 = physics ? physics.finishX : 1;
+    const samples = [];
+    for (let k = 0; k <= 8; k++) {
+      const x = x0 + (x1 - x0) * (k / 8);
+      samples.push({ x: +x.toFixed(1), z: +laneCurveZ(x).toFixed(3) });
+    }
+    return { trackMeshes: meshes, rivalLaneZ: this.rivalLaneZ, curveSamples: samples };
   }
 
   render() { this.renderer.render(this.scene, this.camera); }
@@ -489,8 +601,10 @@ export class Renderer {
     c.width = c.height = 128;
     const ctx = c.getContext('2d');
     const s = 128 / n;
+    // higher-contrast purple check so the band reads as a checkered track (the
+    // earlier two purples were too close and looked solid from the top-down view).
     for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
-      ctx.fillStyle = ((i + j) % 2 === 0) ? '#8E3AAE' : '#C24FD6';
+      ctx.fillStyle = ((i + j) % 2 === 0) ? '#7A2C9C' : '#C95FE0';
       ctx.fillRect(i * s, j * s, s, s);
     }
     const tex = new THREE.CanvasTexture(c);

@@ -91,7 +91,7 @@ const TUNE = {
   tiltDx: 0.55,          // half-width (world u) of the slope-probe around the body
   tiltLerp: 5.5,         // 1/s — how fast cube.angle eases to the target tilt (lower ⇒ gentler lean, no per-frame snap at segment seams)
   tiltSlewMax: 0.025,    // rad/frame cap on cube.angle change (slew limiter ⇒ no per-frame lean snap at segment seams)
-  tiltMax: 0.85,         // rad — clamp so a near-vertical step can't flip the body
+  tiltMax: 0.65,         // rad — clamp so a near-vertical step can't flip the body (§E: lowered 0.85→0.65, the reference lean is gentler)
   tiltGain: 1.0,         // scale on the measured tangent angle (1 = exact match)
   // CLIMB RULE: a step of height h is climbable iff reach >= climbBase + climbK*h
   // i.e. taller steps demand a longer leg. Solve h_max(reach) = (reach-base)/K.
@@ -898,7 +898,9 @@ export function presetStroke(name) {
   if (name === 'stick') return [{ x: -0.9, y: 0 }, { x: 0.9, y: 0 }];
   if (name === 'hook') return [{ x: -0.2, y: -0.8 }, { x: -0.2, y: 0.4 }, { x: 0.5, y: 0.7 }, { x: 0.85, y: 0.2 }];
   if (name === 'limb') return [{ x: 0.0, y: 0.0 }, { x: 0.0, y: 0.55 }, { x: 0.45, y: 0.95 }];
-  if (name === 'limb_long') return [{ x: 0.0, y: -0.2 }, { x: 0.1, y: 0.5 }, { x: 0.55, y: 0.95 }, { x: 0.95, y: 0.8 }];
+  // §E: a LONGER demo/verify limb so the drawn leg reads as a real long stride
+  // (more pronounced two-leg gait). Farthest sample ≈1.6 (clamps under LEG_REACH_MAX 1.7).
+  if (name === 'limb_long') return [{ x: 0.0, y: -0.25 }, { x: 0.12, y: 0.55 }, { x: 0.62, y: 1.05 }, { x: 1.15, y: 0.95 }];
   if (name === 'limb_short') return [{ x: 0.0, y: 0.0 }, { x: 0.18, y: 0.28 }, { x: 0.42, y: 0.36 }];
   if (name === 'short') return [{ x: -0.32, y: 0.18 }, { x: 0.32, y: -0.18 }];
   if (name === 'long') return [{ x: -0.95, y: 0.55 }, { x: 0.95, y: -0.55 }];

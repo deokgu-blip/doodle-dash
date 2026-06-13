@@ -355,12 +355,20 @@ export class Renderer {
     // in depth (z = ±LEG_Z_OFFSET) are visibly separated (one near, one far),
     // not stacked dead-on. Keep it behind (-x) and above (+y) for the 3/4 chase.
     const camX = x - 5.5;
-    const camY = cubeRenderY + 6.4;
+    // SMOOTH VERTICAL FOLLOW: the body snaps up at each stair step (so the foot
+    // never penetrates — structural 0). Tracking that snapped y directly jolts
+    // the whole view ("화면이 튀어"). Easing a separate _camY toward the cube's
+    // render-y turns the step-up into a glide, so the screen never jumps while
+    // the body's zero-penetration snap is preserved. (X follows directly — the
+    // forward motion is already smooth.)
+    if (this._camY == null || !Number.isFinite(this._camY)) this._camY = cubeRenderY;
+    else this._camY += (cubeRenderY - this._camY) * 0.10;
+    const camY = this._camY + 6.4;
     const camZ = 8.0;
     this.camera.position.set(camX, camY, camZ);
     // Aim only slightly ahead of the cube so the cube sits centered (not shoved
     // to the left edge) with the magenta lane receding ahead of it.
-    this.camera.lookAt(x + 1.5, cubeRenderY - 1.0, 0);
+    this.camera.lookAt(x + 1.5, this._camY - 1.0, 0);
   }
 
   render() { this.renderer.render(this.scene, this.camera); }

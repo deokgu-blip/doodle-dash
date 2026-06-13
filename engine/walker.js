@@ -72,7 +72,7 @@ const LEG_MAX_CIRCLES = 40;      // chain sample cap (shape-faithful, bounded)
 // Tuned for a grounded, planted walk: not too fast/slow, no penetration, no
 // slip, no stop-go jerk. 'natural' is ultimately the user's call.
 const TUNE = {
-  baseSpeed: 3.6,        // world u/s at the reference leg on flat ground
+  baseSpeed: 6.0,        // world u/s at the reference leg on flat ground
   refReach: 1.0,         // reach that maps to legSpeedFactor == 1
   // legSpeedFactor(reach): longer ⇒ bigger stride ⇒ faster. A gentle monotone
   // power curve, clamped. At reach=MIN ≈ 0.66, at reach=MAX ≈ 1.43.

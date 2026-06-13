@@ -22,8 +22,8 @@ const COL = {
 // the parallel lane BEHIND the player and appears slightly smaller (perspective).
 const RIVAL_LANE_SIGN = -1;
 
-const RIBBON_DEPTH = 3.6;     // z-extrusion of the track (narrower lane width — reference-like path)
-const RIBBON_DOWN = 0.9;      // how far below the surface the ribbon's side face drops (visible thickness)
+const RIBBON_DEPTH = 2.6;     // z-extrusion of the track — a slim WINDING PATH (was 3.6, too wide; reference shows a narrow band with field around it)
+const RIBBON_DOWN = 0.6;      // how far below the surface the side face drops — a THIN dark strip under the bright checker top (was 0.9; less dark side, more checker)
 
 // ── SERPENTINE CURVE (render-only, §C) ──────────────────────────────────────
 // The original track snakes left/right as it recedes. We bend the WHOLE render
@@ -118,11 +118,15 @@ export class Renderer {
     // One material set, reused across both lanes (draw-call friendly).
     const checker = this._makeChecker();
     const sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.85 });
-    // emissive-tinted top so the purple check survives the grazing 3/4 light
-    // (a pure StandardMaterial top went near-flat under one steep directional).
-    const topMat = new THREE.MeshStandardMaterial({
-      map: checker, roughness: 0.6, emissive: 0x3A1450, emissiveMap: checker, emissiveIntensity: 0.55,
-    });
+    // TOP is UNLIT (MeshBasicMaterial): exactly like the drawn leg line, the
+    // checker top ignores scene lighting and always renders at the texture's full
+    // vivid colour. This guarantees the check is crisp at ANY camera angle /
+    // light direction — no grazing-light wash-out into a solid purple blob.
+    // DoubleSide so the top face shows regardless of the ribbon triangle winding
+    // (the previous StandardMaterial top was FrontSide; the top tris are wound
+    // facing DOWN, so from above the top was culled and we saw only the dark side
+    // walls — that was the "solid dark purple, no checker" bug).
+    const topMat = new THREE.MeshBasicMaterial({ map: checker, side: THREE.DoubleSide });
 
     // rival lane z-centre (parallel lane, one offset away on the -z side).
     this.rivalLaneZ = rivalSpec
@@ -224,9 +228,11 @@ export class Renderer {
     let topV = 0, sideV = 0;
     let prevX = null;
     const N = xs.length;
-    // checker repeat: ~0.7 cell/world-u along x, and ~2 cells across the band width
-    // (v 0→2) so the purple check reads clearly on the top (reference look).
-    const uScale = 0.7;
+    // checker repeat: bigger cells (reference look). ~0.5 cell/world-u along x and
+    // ~1.6 cells across the (now narrower) band width (v 0→vRepeat) so each square
+    // is large and clearly reads as a checker — not a fine speckle.
+    const uScale = 0.42;
+    const vRepeat = 1.4;
     for (let i = 0; i < N; i++) {
       const x = xs[i];
       const ry = -surfY(x);                 // render y (up)
@@ -234,7 +240,7 @@ export class Renderer {
       const zN = cz - half, zF = cz + half; // near / far edges
       // TOP strip: 2 verts (near, far) at the surface.
       topPos.push(x, ry, zN, x, ry, zF);
-      topUV.push(x * uScale, 0, x * uScale, 2);
+      topUV.push(x * uScale, 0, x * uScale, vRepeat);
       // SIDE/bottom strip: top edges (= surface) + bottom edges (dropped).
       const by = ry - RIBBON_DOWN;
       sidePos.push(
@@ -559,18 +565,22 @@ export class Renderer {
     else this._camCurveZ += (curveZ - this._camCurveZ) * 0.10;
 
     const racing = Math.abs(this.rivalLaneZ) > 1e-3;
-    // CLOSER + LOWER 3/4 chase (was camX=x-9, camY=+11/12, camZ=13/15). Pull in to
-    // ~6 behind, ~6.5 up, ~7.5 to the +z side: the cube gets bigger and the camera
-    // looks more along the track (lower, flatter) so a tall sky sits above it.
-    const camX = x - 6.0;
-    const camY = this._camY + (racing ? 7.2 : 6.4);
-    const camZ = (racing ? 8.5 : 7.6) + this._camCurveZ;
+    // 3/4 chase framed like the reference: a narrow checker PATH winding across the
+    // lower-middle of the frame (~1/3–1/2 of the width) with a big lime field/sky
+    // around it, AND a steep enough DEPRESSION angle that the camera looks DOWN
+    // onto the band's TOP face (so the bright checker — not the dark side walls —
+    // is the dominant visible surface). Earlier the eye was high but it AIMED far
+    // ahead at cube height, skimming the band edge-on ⇒ only the dark sides showed.
+    //   eye ~7 behind, ~9 up, ~9 to the +z side.
+    const camX = x - 7.0;
+    const camY = this._camY + (racing ? 9.4 : 9.0);
+    const camZ = (racing ? 9.5 : 9.0) + this._camCurveZ;
     this.camera.position.set(camX, camY, camZ);
-    // Look-at: aim a bit AHEAD (x+3) and at a z biased toward the player lane (plus
-    // the curve offset). Aiming the look-y BELOW the cube pushes the cube up into
-    // the lower-centre of the frame and opens up the sky above (reference look).
+    // Aim NEAR the cube (only +1.2 ahead) and a touch ABOVE the ground but well
+    // below the eye: this tilts the view DOWN onto the band top so the checker
+    // reads, while still keeping the cube in the lower-centre with field/sky above.
     const lookZ = (racing ? this.rivalLaneZ * 0.30 : 0) + this._camCurveZ;
-    this.camera.lookAt(x + 3.0, this._camY - 0.6, lookZ);
+    this.camera.lookAt(x + 1.2, this._camY - 0.2, lookZ);
   }
 
   /** Debug/verify info: how many meshes the track group holds (continuous ribbon
@@ -601,15 +611,19 @@ export class Renderer {
     c.width = c.height = 128;
     const ctx = c.getContext('2d');
     const s = 128 / n;
-    // higher-contrast purple check so the band reads as a checkered track (the
-    // earlier two purples were too close and looked solid from the top-down view).
+    // VIVID purple check with strong light/dark contrast so the band reads as a
+    // crisp checkered PATH (reference look). The top material is unlit
+    // (MeshBasicMaterial) so these colours show at full brightness regardless of
+    // the grazing 3/4 light — the check never dies into a solid blob.
+    //   bright lilac  #D98CF0  ↔  deep magenta  #8A2BB0
     for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
-      ctx.fillStyle = ((i + j) % 2 === 0) ? '#7A2C9C' : '#C95FE0';
+      ctx.fillStyle = ((i + j) % 2 === 0) ? '#8A2BB0' : '#D98CF0';
       ctx.fillRect(i * s, j * s, s, s);
     }
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.magFilter = THREE.NearestFilter; // keep crisp square cells (no muddy blur)
     return tex;
   }
 

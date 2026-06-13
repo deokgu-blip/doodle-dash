@@ -59,6 +59,12 @@ const AXLE_Y = 0.0;
 // Floor slab thickness below the surface (render only — for the ribbon depth).
 const FLOOR_THICK = 4.0;
 
+// GAIT-LOFT: above this loft height (world u) the support foot has cleared the
+// surface in the current stride, so `airborne` is reported true (the verifier then
+// treats these frames as the float phase of a stride — legs still roll). Small so a
+// real hop is flagged but the grazing plant phase (loft≈0) stays "grounded".
+const LOFT_AIR_EPS = 0.10;
+
 // ── Leg (drawn-stroke) geometry — identical mapping to the old build so the
 //    rendered line and the length→reach relation are unchanged. ──
 const LEG_WORLD_SCALE = 1.0;     // normalized [-1,1] → world units (length preserved)
@@ -137,54 +143,40 @@ const TUNE = {
   // idle ω when v≈0 but a leg exists (so the foot doesn't sit dead) — tiny.
   idleOmega: 0.0,
 
-  // ── AIRBORNE / CREST JUMP (designed, physical) ──
-  // The reference walker, when it hits a CONVEX crest (flat/up → sudden steep
-  // down, a hilltop) WITH SPEED, LAUNCHES off the edge and flies a ballistic arc,
-  // landing further down the descent — it does NOT glue to the surface. We model
-  // this as a designed state: while GROUNDED the body rides surfaceY; at a crest
-  // where the surface's downward acceleration (v²·curvature) exceeds gravity, the
-  // foot can no longer push on the ground → we switch to AIRBORNE and integrate a
-  // true parabola (x keeps its forward v, y under gravity g) until the arc meets
-  // the surface again (LAND → GROUNDED). Faster / sharper crest ⇒ farther flight;
-  // gentle slopes or low speed never trigger (no false jumps on the flat).
-  gravity: 26.0,         // world u/s² downward (physics +down) — arc fall rate
-  crestLookDx: 0.7,      // half-window (world u) to finite-difference the surface slope around the body for crest detection
-  crestAheadDx: 0.7,     // how far AHEAD (world u) to measure the post-crest slope (the descent the body would have to follow)
-  // LAUNCH condition: the surface curls DOWN by Δslope over the crest window. The
-  // ground's downward acceleration if the body STAYED on it is a_surf ≈ v²·dSlope/dx.
-  // When a_surf > gravity·launchMargin the foot would have to be PULLED down faster
-  // than free-fall (impossible — no glue) ⇒ the body leaves the surface. margin>1
-  // gives a little hysteresis so only a real, speed-backed crest launches (no jitter).
-  launchMargin: 1.0,     // a_surf must exceed gravity·this to launch (≥1 ⇒ true ballistic departure)
-  minLaunchSpeed: 3.5,   // u/s — below this horizontal speed the body never launches (slow walks stay grounded)
-  minDropSlope: 0.18,    // the post-crest descent slope (physics +down, downhill>0) must exceed this — gentle dips don't launch
-  airTiltLerp: 6.0,      // 1/s — in the air the body eases its lean toward the FLIGHT-PATH angle (atan(vy/vx)) for a natural arc pose
-  landMergeLerp: 14.0,   // 1/s — on LAND, how fast the body re-settles onto the ground support (a soft touchdown, no snap)
-
-  // ── REACH → JUMP SCALING (spec #2/#3) ──
-  // A LONG leg (big stride) leaps easily, high and far off a downhill edge; a SHORT
-  // leg barely/never leaves the ground (walks down). We scale the launch GATES and
-  // the launch IMPULSE by a normalized reach t = (reach−min)/(max−min) ∈ [0,1].
-  //   • gates EASE as reach grows: long legs trip the launch on gentler/slower crests,
-  //     short legs need a much steeper/faster crest (so they effectively don't fly).
-  //   • a reach-scaled UPWARD boost is added to vy0 so the LONG leg visibly "pops"
-  //     off the lip (big airborne arc); SHORT contributes ~0 (no pop → walk down).
-  // jumpReachPow shapes the t→jump curve (monotone increasing). Tuned so reach≈0.7
-  // (short presets) ⇒ tiny jump factor, reach≈1.7 (long) ⇒ full jump.
-  jumpReachPow: 1.4,        // exponent on normalized reach for the jump factor (>1 ⇒ short suppressed harder)
-  // gate scaling: effective thresholds = base × lerp(gateMax@short, gateMin@long, jf).
-  // higher = harder to launch. SHORT (jf≈0) sees ×gateMax (rarely launches);
-  // LONG (jf≈1) sees ×gateMin (launches readily).
-  launchSpeedGateShort: 1.55, // ×minLaunchSpeed for the shortest leg (needs to be fast)
-  launchSpeedGateLong: 0.80,  // ×minLaunchSpeed for the longest leg (launches even when slower)
-  dropSlopeGateShort: 1.70,   // ×minDropSlope for the shortest leg (needs a steeper drop)
-  dropSlopeGateLong: 0.80,    // ×minDropSlope for the longest leg
-  marginGateShort: 1.70,      // ×launchMargin for the shortest leg (gravity must be more clearly overcome)
-  marginGateLong: 0.80,       // ×launchMargin for the longest leg
-  // launch IMPULSE: an extra UPWARD velocity (physics +down ⇒ negative) at take-off,
-  // scaled by reach. This is the "big stride pops you off the edge" pop that turns a
-  // grazing departure into a visible, far-gliding arc for long legs. 0 for short.
-  jumpBoost: 5.6,             // u/s of extra UP velocity at the longest reach (jf=1); ×jf for shorter
+  // ── GAIT-LOFT (a RUN, not a forced flight) — spec rewrite ──
+  // The walker is ALWAYS running: the legs keep rolling and the body lands once per
+  // stride. On a STEEPER downhill (× speed) a single stride naturally (a) reaches
+  // farther, (b) lofts a little HIGHER and stays off the ground a little LONGER, and
+  // (c) so the legs roll a LITTLE LESS per unit distance (bigger stride = fewer
+  // rotations). There is NO discrete "launch off a crest" — the loft is a smooth,
+  // gait-phase-locked HOP added on top of the surface-follow body height, whose
+  // amplitude/duration grow MONOTONELY with downhill-steepness × speed and is CAPPED
+  // so the cube never flies high. The previous discrete forced launch + frozen-leg
+  // ballistic state is GONE; "airborne" now just means the current stride's hop has
+  // lifted the foot clear of the surface (legs still roll throughout).
+  //
+  //   loft(θ) = loftAmp(slope,v) · hop(θ)        (added ABOVE the grounded pose)
+  // where hop(θ) ∈ [0,1] is a smooth gait pulse that is 0 at each foot-plant (a leg
+  // straight down) and peaks BETWEEN plants (the float phase of a bounding run); and
+  //   loftAmp(slope,v) = loftMax · clamp01(steepNorm) · clamp01(speedNorm)
+  // so flat / uphill / slow ⇒ ~0 loft (grounded walk), steep+fast ⇒ a controlled hop.
+  loftMax: 1.20,         // world-u HARD CAP on the per-stride hop height (the old wheel flew 6.35u — this keeps it grounded-feeling)
+  loftSlopeRef: 0.85,    // downhill slope (physics +down, downhill>0) at which the steepness factor saturates to 1 (gentler ⇒ proportionally less)
+  loftSlopeMin: 0.12,    // below this downhill slope the loft is 0 (gentle dips / flats never hop)
+  loftSpeedRef: 6.5,     // forward speed (u/s) at which the speed factor saturates to 1 (slower ⇒ proportionally less; a slow walk barely hops)
+  loftSpeedMin: 2.5,     // below this speed the loft is 0 (slow walks stay grounded)
+  loftReachRef: 1.3,     // a longer reach (bigger natural stride) lofts a touch more; this reach maps the reach-factor to 1 (shorter ⇒ a little less, but NOT suppressed to 0 — every leg runs)
+  // STRIDE STRETCH: during the float (hop>0) part of a stride the legs roll SLOWER so
+  // a steep stride covers more ground per rotation (spec #2/#3 "roll a little"). At a
+  // foot-plant (hop=0) ω == v/r EXACTLY (no-slip preserved); mid-float ω is divided by
+  // (1 + strideStretch·hop). The stretch scales with the SAME steep×speed factor as the
+  // loft, so flat ground keeps the normal cadence.
+  strideStretch: 1.6,    // max extra rolling-radius factor at full loft (1.6 ⇒ ~2.6× radius mid-float ⇒ ~0.38× cadence there)
+  loftLerp: 16.0,        // 1/s — how fast the live loft eases toward its phase target (smooth, no pop at slope onset)
+  airTiltLerp: 7.0,      // 1/s — body eases its lean a touch faster during the hovering float (nose follows the gentle arc)
+  landMergeLerp: 14.0,   // 1/s — residual touchdown re-settle ease (kept for cosmetic continuity)
+  // reach factor floor: even the shortest leg still runs and lofts a little (never 0).
+  loftReachFloor: 0.55,  // min reach-factor (so short legs hop less, but are not frozen-grounded)
 };
 
 export class Physics {
@@ -220,13 +212,16 @@ export class Physics {
     this._vTip = 0;                  // last foot tip linear speed (u/s)
     this._omega = 0;                 // last leg angular speed (rad/s)
 
-    // ── AIRBORNE state (crest jump) ──
-    this._air = false;               // true while in a ballistic flight (off the ground)
-    this._vy = 0;                    // vertical velocity of the GROUND-CONTACT level (physics +down; up = negative)
-    this._footBaseY = 0;             // y of the foot-contact level (surfaceY-equivalent the body floats on); grounded == surfaceY, airborne == ballistic
-    this._prevFootBaseY = 0;         // previous frame's foot-contact level (to estimate vertical velocity at launch)
-    this._airFrames = 0;             // frames spent airborne in the current flight (diagnostic)
-    this._landMerge = 0;             // 0..1 touchdown re-settle blend (1 right after landing → eases to 0)
+    // ── GAIT-LOFT state (a run, not a forced flight) ──
+    this._air = false;               // true while the current stride's hop has lifted the foot clear of the surface (legs STILL roll)
+    this._vy = 0;                    // vertical velocity of the body (physics +down; up = negative) — derived from the loft change
+    this._footBaseY = 0;             // y of the foot-contact level (== surfaceY under the body; the loft rides ABOVE this)
+    this._prevFootBaseY = 0;         // previous frame's foot-contact level (vertical velocity estimate)
+    this._airFrames = 0;             // frames spent in the loft float of the current stride (diagnostic)
+    this._landMerge = 0;             // residual touchdown re-settle blend (cosmetic continuity)
+    this._loft = 0;                  // live per-frame loft height above the grounded pose (world u, eased toward the phase target)
+    this._loftAmpLive = 0;           // eased loft AMPLITUDE for the current steep×speed (so stride-stretch & loft share one value)
+    this._prevLoft = 0;              // previous frame's loft (for the body vertical velocity)
 
     // gate used by the verifier's leg-driven assertion (motor-off ⇒ no motion).
     this.motorEnabled = true;
@@ -262,6 +257,9 @@ export class Physics {
     this._vy = 0;
     this._airFrames = 0;
     this._landMerge = 0;
+    this._loft = 0;
+    this._loftAmpLive = 0;
+    this._prevLoft = 0;
   }
 
   // ── TERRAIN: build floor slabs (for the renderer) + a height model. ──
@@ -448,6 +446,9 @@ export class Physics {
     this._vy = 0;
     this._airFrames = 0;
     this._landMerge = 0;
+    this._loft = 0;
+    this._loftAmpLive = 0;
+    this._prevLoft = 0;
     const startSurf0 = this.surfaceYAt(track.startX);
     this._footBaseY = (startSurf0 == null) ? groundY : startSurf0;
     this._prevFootBaseY = this._footBaseY;
@@ -658,19 +659,21 @@ export class Physics {
       this._vy = 0;
       this._airFrames = 0;
       this._landMerge = 0;
+      this._loft = 0;
+      this._loftAmpLive = 0;
       this._footBaseY = surf;
       this._prevFootBaseY = surf;
     } else if (this._air) {
-      // CONTINUE while AIRBORNE: a mid-flight redraw must NOT teleport the body to the
-      // ground (that would be a fake landing). Keep the flight going — x / θ / tilt /
-      // _vy / _footBaseY (the ballistic level) all PRESERVED. Only the leg shape (reach)
-      // changed; the arc continues and the next update() step keeps integrating gravity.
+      // CONTINUE while in the LOFT float of a stride: a mid-stride redraw must NOT
+      // teleport the body to the ground (that would be a fake landing snap). The loft
+      // is recomputed every step from phase × slope × v, so we just PRESERVE x / θ /
+      // tilt / the live loft; the next update() keeps the run continuous.
       this.cube.velocity.x = 0; this.cube.velocity.y = 0;
       this.cube.angle = this._angle;
       this._blocked = false;
       this._vx = 0;
       this._vTip = 0;
-      // _x, _theta, _angle, _air, _vy, _footBaseY, _bodyY, _bodyBaseY all PRESERVED.
+      // _x, _theta, _angle, _air, _loft, _footBaseY, _bodyY, _bodyBaseY all PRESERVED.
     } else {
       // CONTINUE (GROUNDED): re-float vertically at the current x for the new leg's
       // reach. x, _theta, _angle, progress are all preserved (carry on running). The
@@ -752,12 +755,12 @@ export class Physics {
     return Math.max(0, Math.min(1, t));
   }
 
-  /** Monotone jump factor jf ∈ [0,1] from reach (spec #2): a LONG leg (reach→MAX)
-   * gives jf→1 (easy, big, far jump); a SHORT leg (reach→MIN) gives jf→0 (eases the
-   * launch gates UP so it barely/never leaves the ground, and ~0 launch boost). The
-   * power >1 suppresses the short half harder so short presets read as "no pop". */
+  /** Monotone reach factor jf ∈ [0,1] from reach (spec #2): a LONG leg (reach→MAX)
+   * gives jf→1 (bigger natural stride ⇒ lofts a touch more/farther), a SHORT leg
+   * (reach→MIN) gives jf→0 (lofts less). Kept as a diagnostic the verifier reports;
+   * the actual loft amplitude uses reachF in _loftAmp (floored so short legs still run). */
   jumpFactor(reach) {
-    return Math.pow(this.reachNorm(reach), TUNE.jumpReachPow);
+    return this.reachNorm(reach);
   }
 
   /** Max step height a given reach can climb (designed rule). */
@@ -855,53 +858,39 @@ export class Physics {
     return bestY;
   }
 
-  /** CREST LAUNCH TEST (called only when GROUNDED). At a CONVEX crest the surface
-   * curls DOWN: the downhill slope just AHEAD is steeper than just BEHIND. If the
-   * body kept following that surface its downward acceleration would be
-   *     a_surf ≈ v² · d(slope)/dx        (curvature × forward-speed²)
-   * which is the centripetal demand of riding a convex hump. A foot can only PUSH,
-   * not PULL — so once a_surf exceeds gravity the foot leaves the ground and the
-   * body flies a parabola (the reference's "speed off a hilltop" launch). We set
-   * the launch vertical velocity to the body's CURRENT along-surface vertical speed
-   * (v·slopeBehind, physics +down) so the arc tangentially continues the pre-crest
-   * motion (smooth departure, no pop). Returns true if it switched to AIRBORNE.
-   * Gated by minLaunchSpeed and minDropSlope so the FLAT (slope≈0, curvature 0) and
-   * slow walks NEVER launch (no false jumps). */
-  _maybeLaunch(v) {
-    // ── REACH-SCALED GATES (spec #2/#3) ──
-    // jf=1 (long leg) ⇒ gates EASE (launch readily, big arc); jf=0 (short leg) ⇒
-    // gates STIFFEN (rarely/never launches → walks down). lerp(short, long, jf).
-    const jf = this.jumpFactor(this._reach);
-    const lerp = (aShort, aLong) => aShort + (aLong - aShort) * jf;
-    const speedGate = TUNE.minLaunchSpeed * lerp(TUNE.launchSpeedGateShort, TUNE.launchSpeedGateLong);
-    const dropGate  = TUNE.minDropSlope   * lerp(TUNE.dropSlopeGateShort,  TUNE.dropSlopeGateLong);
-    const marginGate = TUNE.launchMargin  * lerp(TUNE.marginGateShort,     TUNE.marginGateLong);
+  /** GAIT-LOFT amplitude (world-u peak hop height) for the CURRENT local downhill
+   * steepness × forward speed. This replaces the discrete crest LAUNCH: there is no
+   * trigger and no ballistic state — the body just hops a LITTLE more, the steeper &
+   * faster the descent. Returns 0 on flat / uphill / slow ground (a grounded walk),
+   * rising MONOTONELY toward loftMax (a hard cap so the cube never flies high).
+   *   amp = loftMax · steepF · speedF · reachF
+   * steepF: downhill slope mapped 0 (≤loftSlopeMin) → 1 (≥loftSlopeRef).
+   * speedF: forward v mapped 0 (≤loftSpeedMin) → 1 (≥loftSpeedRef).
+   * reachF: a longer reach (bigger natural stride) lofts a touch more, floored so a
+   *         short leg still runs (never frozen-grounded). */
+  _loftAmp(v) {
+    // local downhill slope just AHEAD (the descent the body is running into). Using a
+    // small forward look makes the loft RAMP UP smoothly as the cube enters a steep
+    // pitch (no per-frame pop), and decay as it flattens out.
+    const slopeHere = this.surfaceSlopeAt(this._x);
+    const slopeAhead = this.surfaceSlopeAt(this._x + 0.6);
+    const slope = Math.max(slopeHere, slopeAhead); // physics +down: downhill > 0
+    if (slope <= TUNE.loftSlopeMin) return 0;
+    const steepF = clamp01((slope - TUNE.loftSlopeMin) / (TUNE.loftSlopeRef - TUNE.loftSlopeMin));
+    if (v <= TUNE.loftSpeedMin) return 0;
+    const speedF = clamp01((v - TUNE.loftSpeedMin) / (TUNE.loftSpeedRef - TUNE.loftSpeedMin));
+    const reachF = Math.max(TUNE.loftReachFloor, Math.min(1, this._reach / TUNE.loftReachRef));
+    return TUNE.loftMax * steepF * speedF * reachF;
+  }
 
-    if (v < speedGate) return false;                  // too slow for this leg → stay grounded
-    const x = this._x;
-    const slopeBehind = this.surfaceSlopeAt(x - TUNE.crestLookDx); // up<0, down>0
-    const slopeAhead = this.surfaceSlopeAt(x + TUNE.crestAheadDx);
-    const dSlope = slopeAhead - slopeBehind;          // convex crest ⇒ +（curls down）
-    if (dSlope <= 0) return false;                     // concave / flat / climbing — no launch
-    if (slopeAhead < dropGate) return false;           // the descent ahead is too gentle for this leg
-    const dxSpan = TUNE.crestLookDx + TUNE.crestAheadDx;
-    const curvature = dSlope / dxSpan;                 // d(slope)/dx
-    const aSurf = v * v * curvature;                   // downward accel demanded to stay glued
-    if (aSurf <= TUNE.gravity * marginGate) return false; // gravity can hold it (for this leg) → grounded
-    // LAUNCH. Base vertical velocity = current along-surface vertical speed (tangential,
-    // smooth departure). PLUS a reach-scaled UPWARD pop (jumpBoost·jf): a long stride
-    // visibly springs off the lip and glides far; a short stride gets ≈0 boost. The
-    // boost is UP (physics +down ⇒ subtract). The whole thing is clamped so a freak
-    // crest can't fling it absurdly (cap grows with the boost so the pop isn't eaten).
-    const vyTangential = v * slopeBehind;              // physics +down; rising crest ⇒ negative (up)
-    const pop = TUNE.jumpBoost * jf;                   // u/s upward, scaled by reach
-    const vy0 = vyTangential - pop;                    // subtract ⇒ more UP
-    const cap = v + pop;                               // allow the reach pop on top of the speed cap
-    this._air = true;
-    this._airFrames = 0;
-    this._vy = clampMag(vy0, cap);
-    this._landMerge = 0;
-    return true;
+  /** GAIT HOP PULSE ∈ [0,1] at the master phase θ. With the two legs 180° apart, a
+   * foot plants twice per π of θ (each leg points ~straight-down once per half-turn).
+   * The hop is 0 AT a plant (body on the ground, foot in contact) and peaks BETWEEN
+   * plants (the float phase). cos(2θ) is +1 at the plants (θ=0,π…) and −1 between, so
+   * 0.5·(1−cos(2θ)) ∈ [0,1] is a smooth pulse that is 0 at every plant and 1 mid-air.
+   * Smooth ⇒ continuous loft, no pop; the body lands once per stride (a real run). */
+  _hopPulse(theta) {
+    return 0.5 * (1 - Math.cos(2 * theta));
   }
 
   // ── MAIN STEP ──
@@ -972,24 +961,17 @@ export class Physics {
     //     (flat→ramp, ramp crest, stair run) can never snap. The legs inherit this
     //     tilt (anchored at the cube centre) so the whole walker leans together.
     {
-      let tgt, lerp;
-      if (this._air) {
-        // AIRBORNE: lean to the FLIGHT-PATH angle (nose follows the arc) — rising at
-        // launch (nose up), pitching down through the apex onto the descent. physics
-        // y +down, so atan(vy/vx): vy<0 (up) ⇒ nose-up (negative), vy>0 ⇒ nose-down.
-        const vxNow = Math.max(1e-3, this._vx);
-        tgt = clampMag(Math.atan2(this._vy, vxNow), TUNE.tiltMax);
-        lerp = TUNE.airTiltLerp;
-      } else {
-        tgt = this._targetTilt(this._x);
-        lerp = TUNE.tiltLerp;
-      }
+      // The body keeps leaning to the SURFACE tangent (nose-down on a descent) even
+      // during the per-stride loft float — a bounding run keeps its down-slope posture,
+      // it does NOT pitch around the small hop arc (that read as the old fake flight).
+      // A touch faster ease during a loft so the nose tracks the descent it is hopping
+      // down — but the per-frame slew stays under the (I) snap cap in EVERY regime (no
+      // pop at the loft↔ground transitions).
+      const tgt = this._targetTilt(this._x);
+      const lerp = this._air ? TUNE.airTiltLerp : TUNE.tiltLerp;
       const a = 1 - Math.exp(-lerp * dt);
       let step = (tgt - this._angle) * a;
-      // keep the per-frame slew cap on the GROUND (anti-snap at seams). In the air the
-      // arc pose may need to swing a touch faster; allow ~2× the cap so the nose can
-      // pitch over the apex (still bounded — no snap).
-      step = clampMag(step, this._air ? TUNE.tiltSlewMax * 2 : TUNE.tiltSlewMax);
+      step = clampMag(step, TUNE.tiltSlewMax);
       this._angle += step;
     }
 
@@ -1013,26 +995,37 @@ export class Physics {
     //     slips (net x ≈ 0 — NO fake forward push). When the motor is off, ω=0.
     let omega = 0;
     const cosA = Math.max(0.2, Math.cos(this._angle || 0)); // along-surface factor
-    if (this._air) {
-      // ── AIRBORNE: FREEZE the legs (spec #1). A person leaping off a downhill edge
-      //    keeps the legs in the take-off pose and glides — the legs do NOT keep
-      //    cycling in mid-air (the previous build's airborne churn read as fake). So
-      //    while off the ground we hold _theta at the launch angle (ω = 0, no advance)
-      //    and resume cycling only on touchdown. The legs still inherit the arc TILT
-      //    (body lean) via _syncLegs, which is the natural "rigid pose follows the
-      //    flight path" look — but the gait phase is locked.
-      omega = 0;
-      this._vTip = 0;
-      this._trying = false;
-    } else if (drive && v > 1e-6) {
+    // GAIT-LOFT amplitude for the current downhill steepness × speed (0 on flat/slow),
+    // eased so it ramps in/out smoothly (no pop at a slope onset). ONE value drives
+    // BOTH the body loft (height) and the stride-stretch (cadence) so they stay in sync.
+    {
+      const ampTarget = drive ? this._loftAmp(v) : 0;
+      const a = 1 - Math.exp(-TUNE.loftLerp * dt);
+      this._loftAmpLive += (ampTarget - this._loftAmpLive) * a;
+      if (this._loftAmpLive < 1e-4) this._loftAmpLive = 0;
+    }
+    // hop pulse ∈ [0,1] at the live phase: 0 at a foot-plant, 1 mid-float.
+    const hop = this._hopPulse(this._theta);
+    // normalized loft intensity ∈ [0,1] (amp scaled by the cap) — drives stride-stretch.
+    const loftIntensity = clamp01(this._loftAmpLive / Math.max(1e-4, TUNE.loftMax));
+    if (drive && v > 1e-6) {
       const vSurf = v / cosA;
       // ry_contact = the deeper (carrying) leg's CURRENT vertical lever (== support
       // depth at the live phase+tilt). Floor it so a near-horizontal pose can't blow
       // ω up; this is the same quantity the body floats on (so foot & body agree).
       const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
-      omega = vSurf / ryContact;
+      // STRIDE STRETCH: during the float (hop>0) part of a STEEP stride the legs roll
+      // SLOWER (the rolling radius is inflated) so the stride covers more ground per
+      // rotation — "roll a little" / bigger boards. At a foot-plant (hop=0) the factor
+      // is 1, so ω == v/r EXACTLY → no-slip is preserved on contact (the only phase the
+      // foot is actually on the ground). Mid-float the foot is clear of the surface, so
+      // the slower roll never slips. The stretch scales with the loft intensity so flat
+      // ground keeps the normal cadence everywhere.
+      const stretch = 1 + TUNE.strideStretch * loftIntensity * hop;
+      omega = vSurf / (ryContact * stretch);
       this._theta += omega * dt;
-      this._vTip = omega * ryContact; // == v_surface (planted foot stationary)
+      this._vTip = omega * ryContact; // == v_surface at a plant (planted foot stationary)
+      this._trying = false;
     } else if (drive && this._blockedByRiser && this._reach > CUBE_SIZE * 0.5) {
       // §C: struggle in place. Spin at the cadence the leg would have if walking on
       // the flat (vNatural/effR) so the churn looks like a real walking effort. The
@@ -1079,55 +1072,41 @@ export class Physics {
 
     this._prevFootBaseY = this._footBaseY;
 
-    if (!this._air) {
-      // ── GROUNDED ──
-      // CREST DETECTION: if the body keeps following the surface, its downward
-      // acceleration would be a_surf ≈ v²·d(slope)/dx (curvature × speed²). At a
-      // CONVEX crest (slope drops: flat/up → steep down) a_surf can exceed gravity —
-      // then the foot can no longer be held down (no glue) and the body LAUNCHES.
-      const launched = this._maybeLaunch(v);
-      if (!launched) {
-        // ride the surface: foot grazes it EVERY frame (no float). The grazing y is
-        // the bob (support oscillation). Track the contact level + its vertical speed.
-        this._footBaseY = groundSurf;
-        this._vy = (this._footBaseY - this._prevFootBaseY) / Math.max(1e-4, dt);
-        this._bodyY = groundedY;
-        // soft touchdown re-settle (decays after a landing) — eases any residual.
-        if (this._landMerge > 1e-3) this._landMerge *= Math.exp(-TUNE.landMergeLerp * dt);
-        else this._landMerge = 0;
-      }
+    // ── GAIT-LOFT BODY HEIGHT (a run, not a forced flight) ──
+    // The contact level is ALWAYS the surface under the body (the foot lands once per
+    // stride — there is no ballistic departure). On top of the grounded pose we add a
+    // smooth, gait-phase-locked HOP: loft = ampLive · hop(θ). It is 0 at each foot-plant
+    // (body grazes the surface, foot in contact) and lifts BETWEEN plants, the steeper &
+    // faster the descent (ampLive), capped at loftMax. So the cube runs along the ground
+    // and floats a LITTLE in each stride — the float grows with the slope, never flies.
+    this._footBaseY = groundSurf;
+    const loftTargetH = this._loftAmpLive * hop; // world-u above the grounded pose
+    // ease the live loft toward the phase target (already smooth, this just removes any
+    // residual step at a redraw / slope onset — no pop).
+    {
+      const a = 1 - Math.exp(-TUNE.loftLerp * dt);
+      this._loft += (loftTargetH - this._loft) * a;
+      if (this._loft < 1e-4) this._loft = 0;
     }
-    if (this._air) {
-      // ── AIRBORNE — integrate the ballistic arc of the CONTACT LEVEL. ──
-      this._vy += TUNE.gravity * dt;            // gravity pulls DOWN (physics +down)
-      this._footBaseY += this._vy * dt;          // the level the body would land on
-      this._airFrames++;
-      // LAND when the descending arc meets the surface DIRECTLY UNDER THE BODY (its
-      // own x), NOT the lead-window min (which still includes the higher ground we
-      // just launched off — that would re-ground us on the launch frame). On a
-      // downhill crest the surface ahead drops away below the arc, so footBaseY (the
-      // contact level) stays ABOVE it (clearance) until the parabola descends onto
-      // the descent: touchdown then. Skip the very first airborne frame so a launch
-      // from a flat lip (vy0≈0) can't instantly re-land before the arc lifts clear.
-      const landSurf = this.surfaceYAt(this._x);
-      const canLand = this._airFrames > 1 && this._vy > 0 && landSurf != null;
-      if (canLand && this._footBaseY >= landSurf - 1e-4) {
-        // TOUCHDOWN → GROUNDED. Snap the contact level onto the surface and re-settle.
-        this._footBaseY = landSurf;
-        this._air = false;
-        this._vy = 0;
-        this._landMerge = 1; // mark a fresh landing (cosmetic ease in the renderer/tilt)
-      }
-      // cube centre rides the arc: it is the grounded pose RAISED by the clearance of
-      // the ballistic contact level above the ground under the body (the legs still
-      // spin in the air, so the bob continues — it just isn't touching anything).
-      const clearance = groundSurf - this._footBaseY; // ≥0 ⇒ contact level above ground
-      this._bodyY = groundedY - Math.max(0, clearance);
-    }
+    // body sits at the grounded pose RAISED by the loft (physics +down ⇒ subtract).
+    this._bodyY = groundedY - this._loft;
+    // vertical velocity of the body (for cube.velocity / render) — the loft's rate.
+    this._vy = -(this._loft - (this._prevLoft || 0)) / Math.max(1e-4, dt);
+    this._prevLoft = this._loft;
+    // "airborne" === the loft has lifted the foot clear of the surface in this stride.
+    // Legs STILL roll throughout (ω>0); this flag only tells the verifier the foot is
+    // legitimately off the ground (so it skips the contact gap / slip / penetration
+    // checks for these frames — they are the float phase of a stride, not a violation).
+    const wasAir = this._air;
+    this._air = this._loft > LOFT_AIR_EPS;
+    if (this._air) this._airFrames++; else this._airFrames = 0;
+    if (wasAir && !this._air) this._landMerge = 1; // touchdown this frame (cosmetic)
+    if (this._landMerge > 1e-3) this._landMerge *= Math.exp(-TUNE.landMergeLerp * dt);
+    else this._landMerge = 0;
 
     // CAMERA BASE: low-pass the cube height so the SCREEN is smooth (no per-foot
-    // bob jolt, no jump snap). The camera follows the GROUND trend — NOT the
-    // airborne arc — so while the cube flies in-frame the screen keeps gliding along
+    // bob jolt, no loft hop jolt). The camera follows the GROUND trend — NOT the
+    // per-stride loft — so while the cube hops in-frame the screen keeps gliding along
     // the terrain (the reference look: the world scrolls smoothly, the cube hops).
     // Target = the grounded vertical-plant height over the ground under the body.
     {
@@ -1148,7 +1127,7 @@ export class Physics {
     this.cube.position.x = this._x;
     this.cube.position.y = this._bodyY;
     this.cube.velocity.x = v;
-    this.cube.velocity.y = this._air ? this._vy : 0;
+    this.cube.velocity.y = this._vy; // loft rate (0 when grounded/flat)
     this.cube.angle = this._angle;
 
     // 6. sync the two leg visuals + their world parts. Foot lowest point is

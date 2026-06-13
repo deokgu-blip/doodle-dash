@@ -8,5 +8,5 @@
     { "kind": "stairs", "length": 4,  "height": 0.9, "steps": 2, "rough": 0.9 },
     { "kind": "flat",   "length": 18, "rough": 0.9 }
   ],
-  "rival": null
+  "rival": { "legPreset": "limb", "pace": 1.0, "laneOffset": 7.0, "name": "BOLT" }
 }

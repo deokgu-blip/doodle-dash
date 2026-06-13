@@ -137,6 +137,11 @@ export class Physics {
 
     // gate used by the verifier's leg-driven assertion (motor-off ⇒ no motion).
     this.motorEnabled = true;
+    // RIVAL/RACE: a forward-speed multiplier (1 = the leg's natural pace). The
+    // computer opponent scales its walker's pace via this so it can be tuned
+    // "competitive". ω is derived from the REALIZED v (post-pace), so no-slip /
+    // no-penetration hold structurally at ANY pace. Player keeps paceFactor=1.
+    this.paceFactor = 1.0;
     // legacy fields some tuning scripts read (harmless no-ops now)
     this.motorSpeed = 0;
     this._fixedSpeed = 0;
@@ -461,6 +466,10 @@ export class Physics {
         }
       }
       v *= terrain;
+
+      // RIVAL pace scaling: applied to the realized speed so ω = v/r still gives
+      // exact no-slip and the foot still grazes (never penetrates) the surface.
+      v *= this.paceFactor;
 
       // 3. advance
       const adv = v * dt;

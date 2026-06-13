@@ -8,7 +8,7 @@
   :root{
     --bg-top:#A6E05A; --bg-bottom:#7FC93C; --hill:#6FB836;
     --track-a:#8E3AAE; --track-b:#C24FD6; --track-edge:#5E2480;
-    --player:#3CA5E5; --player-face:#0E2A3A; --leg:#1A1A1A;
+    --player:#3CA5E5; --player-face:#0E2A3A; --leg:#1A1A1A; --rival:#35C44A;
     --ui-text:#FFFFFF; --ui-shadow:rgba(0,0,0,.25); --accent:#F4C430;
     --draw-box:rgba(255,255,255,.85); --draw-fill:rgba(255,255,255,.10);
     --tap-min:44px; --safe-t:env(safe-area-inset-top); --safe-b:env(safe-area-inset-bottom);
@@ -42,8 +42,11 @@
   #progress-wrap{ flex:1; height:14px; background:rgba(0,0,0,.18); border-radius:7px; position:relative; overflow:visible; }
   #progress-fill{ position:absolute; left:0; top:0; bottom:0; width:0%; background:var(--accent); border-radius:7px; transition:width .08s linear; }
   #you{ position:absolute; top:-6px; left:0%; width:24px; height:24px; margin-left:-12px;
-    border-radius:50%; background:var(--player); border:3px solid #fff; box-shadow:0 1px 3px var(--ui-shadow); transition:left .08s linear; }
-  #flag-end{ position:absolute; right:-2px; top:-8px; font-size:18px; }
+    border-radius:50%; background:var(--player); border:3px solid #fff; box-shadow:0 1px 3px var(--ui-shadow); transition:left .08s linear; z-index:2; }
+  /* rival marker — our opponent's progress on the same bar (distinct colour) */
+  #rival{ position:absolute; top:-6px; left:0%; width:24px; height:24px; margin-left:-12px;
+    border-radius:50%; background:var(--rival); border:3px solid #fff; box-shadow:0 1px 3px var(--ui-shadow); transition:left .08s linear; display:none; z-index:1; }
+  #flag-end{ position:absolute; right:-2px; top:-8px; font-size:18px; z-index:3; }
 
   /* ── countdown ── */
   #countdown{ position:absolute; inset:0; display:none; align-items:center; justify-content:center;
@@ -81,6 +84,7 @@
       <button class="icon-btn" id="btn-restart" title="restart">&#8635;</button>
       <div id="progress-wrap">
         <div id="progress-fill"></div>
+        <div id="rival"></div>
         <div id="you"></div>
         <div id="flag-end">&#127937;</div>
       </div>
@@ -117,6 +121,7 @@
   const hud = {
     progressFill: $('progress-fill'),
     youMarker: $('you'),
+    rivalMarker: $('rival'),
     countdown: $('countdown'),
     overlay: $('overlay'),
     overlayTitle: $('overlay-title'),
@@ -161,6 +166,10 @@
       step: (ms) => game.step(ms),
       forceStart: () => game.forceStart(),
       getState: () => game.getState(),
+      // RIVAL / RACE headless helpers
+      clearRival: () => game.clearRival(),
+      enableRival: (spec) => game.enableRival(spec),
+      loadTrackData: (data) => game.loadTrack(data),
       // verifier hook: toggle the leg motor to prove propulsion comes ONLY from
       // the legs (motor off => cube must barely move).
       setMotorEnabled: (on) => { game.physics.motorEnabled = !!on; },

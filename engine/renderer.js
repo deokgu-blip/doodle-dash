@@ -13,7 +13,14 @@ const COL = {
   bgTop: 0xA6E05A, bgBottom: 0x7FC93C, hill: 0x6FB836,
   trackA: 0x8E3AAE, trackB: 0xC24FD6, trackEdge: 0x5E2480,
   player: 0x3CA5E5, playerFace: 0x0E2A3A, leg: 0x1A1A1A,
+  // RIVAL: our own opponent colour (NOT the original game's character). A bright
+  // lime-emerald cube so it reads as a distinct racer on the parallel lane.
+  rival: 0x35C44A, rivalFace: 0x0B3A18,
 };
+
+// The rival lane sits on the -z side (farther from the +z camera) so it reads as
+// the parallel lane BEHIND the player and appears slightly smaller (perspective).
+const RIVAL_LANE_SIGN = -1;
 
 const RIBBON_DEPTH = 6.0;     // z-extrusion of the track (wide so it reads as ground)
 const RIBBON_DOWN = 0.5;      // how far below the surface the ribbon goes
@@ -41,10 +48,14 @@ export class Renderer {
     // y is UP on screen; physics y is +down, so we render with y = -physY.
     this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
 
-    this.cubeMesh = null;
-    this.faceMesh = null;
+    this.cubeMesh = null;    // player cube (smiley face is a child mesh)
     this.legGroups = [];     // [{ mesh, body, side }] — one extruded disc per wheel
     this.trackGroup = null;
+
+    // RIVAL (computer opponent) — parallel lane, own cube + legs, offset in z.
+    this.rivalCubeMesh = null;
+    this.rivalLegGroups = [];
+    this.rivalLaneZ = 0;     // z centre of the rival lane (set in buildTrack)
 
     // The leg is a DRAWN PEN LINE, not a shaded 3D object. A flat, unlit material
     // keeps it reading as a single solid black stroke (no per-bump specular
@@ -78,63 +89,95 @@ export class Renderer {
     this.scene.add(fill);
   }
 
-  /** Build the track ribbon + ground from the physics floor bodies. */
-  buildTrack(physics, track) {
+  /** Build the track ribbon + ground from the physics floor bodies. When a
+   * `rivalSpec` is given, also build a PARALLEL lane (offset in z) + the rival
+   * cube so the two racers read side-by-side in a diagonal 3/4 view. */
+  buildTrack(physics, track, rivalSpec = null) {
     if (this.trackGroup) { this.scene.remove(this.trackGroup); this._disposeGroup(this.trackGroup); }
     if (this.cubeMesh) { this.scene.remove(this.cubeMesh); }
+    if (this.rivalCubeMesh) { this.scene.remove(this.rivalCubeMesh); }
     this.trackGroup = new THREE.Group();
 
-    // checkerboard texture for the ribbon top
+    // checkerboard texture for the ribbon top (shared by both lanes — same purple
+    // check, as in the reference). One material set, reused (draw-call friendly).
     const checker = this._makeChecker();
+    const sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.8 });
+    const topMat = new THREE.MeshStandardMaterial({ map: checker, roughness: 0.5 });
 
-    // One box per floor body (top surface), checker on top face.
-    for (const b of physics.floorBodies) {
-      const w = b.bounds.max.x - b.bounds.min.x;
-      const h = b.bounds.max.y - b.bounds.min.y;
-      const cx = b.position.x;
-      const cyPhys = b.position.y; // physics y (+down)
-      // render extends the slab down + gives it depth in z
-      const geo = new THREE.BoxGeometry(w, h + RIBBON_DOWN, RIBBON_DEPTH);
-      const sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.8 });
-      const topMat = new THREE.MeshStandardMaterial({ map: checker, roughness: 0.5 });
-      // BoxGeometry material order: +x,-x,+y,-y,+z,-z. +y is top.
-      const mats = [sideMat, sideMat, topMat, sideMat, sideMat, sideMat];
-      const mesh = new THREE.Mesh(geo, mats);
-      mesh.position.set(cx, -(cyPhys + RIBBON_DOWN / 2), 0);
-      this.trackGroup.add(mesh);
-    }
+    // rival lane z-centre (parallel lane, one offset away on the -z side).
+    this.rivalLaneZ = rivalSpec
+      ? RIVAL_LANE_SIGN * (rivalSpec.laneOffset ?? 7.0) : 0;
+
+    const addLane = (laneZ) => {
+      for (const b of physics.floorBodies) {
+        const w = b.bounds.max.x - b.bounds.min.x;
+        const h = b.bounds.max.y - b.bounds.min.y;
+        const cx = b.position.x;
+        const cyPhys = b.position.y; // physics y (+down)
+        const geo = new THREE.BoxGeometry(w, h + RIBBON_DOWN, RIBBON_DEPTH);
+        // BoxGeometry material order: +x,-x,+y,-y,+z,-z. +y is top.
+        const mats = [sideMat, sideMat, topMat, sideMat, sideMat, sideMat];
+        const mesh = new THREE.Mesh(geo, mats);
+        mesh.position.set(cx, -(cyPhys + RIBBON_DOWN / 2), laneZ);
+        this.trackGroup.add(mesh);
+      }
+    };
+    // player lane at z=0 (near the camera).
+    addLane(0);
+    // rival lane behind it (its surface model is identical, so reuse player's
+    // floorBodies geometry shifted in z).
+    if (rivalSpec) addLane(this.rivalLaneZ);
     this.scene.add(this.trackGroup);
 
     // ── player cube ──
-    const cubeGeo = new THREE.BoxGeometry(PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE * 0.9);
-    const cubeMat = new THREE.MeshStandardMaterial({ color: COL.player, roughness: 0.45, metalness: 0.05 });
-    this.cubeMesh = new THREE.Mesh(cubeGeo, cubeMat);
-    // dot-eye face on +z
-    const faceTex = this._makeFace();
-    const faceMat = new THREE.MeshBasicMaterial({ map: faceTex, transparent: true });
-    const faceGeo = new THREE.PlaneGeometry(PHYS_CONST.CUBE_SIZE * 0.92, PHYS_CONST.CUBE_SIZE * 0.92);
-    this.faceMesh = new THREE.Mesh(faceGeo, faceMat);
-    this.faceMesh.position.z = PHYS_CONST.CUBE_SIZE * 0.46;
-    this.cubeMesh.add(this.faceMesh);
+    this.cubeMesh = this._buildCharacterCube(COL.player, COL.playerFace);
     this.scene.add(this.cubeMesh);
 
-    // finish flag (simple marker at finishX)
-    this._buildFinish(track);
+    // ── rival cube (our own opponent — distinct colour, on the parallel lane) ──
+    if (rivalSpec) {
+      this.rivalCubeMesh = this._buildCharacterCube(COL.rival, COL.rivalFace);
+      this.rivalCubeMesh.position.z = this.rivalLaneZ;
+      this.scene.add(this.rivalCubeMesh);
+    } else {
+      this.rivalCubeMesh = null;
+    }
+
+    // finish flag (simple marker at finishX) — spans both lanes when racing.
+    this._buildFinish(track, rivalSpec);
   }
 
-  _buildFinish(track) {
-    const geo = new THREE.PlaneGeometry(0.15, 3);
-    const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    const pole = new THREE.Mesh(geo, mat);
-    pole.position.set(track.finishX, 1.4, 0);
-    this.trackGroup.add(pole);
+  /** Build a smiley character cube (body colour + face colour) with a dot-eye
+   * face on +z. Shared by player and rival (different palette). */
+  _buildCharacterCube(bodyColor, faceColor) {
+    const cubeGeo = new THREE.BoxGeometry(PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE * 0.9);
+    const cubeMat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.45, metalness: 0.05 });
+    const cube = new THREE.Mesh(cubeGeo, cubeMat);
+    const faceTex = this._makeFace(faceColor);
+    const faceMat = new THREE.MeshBasicMaterial({ map: faceTex, transparent: true });
+    const faceGeo = new THREE.PlaneGeometry(PHYS_CONST.CUBE_SIZE * 0.92, PHYS_CONST.CUBE_SIZE * 0.92);
+    const face = new THREE.Mesh(faceGeo, faceMat);
+    face.position.z = PHYS_CONST.CUBE_SIZE * 0.46;
+    cube.add(face);
+    return cube;
+  }
+
+  _buildFinish(track, rivalSpec = null) {
     const flagTex = this._makeChecker(6);
-    const flag = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.2, 0.8),
-      new THREE.MeshBasicMaterial({ map: flagTex, side: THREE.DoubleSide })
-    );
-    flag.position.set(track.finishX + 0.6, 2.4, 0);
-    this.trackGroup.add(flag);
+    const lanes = rivalSpec ? [0, this.rivalLaneZ] : [0];
+    for (const laneZ of lanes) {
+      const pole = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.15, 3),
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      );
+      pole.position.set(track.finishX, 1.4, laneZ);
+      this.trackGroup.add(pole);
+      const flag = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.2, 0.8),
+        new THREE.MeshBasicMaterial({ map: flagTex, side: THREE.DoubleSide })
+      );
+      flag.position.set(track.finishX + 0.6, 2.4, laneZ);
+      this.trackGroup.add(flag);
+    }
   }
 
   /** Rebuild leg meshes to match the current physics legs (after a redraw).
@@ -150,8 +193,20 @@ export class Renderer {
    * drawn stroke. Open/curved strokes stay open & curved; long strokes -> long
    * legs (the polyline carries the preserved drawn length). */
   rebuildLegs(physics) {
-    for (const lg of this.legGroups) { this.scene.remove(lg.mesh); this._disposeMesh(lg.mesh); }
-    this.legGroups = [];
+    this.legGroups = this._buildLegGroups(physics, this.legGroups, 0);
+  }
+
+  /** Rebuild the RIVAL's leg meshes (same builder, centred on the rival lane z). */
+  rebuildRivalLegs(rival) {
+    this.rivalLegGroups = this._buildLegGroups(rival, this.rivalLegGroups, this.rivalLaneZ);
+  }
+
+  /** Shared leg-group builder for both racers. `laneZ` is the lane centre; each
+   * leg is straddled ±LEG_Z_OFFSET about it. Disposes the old groups, returns
+   * the new array. */
+  _buildLegGroups(physics, oldGroups, laneZ) {
+    for (const lg of oldGroups) { this.scene.remove(lg.mesh); this._disposeMesh(lg.mesh); }
+    const groups = [];
     for (const l of physics.legs) {
       const body = l.body;
       const grp = new THREE.Group();
@@ -169,9 +224,10 @@ export class Renderer {
       const mesh = this._buildStrokeRibbon(pts, halfW);
       if (mesh) grp.add(mesh);
       this.scene.add(grp);
-      // z offset by side so the two legs straddle the cube (read as two legs).
-      this.legGroups.push({ mesh: grp, body, side: l.side, z: l.side * LEG_Z_OFFSET });
+      // z offset by side (straddle) PLUS the lane centre offset.
+      groups.push({ mesh: grp, body, side: l.side, z: laneZ + l.side * LEG_Z_OFFSET });
     }
+    return groups;
   }
 
   /** Build a SMOOTH constant-width pen LINE of half-width `halfW` tracing the
@@ -322,7 +378,21 @@ export class Renderer {
       this.cubeMesh.position.set(p.x, -p.y, 0);
       this.cubeMesh.rotation.z = -physics.cube.angle;
     }
-    for (const lg of this.legGroups) {
+    this._syncLegGroups(this.legGroups);
+  }
+
+  /** Sync the rival cube + its legs (call every frame when racing). */
+  syncRival(rival) {
+    if (this.rivalCubeMesh && rival.cube) {
+      const p = rival.cube.position;
+      this.rivalCubeMesh.position.set(p.x, -p.y, this.rivalLaneZ);
+      this.rivalCubeMesh.rotation.z = -rival.cube.angle;
+    }
+    this._syncLegGroups(this.rivalLegGroups);
+  }
+
+  _syncLegGroups(groups) {
+    for (const lg of groups) {
       const body = lg.body;
       // Both legs share the same physics x/y; the z offset gives the two-leg
       // (left/right) straddle look while each spins at its own (180°-offset)
@@ -363,12 +433,20 @@ export class Renderer {
     // forward motion is already smooth.)
     if (this._camY == null || !Number.isFinite(this._camY)) this._camY = cubeRenderY;
     else this._camY += (cubeRenderY - this._camY) * 0.10;
-    const camY = this._camY + 6.4;
-    const camZ = 8.0;
+    // RACE FRAMING: when a rival lane exists (at this.rivalLaneZ, the -z side) we
+    // want BOTH parallel lanes in frame — the player lane near/large in the lower
+    // centre and the rival lane receding behind+up. We do this by (a) pulling the
+    // camera a touch higher + further to +z, and (b) aiming the look-at toward a
+    // point BETWEEN the two lanes (biased to the player side so the player stays
+    // dominant lower-centre). With no rival we keep the original single-lane aim.
+    const racing = Math.abs(this.rivalLaneZ) > 1e-3;
+    const camY = this._camY + (racing ? 7.2 : 6.4);
+    const camZ = racing ? 9.5 : 8.0;
     this.camera.position.set(camX, camY, camZ);
-    // Aim only slightly ahead of the cube so the cube sits centered (not shoved
-    // to the left edge) with the magenta lane receding ahead of it.
-    this.camera.lookAt(x + 1.5, this._camY - 1.0, 0);
+    // look-at z: 0 (single lane) OR a point ~35% of the way toward the rival lane
+    // (between the lanes, player-biased) so both lanes are diagonally visible.
+    const lookZ = racing ? this.rivalLaneZ * 0.35 : 0;
+    this.camera.lookAt(x + 1.5, this._camY - 1.0, lookZ);
   }
 
   render() { this.renderer.render(this.scene, this.camera); }
@@ -395,17 +473,18 @@ export class Renderer {
     return tex;
   }
 
-  _makeFace() {
+  _makeFace(faceColor) {
+    const hex = '#' + ((faceColor == null ? COL.playerFace : faceColor) >>> 0).toString(16).padStart(6, '0');
     const c = document.createElement('canvas');
     c.width = c.height = 128;
     const ctx = c.getContext('2d');
     ctx.clearRect(0, 0, 128, 128);
-    ctx.fillStyle = '#0E2A3A';
+    ctx.fillStyle = hex;
     // two dot eyes
     ctx.beginPath(); ctx.arc(46, 54, 10, 0, Math.PI * 2); ctx.fill();
     ctx.beginPath(); ctx.arc(82, 54, 10, 0, Math.PI * 2); ctx.fill();
     // smile
-    ctx.lineWidth = 6; ctx.strokeStyle = '#0E2A3A'; ctx.lineCap = 'round';
+    ctx.lineWidth = 6; ctx.strokeStyle = hex; ctx.lineCap = 'round';
     ctx.beginPath(); ctx.arc(64, 72, 18, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;

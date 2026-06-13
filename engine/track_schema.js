@@ -21,13 +21,17 @@
  */
 
 /**
- * @typedef {'wheel'|'stick'|'hook'} LegPreset
+ * @typedef {string} LegPreset   one of presetStroke()'s names (e.g. 'limb','limb_long')
  */
 
 /**
+ * Computer opponent (the rival). Runs the SAME procedural walker on a PARALLEL
+ * lane with a fixed designed leg preset, its forward speed scaled by `pace`.
  * @typedef {Object} RivalSpec
- * @property {LegPreset} legPreset
- * @property {number}    speed
+ * @property {LegPreset} legPreset   the rival's drawn-leg shape (fixed, designed)
+ * @property {number}    pace        speed multiplier on the rival's walker (1 = same feel as that leg)
+ * @property {number}   [laneOffset] z separation of the rival lane from the player lane (world units; +behind)
+ * @property {string}   [name]       our own rival nickname for the HUD/label (NOT the original game's)
  */
 
 /**
@@ -39,6 +43,14 @@
  * @property {TrackSegment[]} segments
  * @property {RivalSpec|null} [rival]
  */
+
+/** Default rival used when a track omits `rival` (but a rival is requested). */
+export const RIVAL_DEFAULTS = Object.freeze({
+  legPreset: 'limb',
+  pace: 1.0,
+  laneOffset: 7.0,
+  name: 'BOLT',
+});
 
 /** Default segment material values (used when a segment omits them). */
 export const SEGMENT_DEFAULTS = Object.freeze({
@@ -81,5 +93,13 @@ export function validateTrack(t) {
     if ((s.kind === 'ramp' || s.kind === 'wall') && !(typeof s.height === 'number'))
       throw new Error(`segment[${i}] ${s.kind} needs height`);
   });
+  if (t.rival != null) {
+    const r = t.rival;
+    if (typeof r !== 'object') throw new Error('TrackData.rival must be an object or null');
+    if (typeof r.legPreset !== 'string') throw new Error('rival.legPreset must be a string');
+    if (typeof r.pace !== 'number' || !(r.pace > 0)) throw new Error('rival.pace must be a positive number');
+    if (r.laneOffset != null && typeof r.laneOffset !== 'number')
+      throw new Error('rival.laneOffset must be a number');
+  }
   return /** @type {TrackData} */ (t);
 }

@@ -638,12 +638,15 @@ export class Renderer {
     // AND a moderately LOW depression (~22°) — not the steep top-down we had. Far
     // distance keeps the leg overlap a non-issue while matching the reference's
     // distant, low, over-the-track view.
-    const camX = x - 10.0;
-    const camY = this._camY + (racing ? 7.6 : 7.0);
-    const camZ = (racing ? 11.0 : 10.5) + this._camCurveZ;
+    // SIDE-ON (옆면) like the reference: camera mostly to the +z SIDE with only a
+    // little behind (-x), low height → we see the cube's side profile + both legs,
+    // travel reads left→right, not "diagonal from behind." Far + low.
+    const camX = x - 3.5;
+    const camY = this._camY + (racing ? 5.8 : 5.2);
+    const camZ = (racing ? 13.5 : 13.0) + this._camCurveZ;
     this.camera.position.set(camX, camY, camZ);
     const lookZ = (racing ? this.rivalLaneZ * 0.30 : 0) + this._camCurveZ;
-    this.camera.lookAt(x + 4.5, this._camY - 0.3, lookZ);
+    this.camera.lookAt(x + 1.5, this._camY + 0.2, lookZ);
   }
 
   /** Debug/verify info: how many meshes the track group holds (continuous ribbon

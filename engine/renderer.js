@@ -22,7 +22,7 @@ const COL = {
 // the parallel lane BEHIND the player and appears slightly smaller (perspective).
 const RIVAL_LANE_SIGN = -1;
 
-const RIBBON_DEPTH = 6.0;     // z-extrusion of the track (wide so it reads as ground)
+const RIBBON_DEPTH = 3.6;     // z-extrusion of the track (narrower lane width — reference-like path)
 const RIBBON_DOWN = 0.5;      // how far below the surface the ribbon goes
 
 // Two legs straddle the cube in DEPTH (z). The cube is ~1.08 deep; legs sit

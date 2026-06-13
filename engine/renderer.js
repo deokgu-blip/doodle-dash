@@ -46,7 +46,10 @@ export class Renderer {
     this.legGroups = [];     // [{ mesh, body, side }] — one extruded disc per wheel
     this.trackGroup = null;
 
-    this._legMat = new THREE.MeshStandardMaterial({ color: COL.leg, roughness: 0.6, metalness: 0.1 });
+    // The leg is a DRAWN PEN LINE, not a shaded 3D object. A flat, unlit material
+    // keeps it reading as a single solid black stroke (no per-bump specular
+    // highlights that made the old circle-chain look like a beaded wheel).
+    this._legMat = new THREE.MeshBasicMaterial({ color: COL.leg, side: THREE.DoubleSide });
   }
 
   _buildBackground() {
@@ -152,14 +155,17 @@ export class Renderer {
     for (const l of physics.legs) {
       const body = l.body;
       const grp = new THREE.Group();
-      // The stored chain is in the leg's AXLE-LOCAL frame (axle at origin). The
-      // body's transform is about its CENTROID; the axle sits at pinLocal from
-      // the centroid in the rest frame. So a chain point's offset from the
-      // centroid (rest frame, angle 0) is pinLocal + chainPoint. We render in
-      // that centroid-relative frame; sync() then applies body.position/angle.
+      // WYSIWYG, RIGID: the leg visual is the user's ORIGINAL stroke polyline,
+      // built ONCE here as a single smooth thin pen line. The stored chain is in
+      // the leg's AXLE-LOCAL frame (axle == origin == stroke start). pinLocal is
+      // {0,0}. We build the line in that local frame and sync() then just places
+      // the group at the axle and rotates it by the physics leg angle — the drawn
+      // shape NEVER deforms, it only spins as a whole.
       const pin = l.pinLocal || { x: 0, y: 0 };
       const pts = l.chain.map((c) => ({ x: pin.x + c.x, y: pin.y + c.y }));
-      const halfW = (l.lineRadius || 0.16);
+      // Visible half-width ~= the physics circle radius so the drawn line ≈ the
+      // collision shape (WYSIWYG). A touch under the radius keeps it slim.
+      const halfW = (l.lineRadius || 0.13) * 0.95;
       const mesh = this._buildStrokeRibbon(pts, halfW);
       if (mesh) grp.add(mesh);
       this.scene.add(grp);
@@ -168,50 +174,115 @@ export class Renderer {
     }
   }
 
-  /** Build a thin LINE ribbon (rounded polyline) of half-width `halfW` along the
-   * centroid-relative polyline `pts` (physics y, +down). Returns a single mesh.
-   * The ribbon is built from quads between consecutive points plus round caps/
-   * joints (circles) so it reads as a smooth pen stroke, not a chain of dots. */
+  /** Build a SMOOTH constant-width pen LINE of half-width `halfW` tracing the
+   * polyline `pts` (physics frame, y +down). Returns a single mesh.
+   *
+   * The earlier builder stacked a full DISC at every chain sample; with the
+   * samples spaced ~ the disc radius those discs bulged perpendicular to the
+   * line and produced a "string of beads / wheel-tread" look that churned as the
+   * leg spun (user reject). This builder instead OFFSETS the centerline by ±halfW
+   * using the MITER of adjacent segment normals, so the two edges run parallel to
+   * the stroke at a uniform width — a clean drawn line. Round CAPS are added at
+   * the two ENDS only (semicircles), so ends are rounded like a felt-tip pen but
+   * the body of the line stays smooth with no interior bumps.
+   */
   _buildStrokeRibbon(pts, halfW) {
     if (!pts || pts.length < 1) return null;
+    // Render-frame centerline (render y = -physY). De-duplicate coincident pts.
+    const C = [];
+    for (const p of pts) {
+      const q = { x: p.x, y: -p.y };
+      if (C.length === 0 || Math.hypot(q.x - C[C.length - 1].x, q.y - C[C.length - 1].y) > 1e-5) C.push(q);
+    }
     const positions = [];
     const idx = [];
     let base = 0;
     const pushTri = (a, b, c) => { idx.push(a, b, c); };
-    // Segment quads.
-    for (let i = 0; i < pts.length - 1; i++) {
-      const a = pts[i], b = pts[i + 1];
-      let dx = b.x - a.x, dy = b.y - a.y;
+
+    if (C.length === 1) {
+      // A dot — just a disc.
+      this._pushDisc(positions, idx, C[0].x, C[0].y, halfW, 0, Math.PI * 2, () => base, (n) => { base = n; });
+      const geo = this._thicken2D(positions, idx, LEG_THICK);
+      return new THREE.Mesh(geo, this._legMat);
+    }
+
+    // Per-segment unit tangents.
+    const seg = [];
+    for (let i = 0; i < C.length - 1; i++) {
+      let dx = C[i + 1].x - C[i].x, dy = C[i + 1].y - C[i].y;
       const len = Math.hypot(dx, dy) || 1;
-      dx /= len; dy /= len;
-      // normal (perp), in physics frame
-      const nx = -dy * halfW, ny = dx * halfW;
-      // render y = -physY for each corner
-      const aL = { x: a.x + nx, y: -(a.y + ny) };
-      const aR = { x: a.x - nx, y: -(a.y - ny) };
-      const bL = { x: b.x + nx, y: -(b.y + ny) };
-      const bR = { x: b.x - nx, y: -(b.y - ny) };
-      positions.push(aL.x, aL.y, aR.x, aR.y, bL.x, bL.y, bR.x, bR.y);
-      pushTri(base, base + 1, base + 2);
-      pushTri(base + 1, base + 3, base + 2);
-      base += 4;
+      seg.push({ x: dx / len, y: dy / len });
     }
-    // Round joints/caps: a small disc at every point so corners & ends are round.
-    const SEG = 8;
-    for (const p of pts) {
-      const cx = p.x, cy = -p.y;
-      const center = base;
-      positions.push(cx, cy);
-      for (let k = 0; k <= SEG; k++) {
-        const a = (k / SEG) * Math.PI * 2;
-        positions.push(cx + Math.cos(a) * halfW, cy + Math.sin(a) * halfW);
-      }
-      for (let k = 0; k < SEG; k++) pushTri(center, center + 1 + k, center + 2 + k);
-      base += SEG + 2;
+    // Per-vertex left-offset vector (miter). Interior vertices use the averaged
+    // (miter) normal so the band keeps a constant perpendicular width through
+    // bends; the miter length is clamped so a sharp corner doesn't spike out.
+    const off = [];
+    const MITER_MAX = 2.5; // clamp factor on the miter so sharp hooks stay bounded
+    for (let i = 0; i < C.length; i++) {
+      const tA = seg[Math.max(0, i - 1)];
+      const tB = seg[Math.min(seg.length - 1, i)];
+      // segment normals (left side): n = (-t.y, t.x)
+      const nAx = -tA.y, nAy = tA.x;
+      const nBx = -tB.y, nBy = tB.x;
+      let mx = nAx + nBx, my = nAy + nBy;
+      const ml = Math.hypot(mx, my);
+      if (ml < 1e-4) { mx = nBx; my = nBy; } // 180° reversal — fall back
+      else { mx /= ml; my /= ml; }
+      // scale so the projection onto the segment normal equals halfW (constant width)
+      let scale = halfW / Math.max(1e-3, (mx * nBx + my * nBy));
+      const cap = halfW * MITER_MAX;
+      if (scale > cap) scale = cap;
+      off.push({ x: mx * scale, y: my * scale });
     }
+    // Two parallel rails -> quads per segment.
+    for (let i = 0; i < C.length; i++) {
+      const L = { x: C[i].x + off[i].x, y: C[i].y + off[i].y };
+      const R = { x: C[i].x - off[i].x, y: C[i].y - off[i].y };
+      positions.push(L.x, L.y, R.x, R.y);
+    }
+    for (let i = 0; i < C.length - 1; i++) {
+      const a = i * 2;            // L[i]
+      const b = i * 2 + 1;        // R[i]
+      const c = (i + 1) * 2;      // L[i+1]
+      const d = (i + 1) * 2 + 1;  // R[i+1]
+      pushTri(a, b, c);
+      pushTri(b, d, c);
+    }
+    base = C.length * 2;
+
+    // Round CAPS at the two ends (semicircle fans), oriented outward.
+    const startT = seg[0];
+    const endT = seg[seg.length - 1];
+    // start cap: faces backward along -startT, sweeping from +normal to -normal
+    {
+      const a0 = Math.atan2(startT.x, -startT.y); // angle of the +left normal
+      this._pushDisc(positions, idx, C[0].x, C[0].y, halfW, a0, a0 + Math.PI,
+        () => base, (n) => { base = n; });
+    }
+    {
+      const a0 = Math.atan2(-endT.x, endT.y); // angle of the -left normal at the tip
+      this._pushDisc(positions, idx, C[C.length - 1].x, C[C.length - 1].y, halfW, a0, a0 + Math.PI,
+        () => base, (n) => { base = n; });
+    }
+
     // 2D triangle soup -> extrude in z into a slim 3D leg (front+back faces).
     const geo = this._thicken2D(positions, idx, LEG_THICK);
     return new THREE.Mesh(geo, this._legMat);
+  }
+
+  /** Append a filled circular fan (cx,cy radius r) sweeping from angle a0..a1 to
+   * the 2D triangle soup. getBase()/setBase track the running vertex index. */
+  _pushDisc(positions, idx, cx, cy, r, a0, a1, getBase, setBase) {
+    const SEG = 10;
+    let base = getBase();
+    const center = base;
+    positions.push(cx, cy);
+    for (let k = 0; k <= SEG; k++) {
+      const a = a0 + (a1 - a0) * (k / SEG);
+      positions.push(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    }
+    for (let k = 0; k < SEG; k++) idx.push(center, center + 1 + k, center + 2 + k);
+    setBase(base + SEG + 2);
   }
 
   /** Turn a flat 2D triangle soup (positions[x,y...], idx) into a thin extruded

@@ -163,7 +163,7 @@ export class Physics {
     this._clampHead = 1.12;   // realized-spin clamp headroom above per-leg target;
     // tight so the leg RIDES its per-leg ceiling -> realized speed ~= target (the
     // phase-lock governor needs the realized speed to track the modulated target).
-    this._fixedSpeed = 6.0;   // fixed angular speed (rad/s) for every shape; tuned
+    this._fixedSpeed = 3.0;   // fixed angular speed (rad/s) for every shape; tuned
     this._legPhase = Math.PI; // phase offset of the 2nd leg (PI=alternating gait)
     // ── PHASE LOCK (alternating gait) — STIFF SYMMETRIC VELOCITY COUPLING ──
     // PROBLEM: the two legs are independently torque-driven, so under load one
@@ -728,7 +728,7 @@ export class Physics {
       // it cannot mask a fall (a falling cube is slowed, not lifted). Walking vx
       // is ~1-2 u/s so the cap (8 u/s) is pure headroom in normal play.
       if (this.cube) {
-        const v = this.cube.velocity, VMAX = 8;
+        const v = this.cube.velocity, VMAX = 3;
         const sp = Math.hypot(v.x, v.y);
         if (sp > VMAX) Body.setVelocity(this.cube, { x: v.x / sp * VMAX, y: v.y / sp * VMAX });
       }

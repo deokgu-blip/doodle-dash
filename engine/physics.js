@@ -124,6 +124,17 @@ export class Physics {
     this.FIXED_DT = 1000 / 60;
     this.SUBSTEPS = 6;                 // 6 substeps -> sub-dt = 1/360s
     this.SUB_DT = this.FIXED_DT / this.SUBSTEPS;
+    // ── UNIT NOTE (root cause of the old "fling/slip" bug) ──
+    // Matter's body.velocity is the raw Δposition over the LAST Body.update call
+    // (one SUB_DT here), and Body.setVelocity(b, v) lands v as that SAME raw
+    // velocity (Δpos per substep). So BOTH use "Δpos per substep" units, and the
+    // real speed is value / (SUB_DT/1000). The OLD caps mixed this up: a "VMAX = 3"
+    // passed to setVelocity is 3 Δpos/substep == 3 / (1/360 s) == 1080 u/s — the
+    // caps were ~hundreds-x too loose and NEVER fired, letting the rigid pin fling
+    // the chassis at 150+ u/s while the planted foot skidded (slipRatio ~3-15).
+    // Verified empirically; we now standardize on REAL u/s (see _us2vel/_vel2us).
+    this._baseDelta = 1000 / 60;       // Matter Body._baseDelta (reference only)
+    this._subSec = this.SUB_DT / 1000; // seconds per substep (the conversion unit)
 
     this.cube = null;
     this.legs = [];        // [{ body, pin, side, radius, phase }]
@@ -163,7 +174,7 @@ export class Physics {
     this._clampHead = 1.12;   // realized-spin clamp headroom above per-leg target;
     // tight so the leg RIDES its per-leg ceiling -> realized speed ~= target (the
     // phase-lock governor needs the realized speed to track the modulated target).
-    this._fixedSpeed = 3.0;   // fixed angular speed (rad/s) for every shape; tuned
+    this._fixedSpeed = 7.0;   // fixed angular speed (rad/s) for every shape; tuned
     this._legPhase = Math.PI; // phase offset of the 2nd leg (PI=alternating gait)
     // ── PHASE LOCK (alternating gait) — STIFF SYMMETRIC VELOCITY COUPLING ──
     // PROBLEM: the two legs are independently torque-driven, so under load one
@@ -217,7 +228,44 @@ export class Physics {
     this.finishX = 1;
     this._exploded = false;
     this.surfaceY = 0;
+
+    // ── NO-SLIP ROLLING (user-confirmed model A: rotating legs, no skid) ──
+    // The chassis must be free to reach the ROLLING speed v_roll = ω·reach so the
+    // planted foot stays put (grip) while the body rolls over it. The old code
+    // capped the chassis far BELOW v_roll (after the unit bug, "3" looked like a
+    // low number but was 180 u/s, while the REAL clamp the author intended would
+    // have throttled the foot into a skid). We set the launch guard WELL ABOVE the
+    // rolling speed so it only kills solver flings, never the legitimate roll.
+    // CHASSIS_VMAX is a multiple of v_roll (computed per-stroke in setLegStroke).
+    this._chassisVmax = 9.0;   // u/s hard cap on chassis speed (anti-launch only);
+    // recomputed in setLegStroke to max(this, rollMult * v_roll).
+    this._rollVmaxMult = 1.6;  // launch cap = rollMult * v_roll (headroom for roll)
+    this._stepMaxUs = 14;      // anti-teleport: max chassis move per substep (u/s)
+    this._legVmaxUs = 18;      // anti-fling: max leg linear speed (u/s)
+    // GRIP ASSIST: when a foot is planted, gently pull the chassis toward the
+    // rolling velocity (ω·r) of that contact. This is NOT an artificial forward
+    // force — it is derived ENTIRELY from the leg's spin ω and contact geometry
+    // (the no-slip rolling constraint). With the motor OFF ω→0 so the target is 0
+    // and nothing is added: the anti-fake-propulsion check still holds. It removes
+    // the residual skid that friction alone leaves and the coast-jerk between
+    // strokes by keeping the body riding its planted foot.
+    this._gripAssist = true;
+    this._gripK = 0.3;         // low-pass factor for the smoothed rolling advance
+    // (per substep): smaller -> smoother glide through the dead phase (de-jerk),
+    // larger -> snappier grip. 0.3 balances slip vs jerk across shapes (tuned).
+    this._gripMinRyFrac = 0.1; // a foot only "drives" when its downward lever arm
+    // ry exceeds this fraction of reach (a genuine planted power-foot); grazing
+    // feet near the top don't brake the coast (anti-jerk).
+    this._rollDx = 0;          // smoothed per-substep rolling advance (raw units)
   }
+
+  // Matter's raw body.velocity is Δposition per the last Body.update (one
+  // SUB_DT). Body.setVelocity's arg lands as that same raw velocity. So BOTH use
+  // "Δpos per substep" units, and u/s = raw / _subSec.
+  // Convert a desired chassis speed in u/s to Matter's setVelocity arg.
+  _us2vel(us) { return us * this._subSec; }
+  // Convert raw body.velocity (Δpos per substep) to u/s.
+  _vel2us(v) { return v / this._subSec; }
 
   reset() {
     Composite.clear(this.world, false);
@@ -315,7 +363,10 @@ export class Physics {
     const cube = Bodies.rectangle(cx, cy, CUBE_SIZE, CUBE_SIZE);
     cube.friction = 0;          // FRICTIONLESS: the belly can NEVER drive the
     cube.frictionStatic = 0;    // cube forward (zero traction) — all propulsion
-    cube.frictionAir = 0.002;   // must come from the legs.
+    cube.frictionAir = 0.0008;  // LOW air drag so the body COASTS through the dead
+    // phase between power strokes (carries momentum forward) instead of stalling —
+    // this smooths the "툭툭" stop-go jerk. Propulsion still comes only from the
+    // legs (motor OFF -> no spin -> no v_roll -> no advance, then drag halts it).
     cube.restitution = 0;
     // The cube collides with the floor ONLY as a deep-fall safety net. With the
     // axle at the cube CENTRE the cube FLOATS ~reach ABOVE the surface (its
@@ -532,6 +583,16 @@ export class Physics {
       this.legConstraints.push(pin);
     }
     this.legDrawn = this.legs.length > 0;
+
+    // ── NO-SLIP ROLLING: size the chassis launch cap from the ROLLING speed. ──
+    // A planted foot rolls the body forward at v_roll = ω·reach. The chassis MUST
+    // be free to reach v_roll (else the foot is forced to skid — the user's "발이
+    // 헛돈다" bug). So the launch cap is set ABOVE v_roll with headroom; it then
+    // only catches solver flings, never the legitimate roll. reach here is the
+    // post-clamp leg length so a long leg gets a proportionally higher cap.
+    const vRoll = this.motorSpeed * reach; // u/s (motorSpeed is ω in rad/s)
+    this._vRoll = vRoll;
+    this._chassisVmax = Math.max(this._chassisVmax, vRoll * this._rollVmaxMult);
   }
 
   /**
@@ -567,6 +628,7 @@ export class Physics {
     // assertion holds). The defensive clamps (leg/cube speed, anti-teleport)
     // ONLY reduce motion — they never add a forward force.
     const subDtSec = this.SUB_DT / 1000;
+    if (!drive) this._rollDx = 0; // no coast while not driving (anti-fake-prop check)
     // Target angular velocity in Matter units (delta-angle per substep update).
     const targetW = this._motorSign * this.motorSpeed * subDtSec;
     // Ceiling magnitude (Matter units) — drive only up to the target speed.
@@ -646,9 +708,15 @@ export class Physics {
         const dx = this.cube.position.x - preX;
         const dy = this.cube.position.y - preY;
         const d = Math.hypot(dx, dy);
-        const STEP_MAX = 0.12; // ~ 43 u/s at sub-dt=1/360s — far above walking
-        if (d > STEP_MAX) {
-          const k = STEP_MAX / d;
+        // Max plausible per-substep chassis move = _stepMaxUs (u/s) * _subSec.
+        // _stepMaxUs is set ABOVE the rolling speed (v_roll ~ 5 u/s) with headroom
+        // so a real roll is never clipped, but a 150 u/s solver fling is. (The old
+        // STEP_MAX=0.12 == 43 u/s WAS above walking — but the chassis VMAX cap that
+        // should have caught the rest was in broken units (180 u/s), so flings
+        // slipped through. Both are now in real u/s.)
+        const stepMax = this._stepMaxUs * this._subSec;
+        if (d > stepMax) {
+          const k = stepMax / d;
           Body.setPosition(this.cube, { x: preX + dx * k, y: preY + dy * k });
           Body.setVelocity(this.cube, { x: 0, y: 0 });
         }
@@ -685,9 +753,10 @@ export class Physics {
         // capping the leg's linear speed to LEGVMAX (generous headroom) stops the
         // runaway at the source without affecting normal striding. Only reduces
         // speed; never adds force -> no fake propulsion.
-        const lv = l.body.velocity, LEGVMAX = 16;
+        const lv = l.body.velocity;
+        const legVmax = this._legVmaxUs * this._subSec; // u/s -> raw
         const lsp = Math.hypot(lv.x, lv.y);
-        if (lsp > LEGVMAX) Body.setVelocity(l.body, { x: lv.x / lsp * LEGVMAX, y: lv.y / lsp * LEGVMAX });
+        if (lsp > legVmax) Body.setVelocity(l.body, { x: lv.x / lsp * legVmax, y: lv.y / lsp * legVmax });
       }
       // ── STIFF SYMMETRIC PHASE LOCK (the alternating-gait lock) ──
       // Pull φ = angleA − angleB to π by applying EQUAL-AND-OPPOSITE angular-
@@ -719,6 +788,8 @@ export class Physics {
         Body.setAngularVelocity(A.body, A.body.angularVelocity + c);
         Body.setAngularVelocity(B.body, B.body.angularVelocity - c);
       }
+      // (the NO-SLIP ROLLING ADVANCE is applied LAST in the substep — see below —
+      // so the contact solver cannot override it.)
       // DEFENSIVE SPEED CLAMP on the cube (anti-fling safety net). A long leg
       // whose foot JAMS on a stair riser can make the rigid length-0 pin inject
       // a large positional correction that teleports the heavy chassis (launch).
@@ -728,9 +799,10 @@ export class Physics {
       // it cannot mask a fall (a falling cube is slowed, not lifted). Walking vx
       // is ~1-2 u/s so the cap (8 u/s) is pure headroom in normal play.
       if (this.cube) {
-        const v = this.cube.velocity, VMAX = 3;
+        const v = this.cube.velocity;
+        const vmax = this._chassisVmax * this._subSec; // u/s -> raw (Δpos/substep)
         const sp = Math.hypot(v.x, v.y);
-        if (sp > VMAX) Body.setVelocity(this.cube, { x: v.x / sp * VMAX, y: v.y / sp * VMAX });
+        if (sp > vmax) Body.setVelocity(this.cube, { x: v.x / sp * vmax, y: v.y / sp * vmax });
       }
       // Keep the chassis perfectly UPRIGHT every substep: zero BOTH the angle
       // AND the angular velocity. With a finite inertia the pin solve leaves a
@@ -741,6 +813,73 @@ export class Physics {
       if (this.cube) {
         if (this.cube.angle !== 0) Body.setAngle(this.cube, 0);
         if (this.cube.angularVelocity !== 0) Body.setAngularVelocity(this.cube, 0);
+      }
+      // ── NO-SLIP ROLLING ADVANCE (kinematic — the chassis is ROLLED forward by
+      //    the spinning leg, applied LAST so the contact solver can't undo it) ──
+      // Model A (user-confirmed): the legs spin (no biomechanical step). When a
+      // planted foot is the instantaneous centre of rotation, the axle (== the rigid
+      // upright chassis) rolls forward by Δx = ω·ry per substep (ry = downward lever
+      // arm from axle to contact; geometrically v_roll = ω·ry). We add exactly Δx to
+      // the chassis x AND to the driving leg (so its length-0 pin isn't stretched and
+      // the contact point stays put -> the foot GRIPS, no skid). The leg also keeps
+      // spinning at ω -> it ROLLS over the planted foot.
+      //
+      // WHY POSITION not velocity: a velocity set is overridden by the next contact
+      // solve (a grippy foot + rigid pin is over-constrained and locks up -> the body
+      // crawled while the foot skidded). Driving POSITION directly is authoritative.
+      //
+      // ANTI-OSCILLATION: we ZERO the chassis x-velocity here so the ONLY forward
+      // motion is this controlled roll — the solver can no longer fling the chassis
+      // forward then yank it back (the wheel/bar lurch). Y is left free (settle).
+      //
+      // LEG-DRIVEN / NOT FAKE PROPULSION: Δx = ω·ry is built ENTIRELY from the motor
+      // spin ω and contact geometry. Motor OFF -> ω=0 -> Δx=0 (and `drive` gates the
+      // branch) -> the cube does not advance; the anti-fake-propulsion check holds.
+      if (drive && this._gripAssist && this.cube) {
+        const axleY = this.cube.position.y;
+        const reach = this.legs[0] ? this.legs[0].radius : 1;
+        const minRy = reach * this._gripMinRyFrac;
+        let bestRy = 0, driveLeg = null, driveAdvance = 0;
+        for (const l of this.legs) {
+          const parts = l.body.parts.length > 1 ? l.body.parts.slice(1) : l.body.parts;
+          let low = null;
+          for (const p of parts) if (!low || p.position.y > low.position.y) low = p;
+          if (!low) continue;
+          const surf = this.surfaceYAt(low.position.x);
+          if (surf == null) continue;
+          const lineR = (l.lineRadius || LEG_LINE_RADIUS);
+          const footBottom = low.position.y + lineR;
+          if (footBottom < surf - lineR * 1.6) continue;   // not planted
+          const ry = low.position.y - axleY;               // downward lever arm
+          if (ry < minRy) continue;                        // grazing, not driving
+          if (ry > bestRy) {
+            bestRy = ry; driveLeg = l;
+            // ω·ry = per-substep rolling Δx (raw units; ω is per-substep Δangle).
+            driveAdvance = Math.max(0, l.body.angularVelocity * ry);
+          }
+        }
+        const advMax = this._chassisVmax * this._subSec; // anti-fling headroom cap
+        // Smoothed rolling target (raw Δpos/substep). When a power-foot is planted
+        // the target is the no-slip roll ω·ry; we LOW-PASS it (_gripK) toward the
+        // chassis' running roll speed so the body keeps gliding through the brief
+        // dead phase between strokes instead of stop-go (de-jerk). The smoothed
+        // speed is stored on _rollDx.
+        if (driveLeg && driveAdvance > 0) {
+          this._rollDx = (this._rollDx ?? 0) + (driveAdvance - (this._rollDx ?? 0)) * this._gripK;
+        } else {
+          // no power-foot this substep: gently bleed the rolling coast (it carries
+          // momentum across the dead phase, then decays so a lifted leg doesn't
+          // free-glide forever).
+          this._rollDx = (this._rollDx ?? 0) * 0.92;
+        }
+        let adv = Math.max(0, Math.min(advMax, this._rollDx));
+        // Advance the chassis kinematically by the rolling amount. We do NOT
+        // translate the legs (the pin pulls them along on the next solve) and we
+        // keep the chassis x-velocity at the roll speed so Matter integrates the
+        // legs consistently. Decoupling forward motion from the contact solver
+        // removes the wheel/bar lurch-and-yank (the solver no longer drives x).
+        Body.setPosition(this.cube, { x: this.cube.position.x + adv, y: this.cube.position.y });
+        Body.setVelocity(this.cube, { x: adv, y: this.cube.velocity.y });
       }
       // HOLD x while NOT driving (see holdX above): the floating cube would
       // otherwise settle-drift sideways. Restore x and zero horizontal velocity

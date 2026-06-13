@@ -634,15 +634,16 @@ export class Renderer {
     // near/far and overlapping. Less +z side-offset + lower eye = the depth between
     // the legs maps to horizontal screen separation. The track top is now an unlit
     // double-sided checker (always visible), so the lower angle no longer hides it.
-    const camX = x - 5.0;
-    const camY = this._camY + (racing ? 4.4 : 4.0);
-    const camZ = (racing ? 5.2 : 4.8) + this._camCurveZ;
+    // Reference framing: FAR (cube small ~1/7 screen, long winding track visible)
+    // AND a moderately LOW depression (~22°) — not the steep top-down we had. Far
+    // distance keeps the leg overlap a non-issue while matching the reference's
+    // distant, low, over-the-track view.
+    const camX = x - 10.0;
+    const camY = this._camY + (racing ? 7.6 : 7.0);
+    const camZ = (racing ? 11.0 : 10.5) + this._camCurveZ;
     this.camera.position.set(camX, camY, camZ);
-    // Aim a bit further ahead and closer to eye-level (less downward tilt) for the
-    // lower, more side-on/behind framing — keeps the cube lower-centre with the
-    // winding checker path receding ahead.
     const lookZ = (racing ? this.rivalLaneZ * 0.30 : 0) + this._camCurveZ;
-    this.camera.lookAt(x + 1.6, this._camY + 0.6, lookZ);
+    this.camera.lookAt(x + 4.5, this._camY - 0.3, lookZ);
   }
 
   /** Debug/verify info: how many meshes the track group holds (continuous ribbon

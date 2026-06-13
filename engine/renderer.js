@@ -282,7 +282,10 @@ export class Renderer {
   }
 
   /** Build a smiley character cube (body colour + face colour) with a dot-eye
-   * face on +z. Shared by player and rival (different palette). */
+   * face on +z. Shared by player and rival (different palette). The legs both
+   * spin about the cube CENTRE (the physics axle, AXLE_X=AXLE_Y=0), so we add a
+   * visible AXLE HUB at that centre so the two legs read as spokes on ONE axle
+   * (reference close-up) instead of two strokes overlapping in the middle. */
   _buildCharacterCube(bodyColor, faceColor) {
     const cubeGeo = new THREE.BoxGeometry(PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE * 0.9);
     const cubeMat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.45, metalness: 0.05 });
@@ -293,7 +296,53 @@ export class Renderer {
     const face = new THREE.Mesh(faceGeo, faceMat);
     face.position.z = PHYS_CONST.CUBE_SIZE * 0.46;
     cube.add(face);
+    cube.add(this._buildAxleHub());
     return cube;
+  }
+
+  /** Build the AXLE HUB — a short cylinder lying along z that spans the two legs
+   * (z = ±LEG_Z_OFFSET = ±0.82) so it reads as a single axle the two legs are
+   * threaded onto, plus a bright bolt-cap (bright disc + dark centre dot) on the
+   * cube's FRONT face (+z) — the reference's "bright circle with a centre dot"
+   * the legs spin around. Children of the cube ⇒ it inherits the cube's
+   * position/rotation/bob automatically. Render-only. */
+  _buildAxleHub() {
+    const hub = new THREE.Group();
+    const AXLE_R = 0.085;                          // axle-bar radius (slim shaft)
+    const HALF_Z = LEG_Z_OFFSET;                  // reach the two leg planes (±0.82)
+    const CAP_R = 0.16;                            // bright bolt-cap disc radius
+    const FRONT_Z = PHYS_CONST.CUBE_SIZE * 0.46;   // cube front face plane (= face plane)
+    const HUB_LIGHT = 0xCDEBFF;                   // bright sky/white (our blue palette)
+    const HUB_RING = 0x8FCBF0;                     // mid-blue ring shading
+    const HUB_BOLT = 0x0E2A3A;                     // dark centre dot (== playerFace dark)
+
+    // axle BAR: a slim shaft laid along z, threading the two leg planes so the
+    // two strokes read as spokes on ONE axle. Sits behind the front face.
+    const barMat = new THREE.MeshStandardMaterial({ color: HUB_RING, roughness: 0.5, metalness: 0.1 });
+    const bar = new THREE.Mesh(
+      new THREE.CylinderGeometry(AXLE_R, AXLE_R, HALF_Z * 2, 16),
+      barMat
+    );
+    bar.rotation.x = Math.PI / 2;                  // lay the cylinder along z
+    hub.add(bar);
+
+    // FRONT bolt cap: a bright disc + dark centre dot on the cube's front face,
+    // sitting BELOW the smiley (the legs' axle is the cube centre, and the face
+    // dots/smile are in the upper half, so the cap reads as the "wheel hub" the
+    // legs pivot on without covering the eyes). Slightly proud of the face plane.
+    const capMat = new THREE.MeshBasicMaterial({ color: HUB_LIGHT });
+    const ringMat = new THREE.MeshBasicMaterial({ color: HUB_RING });
+    const boltMat = new THREE.MeshBasicMaterial({ color: HUB_BOLT });
+    const ring = new THREE.Mesh(new THREE.CircleGeometry(CAP_R, 22), ringMat);
+    ring.position.set(0, 0, FRONT_Z + 0.012);
+    hub.add(ring);
+    const disc = new THREE.Mesh(new THREE.CircleGeometry(CAP_R * 0.78, 22), capMat);
+    disc.position.set(0, 0, FRONT_Z + 0.014);
+    hub.add(disc);
+    const bolt = new THREE.Mesh(new THREE.CircleGeometry(CAP_R * 0.34, 16), boltMat);
+    bolt.position.set(0, 0, FRONT_Z + 0.016);
+    hub.add(bolt);
+    return hub;
   }
 
   _buildFinish(track, rivalSpec = null, physics = null) {
@@ -580,15 +629,20 @@ export class Renderer {
     // is the dominant visible surface). Earlier the eye was high but it AIMED far
     // ahead at cube height, skimming the band edge-on ⇒ only the dark sides showed.
     //   eye ~7 behind, ~9 up, ~9 to the +z side.
-    const camX = x - 7.0;
-    const camY = this._camY + (racing ? 9.4 : 9.0);
-    const camZ = (racing ? 9.5 : 9.0) + this._camCurveZ;
+    // CAMERA A (user pick): LOWER + more BEHIND so the two legs (z = ±LEG_Z_OFFSET)
+    // read as a clear LEFT/RIGHT pair straddling the cube, instead of stacking
+    // near/far and overlapping. Less +z side-offset + lower eye = the depth between
+    // the legs maps to horizontal screen separation. The track top is now an unlit
+    // double-sided checker (always visible), so the lower angle no longer hides it.
+    const camX = x - 5.0;
+    const camY = this._camY + (racing ? 4.4 : 4.0);
+    const camZ = (racing ? 5.2 : 4.8) + this._camCurveZ;
     this.camera.position.set(camX, camY, camZ);
-    // Aim NEAR the cube (only +1.2 ahead) and a touch ABOVE the ground but well
-    // below the eye: this tilts the view DOWN onto the band top so the checker
-    // reads, while still keeping the cube in the lower-centre with field/sky above.
+    // Aim a bit further ahead and closer to eye-level (less downward tilt) for the
+    // lower, more side-on/behind framing — keeps the cube lower-centre with the
+    // winding checker path receding ahead.
     const lookZ = (racing ? this.rivalLaneZ * 0.30 : 0) + this._camCurveZ;
-    this.camera.lookAt(x + 1.2, this._camY - 0.2, lookZ);
+    this.camera.lookAt(x + 1.6, this._camY + 0.6, lookZ);
   }
 
   /** Debug/verify info: how many meshes the track group holds (continuous ribbon
@@ -642,12 +696,14 @@ export class Renderer {
     const ctx = c.getContext('2d');
     ctx.clearRect(0, 0, 128, 128);
     ctx.fillStyle = hex;
-    // two dot eyes
-    ctx.beginPath(); ctx.arc(46, 54, 10, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(82, 54, 10, 0, Math.PI * 2); ctx.fill();
-    // smile
+    // Face sits in the UPPER half so the axle hub (rendered at the cube centre,
+    // where both legs pivot) sits BELOW the smile without covering the eyes.
+    // two dot eyes (raised)
+    ctx.beginPath(); ctx.arc(46, 38, 10, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(82, 38, 10, 0, Math.PI * 2); ctx.fill();
+    // smile (raised, above the hub)
     ctx.lineWidth = 6; ctx.strokeStyle = hex; ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.arc(64, 72, 18, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.arc(64, 54, 16, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
     return tex;

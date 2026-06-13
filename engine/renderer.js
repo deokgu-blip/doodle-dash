@@ -18,6 +18,11 @@ const COL = {
 const RIBBON_DEPTH = 6.0;     // z-extrusion of the track (wide so it reads as ground)
 const RIBBON_DOWN = 0.5;      // how far below the surface the ribbon goes
 
+// Two legs straddle the cube in DEPTH (z). The cube is ~1.08 deep; legs sit
+// just outside its faces so they clearly read as a left and a right leg.
+const LEG_THICK = 0.30;       // per-leg extrusion depth (slim — two legs, not 1 wheel)
+const LEG_Z_OFFSET = 0.62;    // z distance of each leg from the cube center
+
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -130,34 +135,46 @@ export class Renderer {
   }
 
   /** Rebuild leg meshes to match the current physics legs (after a redraw).
-   * Each leg is a single SOLID convex body — render it as an extruded disc
-   * matching the body's vertices (in body-local coords about its centroid). */
+   * Both legs share the SAME single bottom-center axle in physics, so we offset
+   * them in z (depth) by their `side` (-1 = far / left, +1 = near / right) to
+   * read as two legs straddling the cube. They are 180° out of phase so one
+   * foot plants while the other lifts — the alternating walking gait. Each leg
+   * is a single SOLID convex body, extruded from the body's rest shape. */
   rebuildLegs(physics) {
     for (const lg of this.legGroups) { this.scene.remove(lg.mesh); this._disposeMesh(lg.mesh); }
     this.legGroups = [];
     for (const l of physics.legs) {
       const body = l.body;
-      // body.vertices are world-space; convert to local (about body.position),
-      // un-rotating by the body's current angle so the extruded shape is the
-      // wheel's rest shape (the mesh is then rotated each frame via sync).
-      const cx = body.position.x, cy = body.position.y, a = body.angle;
+      // The leg is a COMPOUND limb (chain of box parts). Build a Three.Group
+      // holding one extruded box per part, each placed in the leg's LOCAL frame
+      // (about body.position, un-rotated by the body's current angle which
+      // includes its 180° phase). The whole group is positioned & rotated each
+      // frame in sync().
+      const grp = new THREE.Group();
+      const a = body.angle;
       const cosA = Math.cos(-a), sinA = Math.sin(-a);
-      const shape = new THREE.Shape();
-      const verts = body.vertices;
-      for (let i = 0; i < verts.length; i++) {
-        const dx = verts[i].x - cx, dy = verts[i].y - cy;
-        // local (un-rotated). render y = -physY, so flip y.
-        const lx = dx * cosA - dy * sinA;
-        const ly = dx * sinA + dy * cosA;
-        const rx = lx, ry = -ly;
-        if (i === 0) shape.moveTo(rx, ry); else shape.lineTo(rx, ry);
+      const px = body.position.x, py = body.position.y;
+      // Matter compound: body.parts[0] is the whole-body proxy; real parts are
+      // parts[1..]. Each part has .vertices (world) and .position.
+      const parts = body.parts.length > 1 ? body.parts.slice(1) : body.parts;
+      for (const part of parts) {
+        const shape = new THREE.Shape();
+        const verts = part.vertices;
+        for (let i = 0; i < verts.length; i++) {
+          const dx = verts[i].x - px, dy = verts[i].y - py;
+          const lx = dx * cosA - dy * sinA;
+          const ly = dx * sinA + dy * cosA;
+          const rx = lx, ry = -ly; // render y = -physY
+          if (i === 0) shape.moveTo(rx, ry); else shape.lineTo(rx, ry);
+        }
+        shape.closePath();
+        const geo = new THREE.ExtrudeGeometry(shape, { depth: LEG_THICK, bevelEnabled: false });
+        geo.translate(0, 0, -LEG_THICK / 2);
+        grp.add(new THREE.Mesh(geo, this._legMat));
       }
-      shape.closePath();
-      const geo = new THREE.ExtrudeGeometry(shape, { depth: 0.55, bevelEnabled: false });
-      geo.translate(0, 0, -0.275);
-      const mesh = new THREE.Mesh(geo, this._legMat);
-      this.scene.add(mesh);
-      this.legGroups.push({ mesh, body, side: l.side });
+      this.scene.add(grp);
+      // z offset by side so the two legs straddle the cube (read as two legs).
+      this.legGroups.push({ mesh: grp, body, side: l.side, z: l.side * LEG_Z_OFFSET });
     }
   }
 
@@ -165,16 +182,18 @@ export class Renderer {
   sync(physics) {
     if (this.cubeMesh && physics.cube) {
       const p = physics.cube.position;
-      // The chassis now rests close to its wheels (axle just below the cube),
-      // so the visual gap is small. A tiny drop closes the remaining clearance
-      // between the cube bottom and the wheel tops.
+      // The chassis rests close to its legs (axle just below the cube), so the
+      // visual gap is small. A tiny drop closes the remaining clearance.
       const CUBE_DROP = 0.10;
       this.cubeMesh.position.set(p.x, -p.y - CUBE_DROP, 0);
       this.cubeMesh.rotation.z = -physics.cube.angle;
     }
     for (const lg of this.legGroups) {
       const body = lg.body;
-      lg.mesh.position.set(body.position.x, -body.position.y, 0);
+      // Both legs share the same physics x/y; the z offset gives the two-leg
+      // (left/right) straddle look while each spins at its own (180°-offset)
+      // angle — the alternating walk.
+      lg.mesh.position.set(body.position.x, -body.position.y, lg.z);
       // render y = -physY -> a CCW physics rotation appears CW on screen.
       lg.mesh.rotation.z = -body.angle;
     }
@@ -198,9 +217,12 @@ export class Renderer {
     // the lane from ~40° above. Sit behind (-x), well above (+y), a bit to the
     // side (+z) for the 3/4 feel, and look DOWN the track ahead so the magenta
     // checkerboard reads clearly as the ground receding forward.
-    const camX = x - 6.0;
-    const camY = cubeRenderY + 7.2;
-    const camZ = 6.0;
+    // Pull the camera more to the +z side so the two legs straddling the cube
+    // in depth (z = ±LEG_Z_OFFSET) are visibly separated (one near, one far),
+    // not stacked dead-on. Keep it behind (-x) and above (+y) for the 3/4 chase.
+    const camX = x - 5.5;
+    const camY = cubeRenderY + 6.4;
+    const camZ = 8.0;
     this.camera.position.set(camX, camY, camZ);
     // Aim only slightly ahead of the cube so the cube sits centered (not shoved
     // to the left edge) with the magenta lane receding ahead of it.
@@ -250,6 +272,11 @@ export class Renderer {
 
   _disposeMesh(m) {
     if (!m) return;
+    // a leg may be a Group of box meshes (compound limb) or a single mesh.
+    if (m.isGroup || (m.children && m.children.length)) {
+      m.traverse((o) => { if (o.isMesh && o.geometry) o.geometry.dispose(); });
+      return;
+    }
     if (m.geometry) m.geometry.dispose();
     if (Array.isArray(m.material)) m.material.forEach((mm) => mm.dispose && mm !== this._legMat && mm.dispose());
     else if (m.material && m.material !== this._legMat) m.material.dispose();

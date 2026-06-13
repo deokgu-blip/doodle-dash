@@ -159,6 +159,9 @@
       step: (ms) => game.step(ms),
       forceStart: () => game.forceStart(),
       getState: () => game.getState(),
+      // verifier hook: toggle the leg motor to prove propulsion comes ONLY from
+      // the legs (motor off => cube must barely move).
+      setMotorEnabled: (on) => { game.physics.motorEnabled = !!on; },
     };
     window.__DC_READY = true;
   })();

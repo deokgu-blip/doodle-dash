@@ -160,9 +160,45 @@ export class Physics {
     // contact spike can't fling the low-inertia chain (launch). Tuned headless.
     this._motorTorque = 0.06; // constant bias torque (drives spin up to target)
     this._motorGain = 0.0;    // optional proportional pull-to-target (anti-stall)
-    this._clampHead = 1.5;    // realized-spin clamp headroom above target; tuned
+    this._clampHead = 1.12;   // realized-spin clamp headroom above per-leg target;
+    // tight so the leg RIDES its per-leg ceiling -> realized speed ~= target (the
+    // phase-lock governor needs the realized speed to track the modulated target).
     this._fixedSpeed = 6.0;   // fixed angular speed (rad/s) for every shape; tuned
     this._legPhase = Math.PI; // phase offset of the 2nd leg (PI=alternating gait)
+    // ── PHASE LOCK (alternating gait) — STIFF SYMMETRIC VELOCITY COUPLING ──
+    // PROBLEM: the two legs are independently torque-driven, so under load one
+    // foot slows (it plants & resists) while the other free-spins -> they DRIFT
+    // toward SYNC (the user reject: "both legs spin together"). Real walking holds
+    // the two feet a HALF-CYCLE apart at ALL times (one plants while the other
+    // lifts). We measured the diff drifting 1.6 -> 0.85 rad (toward sync).
+    //
+    // WHAT FAILED (kept here as the design record so we don't retry them):
+    //   * A bounded corrective TORQUE per leg: too weak vs the contact disturbance
+    //     (coupling << perturbation) — no lock; at a high cap it reversed a leg.
+    //   * A SYMMETRIC mutual PD toward π: fell into the SYNC attractor (φ=0).
+    //   * A SPEED GOVERNOR (modulate one leg's speed ceiling to track the other):
+    //     held π for ~0.4s then a single contact KICK (which even spun a leg
+    //     BACKWARD, allowed by the old symmetric ±clamp) crashed it to sync, and
+    //     the bounded forward-only governor recovered too slowly before the next
+    //     kick. Two fixes came out of this: (a) the FORWARD-ONLY RATCHET on the
+    //     leg spin (see the clamp in update — a driven pedal must never reverse),
+    //     and (b) the stiff coupling below.
+    //
+    // SOLUTION (what works, verified φ==π for the whole run): a STIFF SYMMETRIC
+    // velocity coupling applied AFTER integration (see update). Split each leg's
+    // spin into a COMMON part (the average = the forward propulsion) and a
+    // DIFFERENTIAL part (the relative phase), and correct ONLY the differential
+    // with EQUAL-AND-OPPOSITE angular-velocity nudges so φ=angleA−angleB → π.
+    // Equal-and-opposite conserves the common (average) spin EXACTLY, so the feet
+    // still grip & push the floor at the same forward rate — propulsion is fully
+    // intact (no-stall avg|w| still == target). It is a differential gear coupling
+    // the two pedals: stiff enough to beat the contact kicks, but it only re-times
+    // the legs relative to each other (never adds net forward spin), so it cannot
+    // fake propulsion (motor OFF -> branch skipped -> legs frozen -> cube still).
+    this._phaseLock = true;
+    this._phiLockK = 18.0;     // stiffness: phase error (rad) -> rel-spin correction
+    this._phiLockD = 0.5;      // damping on the relative spin (anti-overshoot)
+    this._phiLockMax = 9.0;    // cap on the rel-spin correction (rad/s); anti-fling
     // ANTI-BACKFLING RATCHET: the rigid length-0 pin can teleport the chassis
     // BACKWARD when a thin lever jams (a solver artifact, same family as the
     // anti-teleport guard) — that flings the cube off the back of the track and
@@ -409,11 +445,16 @@ export class Physics {
     Body.setAngle(this.cube, 0);
     this._maxX = this.startX; // reset the ratchet floor to the spawn x
 
-    // Two legs share ONE axle (x = AXLE_X). They are spun 180° out of phase:
-    // phase 0 and phase PI. side is for the renderer's z offset only.
+    // Two legs share ONE axle (x = AXLE_X). They START exactly 180° out of phase
+    // (leg A's body rotated by phase 0, leg B by PI), and the stiff symmetric
+    // phase lock (in update) HOLDS that half-cycle separation for the whole run.
+    // phaseOffset is each leg's TARGET phase offset (A: 0, B: PI) — the lock pulls
+    // φ = angleA − angleB to wrap(−(B.off − A.off)) = π. side is the renderer z
+    // offset only. Starting at exactly PI means the legs are alternating from
+    // frame 0 (the user reject was that they drifted to sync — now locked).
     const defs = [
-      { side: -1, phase: 0 },
-      { side: +1, phase: this._legPhase ?? 0 },
+      { side: -1, phase: 0, phaseOffset: 0 },
+      { side: +1, phase: this._legPhase ?? 0, phaseOffset: this._legPhase ?? 0 },
     ];
     for (const def of defs) {
       const axleX = this.cube.position.x + AXLE_X;
@@ -486,7 +527,7 @@ export class Physics {
       // renderer can draw a thin LINE ribbon — WYSIWYG: same stroke as physics.
       this.legs.push({
         body: leg, pin, side: def.side, radius: reach, phase: def.phase,
-        chain, lineRadius: LEG_LINE_RADIUS, pinLocal,
+        phaseOffset: def.phaseOffset, chain, lineRadius: LEG_LINE_RADIUS, pinLocal,
       });
       this.legConstraints.push(pin);
     }
@@ -544,13 +585,23 @@ export class Physics {
     // never active while driving, so the real walk is untouched).
     const holdX = (!drive && this.cube) ? this.cube.position.x : null;
 
+    const TAU = Math.PI * 2;
+    const wrapPi = (a) => { // wrap into (-PI, PI]
+      a = ((a % TAU) + TAU) % TAU;
+      return a > Math.PI ? a - TAU : a;
+    };
+
     for (let s = 0; s < this.SUBSTEPS; s++) {
       if (drive) {
+        // PROPULSION torque (UNCHANGED): drive BOTH legs' spin up to the SAME base
+        // speed ceiling. This is the leg-vs-floor thrust. The alternating PHASE is
+        // enforced SEPARATELY by the stiff symmetric velocity lock applied after
+        // integration (below) — it re-times the two legs relative to each other
+        // without changing their common forward spin, so propulsion is fully
+        // intact (a planted foot still resists & pushes). With the motor OFF this
+        // whole branch is skipped — propulsion is leg-only.
         for (const l of this.legs) {
           const w = l.body.angularVelocity;
-          // Apply the motor torque ONLY while below the speed ceiling (in the
-          // drive direction): a constant bias torque PLUS a proportional pull
-          // toward target (anti-stall) when a load slows it.
           if (this._motorSign > 0 ? (w < ceilingTarget) : (w > -ceilingTarget)) {
             const err = targetW - w; // Matter units
             l.body.torque += torque + err * this._motorGain;
@@ -609,12 +660,25 @@ export class Physics {
       // realized spin to ±clampW (headroom above the servo target so coasting
       // isn't killed) removes that failure mode while leaving the WALK intact —
       // the foot still sweeps the ground at the target speed.
-      const ceiling = Math.abs(targetW); // servo target magnitude (Matter units)
-      const clampW = ceiling * this._clampHead; // headroom above target (tuned)
+      const clampW = ceilingTarget * this._clampHead; // ceiling + headroom (Matter)
       for (const l of this.legs) {
         const w = l.body.angularVelocity;
-        if (w > clampW) Body.setAngularVelocity(l.body, clampW);
-        else if (w < -clampW) Body.setAngularVelocity(l.body, -clampW);
+        if (this._motorSign > 0) {
+          // FORWARD-ONLY RATCHET (a phase-lock fix). The pedal is driven FORWARD
+          // and must NEVER reverse: a contact impulse used to kick a leg BACKWARD
+          // (w = −6.7 rad/s, allowed by the old symmetric ±clamp) which instantly
+          // destroyed the alternating phase (the leg jumped a half-cycle — verified
+          // it locked at π for ~0.4s then a back-kick crashed it to sync). Flooring
+          // w at >= 0 (and ceiling at +clampW) keeps each leg monotonically forward
+          // like a real driven wheel, so the stiff phase lock can hold. This only
+          // REMOVES non-physical backward spin (never adds forward force); with the
+          // motor OFF the legs are frozen so the leg-only assertion is untouched.
+          if (w > clampW) Body.setAngularVelocity(l.body, clampW);
+          else if (w < 0 && drive) Body.setAngularVelocity(l.body, 0);
+        } else {
+          if (w < -clampW) Body.setAngularVelocity(l.body, -clampW);
+          else if (w > 0 && drive) Body.setAngularVelocity(l.body, 0);
+        }
         // DEFENSIVE LEG LINEAR-SPEED CLAMP (anti-fling). When a foot JAMS on a
         // step edge the rigid pin can fling the leg (and, through the pin, the
         // chassis) at huge speed. A planted foot's tip moves at most ~V_TIP, so
@@ -624,6 +688,36 @@ export class Physics {
         const lv = l.body.velocity, LEGVMAX = 16;
         const lsp = Math.hypot(lv.x, lv.y);
         if (lsp > LEGVMAX) Body.setVelocity(l.body, { x: lv.x / lsp * LEGVMAX, y: lv.y / lsp * LEGVMAX });
+      }
+      // ── STIFF SYMMETRIC PHASE LOCK (the alternating-gait lock) ──
+      // Pull φ = angleA − angleB to π by applying EQUAL-AND-OPPOSITE angular-
+      // velocity nudges to A and B. Equal-and-opposite leaves the COMMON (average)
+      // spin — which IS the forward propulsion — EXACTLY unchanged, so the feet
+      // still grip & push the floor at the same rate (propulsion intact; with the
+      // motor OFF this branch is skipped, so the leg-only check holds). It is a
+      // differential gear coupling the two pedals: stiff enough to beat a contact
+      // kick, but it only re-times the legs relative to each other — it never adds
+      // net forward spin, so it cannot fake propulsion. Verified: φ == π for the
+      // whole run, while no-stall avg|w| still == target (propulsion unweakened).
+      if (drive && this._phaseLock && this.legs.length >= 2) {
+        const A = this.legs[0], B = this.legs[1];
+        // desired φ = angleA − angleB. The legs are created a half-cycle apart
+        // (B.phaseOffset − A.phaseOffset = π), so the target relative phase is
+        // wrap(−(B.off − A.off)) = wrap(−π) ≡ +π.
+        const offDiff = wrapPi((B.phaseOffset || 0) - (A.phaseOffset || 0)); // = π
+        const targetPhi = wrapPi(-offDiff);               // ≡ +π
+        const phi = wrapPi(A.body.angle - B.body.angle);  // current relative phase
+        const phiErr = wrapPi(targetPhi - phi);           // >0 => A must gain on B
+        // velocity-level correction (Matter units, per-sub-dt delta-angle). A gets
+        // +c, B gets −c so the average (propulsion) spin is conserved exactly.
+        // Stiffness _phiLockK (per substep) pulls φ→target fast; bounded so a huge
+        // error can't fling either leg. Also damp the relative spin.
+        const relWmatter = (A.body.angularVelocity - B.body.angularVelocity);
+        let c = this._phiLockK * phiErr * subDtSec - this._phiLockD * relWmatter;
+        const cMax = this._phiLockMax * subDtSec; // cap (Matter units)
+        if (c > cMax) c = cMax; else if (c < -cMax) c = -cMax;
+        Body.setAngularVelocity(A.body, A.body.angularVelocity + c);
+        Body.setAngularVelocity(B.body, B.body.angularVelocity - c);
       }
       // DEFENSIVE SPEED CLAMP on the cube (anti-fling safety net). A long leg
       // whose foot JAMS on a stair riser can make the rigid length-0 pin inject

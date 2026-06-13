@@ -66,11 +66,21 @@ const CAT_LEG   = 0x0004;
 // this so they pass through one another while still colliding with the floor.
 const GROUP_LEGS = -1;
 
-const CUBE_SIZE = 1.2;              // world units (player cube edge)
-// Single axle at the bottom-CENTER of the cube (x offset = 0). It sits just
-// below the cube's bottom face; the legs hang below the axle by their radius.
+// Player cube edge (world units). Kept SMALLER than 2*(LEG_REACH_MIN+radius) so
+// that even the shortest leg's foot tip (reach+radius below the CENTRE axle)
+// extends BELOW the cube's bottom face (half-edge = CUBE_SIZE/2). This is what
+// makes the cube FLOAT with the legs sticking out underneath it (the reference):
+// CUBE_SIZE/2 (0.45) < LEG_REACH_MIN+radius (0.45+0.13=0.58), so the foot always
+// reaches past the belly to the ground and the frictionless belly never lands.
+const CUBE_SIZE = 0.9;
+// Single axle at the GEOMETRIC CENTRE of the cube (x AND y offset = 0). The
+// reference (original Draw Climber) anchors the legs at the cube's CENTER and
+// the drawn stroke spins 360° ABOUT THE CENTER, reaching down past the cube's
+// bottom face to plant on the ground. So the cube floats above the track by
+// ~reach and the leg sweeps from the center down to the floor. AXLE_Y == 0
+// means the pin local-point coincides with the cube centroid.
 const AXLE_X = 0.0;
-const AXLE_Y = CUBE_SIZE * 0.5 + 0.06; // axle just below the cube bottom face
+const AXLE_Y = 0.0; // axle at the cube geometric CENTRE (was: just below bottom)
 
 // Slab thickness BELOW the surface. Deep enough that a foot cannot cross the
 // whole slab in one substep (per-substep travel is small, see SUBSTEPS).
@@ -238,12 +248,13 @@ export class Physics {
     cube.frictionStatic = 0;    // cube forward (zero traction) — all propulsion
     cube.frictionAir = 0.002;   // must come from the legs.
     cube.restitution = 0;
-    // The cube collides with the floor ONLY as a deep-fall safety net. In normal
-    // walking the cube rides ~ (legRadius + AXLE_Y) ABOVE the surface so the
-    // belly does NOT touch and does NOT carry the weight — the legs bear the load
-    // and have full normal force for traction. The belly catches the cube only
-    // if BOTH feet leave the ground (so it can't free-fall through the world),
-    // and because it is frictionless it adds NO forward force when it does.
+    // The cube collides with the floor ONLY as a deep-fall safety net. With the
+    // axle at the cube CENTRE the cube FLOATS ~reach ABOVE the surface (its
+    // centre sits reach+radius above the foot tip), so the belly does NOT touch
+    // and does NOT carry the weight — the legs bear the load and have full normal
+    // force for traction. The belly catches the cube only if BOTH feet leave the
+    // ground (so it can't free-fall through the world), and because it is
+    // frictionless it adds NO forward force when it does.
     cube.collisionFilter = { category: CAT_BODY, mask: CAT_FLOOR, group: 0 };
     cube.label = 'cube';
     Body.setMass(cube, 2.2);
@@ -326,12 +337,15 @@ export class Physics {
       this.motorSpeed = Math.max(5, Math.min(16, V_TIP / reach));
     }
 
-    // Place the AXLE so the LOWEST point of the chain (a circle bottom = its
-    // center reach + the circle radius) sits just ABOVE the surface. Using
-    // `reach + LEG_LINE_RADIUS` (not just `reach`) is essential: ignoring the
-    // circle radius spawns the foot 0.16 BELOW the surface, and resolving that
-    // penetration on frame 0 launches the cube backward (verified). The -0.04
-    // clearance keeps it from starting penetrated. Cube center is AXLE_Y above.
+    // Place the AXLE (== the cube CENTRE now) so the LOWEST point of the chain
+    // (a circle bottom = its center reach + the circle radius) sits just ABOVE
+    // the surface. The axle is the cube's geometric centre, so the cube FLOATS
+    // ~reach above the track and the leg sweeps DOWN from the centre to plant on
+    // the floor — exactly the reference. Using `reach + LEG_LINE_RADIUS` (not
+    // just `reach`) is essential: ignoring the circle radius spawns the foot
+    // 0.16 BELOW the surface, and resolving that penetration on frame 0 launches
+    // the cube (verified). The -0.04 clearance keeps it from starting penetrated.
+    // With AXLE_Y == 0 the cube centre IS the axle: cubeY = axleY.
     const startSurfaceY = 0; // first segment surface (groundY)
     const desiredAxleY = startSurfaceY - (reach + LEG_LINE_RADIUS) - 0.04;
     const desiredCubeY = desiredAxleY - AXLE_Y;
@@ -451,6 +465,18 @@ export class Physics {
     const ceiling = this.motorSpeed * subDtSec;
     const torque = this._motorSign * this._motorTorque;
 
+    // When NOT driving (countdown / win / lose / motor-off verifier) HOLD the
+    // chassis x at its entry value. The axle is now the cube CENTRE, so the cube
+    // floats ~reach above the track balanced on its leg like an inverted
+    // pendulum: with the leg frozen as a rigid strut the static contact point is
+    // not exactly under the centre, so the upright-locked frictionless cube
+    // slowly TRANSLATES sideways (a settling artifact, NOT propulsion). Pinning x
+    // while off keeps the cube perfectly still during the countdown and makes the
+    // anti-fake-propulsion check measure ZERO motor-off motion. This only PREVENTS
+    // motion; it adds no forward force, so it cannot fake propulsion (and it is
+    // never active while driving, so the real walk is untouched).
+    const holdX = (!drive && this.cube) ? this.cube.position.x : null;
+
     for (let s = 0; s < this.SUBSTEPS; s++) {
       if (drive) {
         for (const l of this.legs) {
@@ -465,15 +491,19 @@ export class Physics {
           }
         }
       } else {
-        // Motor OFF (countdown / win / lose / motor-off verifier): the leg's
-        // axle is a BRAKED bearing, not a free-spinning one — bleed the leg's
-        // angular velocity toward 0 each substep. Without this the foot circles
-        // free-roll under gravity and inch the cube forward over time, which
-        // would (wrongly) look like propulsion with the motor off. Braking the
-        // free leg keeps the motor-OFF cube essentially STATIONARY, so the
-        // leg-driven (anti-fake-propulsion) assertion measures real propulsion.
+        // Motor OFF (countdown / win / lose / motor-off verifier): the leg axle
+        // is a FULLY LOCKED bearing, not a free-spinning one. With the axle now
+        // at the cube CENTRE the cube FLOATS ~reach above the track, balanced on
+        // its leg like an inverted pendulum; if the off leg can still swing, the
+        // floating cube settles/rolls forward (it inched to progress~0.09 in 6s
+        // — a FALSE positive for the anti-fake-propulsion check). So when off we
+        // HARD-FREEZE each leg's spin (angular velocity -> 0) so it is a rigid
+        // strut: the cube then rests statically on its leg and does NOT drift.
+        // No forward force is added — this only removes a settling drift; with
+        // the motor on (drive) this branch never runs, so real propulsion is
+        // unaffected and the leg-driven assertion still measures the true walk.
         for (const l of this.legs) {
-          Body.setAngularVelocity(l.body, l.body.angularVelocity * 0.5);
+          Body.setAngularVelocity(l.body, 0);
         }
       }
       // Snapshot the chassis position BEFORE integration so we can detect (and
@@ -551,6 +581,14 @@ export class Physics {
         if (this.cube.angle !== 0) Body.setAngle(this.cube, 0);
         if (this.cube.angularVelocity !== 0) Body.setAngularVelocity(this.cube, 0);
       }
+      // HOLD x while NOT driving (see holdX above): the floating cube would
+      // otherwise settle-drift sideways. Restore x and zero horizontal velocity
+      // so it sits perfectly still during the countdown / off-motor check. The
+      // cube is still free in Y (it can settle vertically onto its leg).
+      if (holdX != null && this.cube) {
+        Body.setPosition(this.cube, { x: holdX, y: this.cube.position.y });
+        Body.setVelocity(this.cube, { x: 0, y: this.cube.velocity.y });
+      }
     }
     this._checkExplosion();
   }
@@ -566,6 +604,28 @@ export class Physics {
       const p = l.body.position;
       if (bad(p.x) || bad(p.y)) this._exploded = true;
     }
+  }
+
+  /**
+   * Pivot/axle diagnostics for verification of "pivot == cube centre".
+   * Returns the WORLD y of the leg's rotation pivot (the cube-side pin anchor =
+   * cube.position + AXLE_Y) and the cube's geometric-centre y, plus their gap and
+   * the surface y beneath the cube. With AXLE_Y == 0 the pivot y MUST equal the
+   * cube centre y (gap ~ 0). aboveSurface > 0 proves the cube floats on the track.
+   */
+  pivotInfo() {
+    if (!this.cube) return null;
+    const cubeCenterY = this.cube.position.y;
+    const axleY = this.cube.position.y + AXLE_Y; // cube-side pin anchor (world)
+    const surfaceY = this.surfaceYAt(this.cube.position.x);
+    return {
+      axleY,
+      cubeCenterY,
+      gap: Math.abs(axleY - cubeCenterY),
+      aboveSurface: surfaceY != null ? (surfaceY - cubeCenterY) : null,
+      reach: this.legs[0] ? this.legs[0].radius : null,
+      axleLocalY: AXLE_Y,
+    };
   }
 
   get bodyX() { return this.cube ? this.cube.position.x : this.startX; }

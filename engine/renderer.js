@@ -243,10 +243,12 @@ export class Renderer {
   sync(physics) {
     if (this.cubeMesh && physics.cube) {
       const p = physics.cube.position;
-      // The chassis rests close to its legs (axle just below the cube), so the
-      // visual gap is small. A tiny drop closes the remaining clearance.
-      const CUBE_DROP = 0.10;
-      this.cubeMesh.position.set(p.x, -p.y - CUBE_DROP, 0);
+      // The axle is the cube's geometric CENTRE, and the leg stroke ribbons are
+      // drawn in the leg-local frame whose origin == that axle. So the cube mesh
+      // centre must sit EXACTLY at the physics cube centre (no drop) — then the
+      // drawn leg lines emanate from the cube's middle and sweep down to the
+      // ground (the reference look). render y = -physY.
+      this.cubeMesh.position.set(p.x, -p.y, 0);
       this.cubeMesh.rotation.z = -physics.cube.angle;
     }
     for (const lg of this.legGroups) {
@@ -272,7 +274,7 @@ export class Renderer {
     // 3/4 chase view: camera behind (-x) and above (+y), looking at the cube
     // with a downward tilt so the wide magenta checkerboard ribbon reads as the
     // ground the cube rolls on, receding ahead.
-    const cubeRenderY = (physics.cube ? -physics.cube.position.y - 0.10 : 0.9);
+    const cubeRenderY = (physics.cube ? -physics.cube.position.y : 0.9);
     // Steeper, higher 3/4 chase. The earlier shallow (~25°) angle saw the flat
     // ribbon nearly edge-on so it hid behind the cube/legs; the reference views
     // the lane from ~40° above. Sit behind (-x), well above (+y), a bit to the

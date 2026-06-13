@@ -140,20 +140,50 @@ export class Game {
   }
 
   // ── fixed-step sim (deterministic) ──
-  /** Advance the simulation by ms worth of fixed steps. Used by loop & headless. */
+  /** Advance the simulation by ms worth of fixed steps. Used by loop & headless.
+   *
+   * SUB-STEP dt ADAPTS TO SLOW-MOTION (smoothness fix). The loop hands us ALREADY
+   * time-scaled ms (frame·timeScale). With a constant 16.67ms tick the accumulator
+   * only reached one tick every ~10 frames during 0.1× bullet-time (per-frame intake
+   * ≈ 1.67ms), so the cube sat still for ~10 frames then JUMPED — the "stuttery slow-
+   * mo" the user reported. We instead shrink the fixed tick to `FIXED_DT · timeScale`
+   * while slowed, so the accumulator drains ~1 tiny tick PER FRAME: 0.1× as far, but
+   * CONTINUOUS (a smooth crawl, not a 10-frame strobe). The walker is procedural /
+   * kinematic — every per-step quantity (Δx=v·dt, tilt ease 1−e^(−lerp·dt), gait ω,
+   * the airborne gravity arc) is proportional to dt, so a smaller dt is identical
+   * behaviour, just finer-grained. At full speed (timeScale==1) dt stays FIXED_DT
+   * exactly ⇒ ZERO behaviour change and refresh-rate independence is preserved.
+   *
+   * The remainder is STILL carried across frames in `_acc` (dropping it leaks time),
+   * and that carry stays correct when dt changes mid-stream: `_acc` holds leftover
+   * ms, the new dt simply re-quantizes it — so the slow→full snap on endDraw never
+   * loses or duplicates simulated time. */
   step(ms) {
-    const dt = this.physics.FIXED_DT;
-    // PERSIST the sub-tick remainder across frames. The old `let acc = ms` threw
-    // away any leftover < dt every call, so on a high-refresh display (e.g. a
-    // 120Hz phone: ~8.3ms/frame, which is < dt 16.67ms) almost every frame ran
-    // ZERO ticks and the sim crawled far slower than real time ("slow motion"),
-    // no matter how high baseSpeed was. Carrying the remainder makes the sim
-    // advance at true real time on ANY refresh rate.
+    const ts = this._timeScale || 1;
+    const base = this.physics.FIXED_DT;
+    // effective fixed tick:
+    //   • NORMAL speed (ts==1): exactly FIXED_DT ⇒ ZERO behaviour change + the
+    //     accumulator carry keeps the sim at real time on ANY refresh rate.
+    //   • SLOW-MO (ts<1): we want ~1 tick PER FRAME so motion is continuous (not a
+    //     10-frame freeze→jump strobe). The per-frame intake is `ms` (≈ frame·ts), so
+    //     a tick of FIXED_DT·ts matches a 60Hz frame's intake — but on a 120/144Hz
+    //     display each frame's intake is SMALLER, so that tick would still need 2+
+    //     frames to fire (≈50% frozen frames). Tracking the actual intake `ms` (with
+    //     a small floor for numeric sanity, capped at the 60Hz slow tick so we never
+    //     take a coarse step) makes it ~1 tick/frame at EVERY refresh rate.
+    const dt = ts >= 1
+      ? base
+      : Math.min(base * ts, Math.max(ms, 0.25));
     this._acc = (this._acc || 0) + ms;
     if (this._acc > 250) this._acc = 250; // spiral-of-death guard (long stalls)
-    while (this._acc >= dt) {
+    // spiral guard #2: cap ticks PER CALL. The intake per frame is ms (≈ frame·ts),
+    // so at the matched dt this is ~1 tick/frame; the cap only bites on a catch-up
+    // burst (e.g. tab-switch). 240 ticks/frame is generous headroom either way.
+    let n = 0;
+    while (this._acc >= dt && n < 240) {
       this._tick(dt);
       this._acc -= dt;
+      n++;
     }
   }
 

@@ -160,6 +160,31 @@ const TUNE = {
   minDropSlope: 0.18,    // the post-crest descent slope (physics +down, downhill>0) must exceed this — gentle dips don't launch
   airTiltLerp: 6.0,      // 1/s — in the air the body eases its lean toward the FLIGHT-PATH angle (atan(vy/vx)) for a natural arc pose
   landMergeLerp: 14.0,   // 1/s — on LAND, how fast the body re-settles onto the ground support (a soft touchdown, no snap)
+
+  // ── REACH → JUMP SCALING (spec #2/#3) ──
+  // A LONG leg (big stride) leaps easily, high and far off a downhill edge; a SHORT
+  // leg barely/never leaves the ground (walks down). We scale the launch GATES and
+  // the launch IMPULSE by a normalized reach t = (reach−min)/(max−min) ∈ [0,1].
+  //   • gates EASE as reach grows: long legs trip the launch on gentler/slower crests,
+  //     short legs need a much steeper/faster crest (so they effectively don't fly).
+  //   • a reach-scaled UPWARD boost is added to vy0 so the LONG leg visibly "pops"
+  //     off the lip (big airborne arc); SHORT contributes ~0 (no pop → walk down).
+  // jumpReachPow shapes the t→jump curve (monotone increasing). Tuned so reach≈0.7
+  // (short presets) ⇒ tiny jump factor, reach≈1.7 (long) ⇒ full jump.
+  jumpReachPow: 1.4,        // exponent on normalized reach for the jump factor (>1 ⇒ short suppressed harder)
+  // gate scaling: effective thresholds = base × lerp(gateMax@short, gateMin@long, jf).
+  // higher = harder to launch. SHORT (jf≈0) sees ×gateMax (rarely launches);
+  // LONG (jf≈1) sees ×gateMin (launches readily).
+  launchSpeedGateShort: 1.55, // ×minLaunchSpeed for the shortest leg (needs to be fast)
+  launchSpeedGateLong: 0.80,  // ×minLaunchSpeed for the longest leg (launches even when slower)
+  dropSlopeGateShort: 1.70,   // ×minDropSlope for the shortest leg (needs a steeper drop)
+  dropSlopeGateLong: 0.80,    // ×minDropSlope for the longest leg
+  marginGateShort: 1.70,      // ×launchMargin for the shortest leg (gravity must be more clearly overcome)
+  marginGateLong: 0.80,       // ×launchMargin for the longest leg
+  // launch IMPULSE: an extra UPWARD velocity (physics +down ⇒ negative) at take-off,
+  // scaled by reach. This is the "big stride pops you off the edge" pop that turns a
+  // grazing departure into a visible, far-gliding arc for long legs. 0 for short.
+  jumpBoost: 5.6,             // u/s of extra UP velocity at the longest reach (jf=1); ×jf for shorter
 };
 
 export class Physics {
@@ -330,22 +355,79 @@ export class Physics {
         surfaceY += dy;
         cursorX += len;
       } else if (seg.kind === 'gap') {
-        // no floor: model as a segment with no surface (surfFn null).
-        const x0 = cursorX, x1 = cursorX + len;
-        this._segs.push({ x0, x1, kind: 'gap', topYa: null, topYb: null, surfFn: () => null });
-        cursorX += len;
+        // GAP = a V-TRENCH WITH A FLOOR (no soft-lock). The bottom drops by `depth`
+        // below the lip and rises back to the same level over `width`. It is built as
+        // TWO ramps (a steep descent into the V, a steep ascent out) so:
+        //   • the ENTRY LIP is a convex crest: a fast LONG leg LAUNCHES off it and
+        //     glides across the trench, landing on/near the far rim (skips the climb).
+        //   • a SHORT/slow leg can't launch ⇒ it walks DOWN the descent into the
+        //     bottom, then SLOWLY climbs the ascent out (uphill = slow) — it always
+        //     escapes (there is a floor everywhere), it is just much slower across.
+        // The two ramps share the existing ramp surface/slope/crest machinery, so
+        // there is no special-case physics and no penetration (analytic slope float).
+        const w = (seg.width != null ? seg.width : len);
+        const depth = seg.depth;
+        const halfW = w / 2;
+        // descent ramp: drop `depth` over halfW (steep).
+        const dx0 = cursorX, dx1 = cursorX + halfW;
+        const dTopY0 = surfaceY, dTopY1 = surfaceY + depth; // +down ⇒ deeper
+        addRampSlab(dx0, dx1, dTopY0, dTopY1, thick);
+        const dSlope = depth / halfW;
+        this._segs.push({ x0: dx0, x1: dx1, kind: 'ramp', gap: true, topYa: dTopY0, topYb: dTopY1,
+          slope: dSlope, surfFn: (px) => dTopY0 + dSlope * (px - dx0) });
+        if (dTopY1 < this._maxSurfaceTopY) this._maxSurfaceTopY = dTopY1;
+        // ascent ramp: climb `depth` back over halfW.
+        const ax0 = cursorX + halfW, ax1 = cursorX + w;
+        const aTopY0 = surfaceY + depth, aTopY1 = surfaceY;
+        addRampSlab(ax0, ax1, aTopY0, aTopY1, thick);
+        const aSlope = -depth / halfW;
+        this._segs.push({ x0: ax0, x1: ax1, kind: 'ramp', gap: true, topYa: aTopY0, topYb: aTopY1,
+          slope: aSlope, surfFn: (px) => aTopY0 + aSlope * (px - ax0) });
+        cursorX += w;
+        // surfaceY returns to its original level (the V is symmetric).
       } else if (seg.kind === 'wall') {
         const h = seg.height ?? 1;
-        // a vertical wall is an unclimbable riser of height h at cursorX.
-        const b = {
-          label: 'floor',
-          position: { x: cursorX, y: surfaceY - h / 2 },
-          bounds: { min: { x: cursorX - 0.3, y: surfaceY - h }, max: { x: cursorX + 0.3, y: surfaceY } },
-          _dcTopY: surfaceY - h,
-        };
-        this.floorBodies.push(b);
-        this._segs.push({ x0: cursorX - 0.3, x1: cursorX + 0.3, kind: 'wall',
-          topYa: surfaceY, topYb: surfaceY, stepH: h, surfFn: () => surfaceY });
+        // WALL = a tall STEP-UP to a higher plateau, gated by leg length. The riser is
+        // a SHORT, STEEP (but still walkable, analytic) ascent ramp carrying stepH=h so
+        // the climb rule applies: a SHORT leg is BLOCKED at its base (can't climb h), a
+        // LONG leg climbs it and continues on the raised plateau. We keep kind:'wall' so
+        // _nextRiser/canClimb gate it exactly like a stairs riser (struggle-in-place for
+        // short legs), and the surface stays raised by h afterwards (a real wall/ledge).
+        const riseLen = Math.min(1.2, Math.max(0.6, h * 0.5)); // short, steep face
+        const wx0 = cursorX, wx1 = cursorX + riseLen;
+        const wTopY0 = surfaceY, wTopY1 = surfaceY - h; // up = negative y
+        addRampSlab(wx0, wx1, wTopY0, wTopY1, thick);
+        const wSlope = -h / riseLen;
+        this._segs.push({ x0: wx0, x1: wx1, kind: 'wall', stepH: h, topYa: wTopY0, topYb: wTopY1,
+          slope: wSlope, surfFn: (px) => wTopY0 + wSlope * (px - wx0) });
+        if (wTopY1 < this._maxSurfaceTopY) this._maxSurfaceTopY = wTopY1;
+        surfaceY -= h;
+        cursorX += riseLen;
+      } else if (seg.kind === 'bumps') {
+        // BUMPS = a continuous wavy surface: a sine of half-amplitude `amp` over `freq`
+        // full periods across `length`. We sample it into many short LINEAR sub-ramps
+        // so the existing ramp slope/tilt/crest machinery rides it with NO penetration
+        // (each sub-segment is analytic) and the body TILT tracks each rise/fall. The
+        // surface returns to the entry level at the end (whole sine periods), so the
+        // track stays continuous. Bumps are gentle enough not to launch on their own
+        // (small amp) — they read as rolling terrain the body bobs/tilts over.
+        const amp = seg.amp, freq = seg.freq;
+        const nSub = Math.max(8, Math.ceil(freq * 8)); // ~8 samples per period
+        const baseY = surfaceY;
+        const wave = (t) => baseY - amp * Math.sin(2 * Math.PI * freq * t); // up = -amp at sin>0
+        for (let k = 0; k < nSub; k++) {
+          const t0 = k / nSub, t1 = (k + 1) / nSub;
+          const sx0 = cursorX + len * t0, sx1 = cursorX + len * t1;
+          const y0 = wave(t0), y1 = wave(t1);
+          addRampSlab(sx0, sx1, y0, y1, thick);
+          const sl = (y1 - y0) / (sx1 - sx0);
+          this._segs.push({ x0: sx0, x1: sx1, kind: 'bumps', topYa: y0, topYb: y1,
+            slope: sl, surfFn: (px) => y0 + sl * (px - sx0) });
+          if (y0 < this._maxSurfaceTopY) this._maxSurfaceTopY = y0;
+          if (y1 < this._maxSurfaceTopY) this._maxSurfaceTopY = y1;
+        }
+        cursorX += len;
+        // surfaceY unchanged (whole periods ⇒ ends at baseY).
       }
     }
 
@@ -391,8 +473,9 @@ export class Physics {
    * spike at a seam; falls back to a small central difference over a gap/unknown. */
   surfaceSlopeAt(px) {
     const s = this._segAt(px);
-    if (s && s.kind === 'ramp') return s.slope;        // downhill > 0 (y +down)
-    if (s && (s.kind === 'flat' || s.kind === 'wall' || s.kind === 'stairs')) return 0;
+    // ramp / wall (steep riser face) / bumps (wavy surface) all carry an analytic slope.
+    if (s && (s.kind === 'ramp' || s.kind === 'wall' || s.kind === 'bumps') && typeof s.slope === 'number') return s.slope; // downhill > 0 (y +down)
+    if (s && (s.kind === 'flat' || s.kind === 'stairs')) return 0;
     const dx = 0.35;
     const yR = this.surfaceYAt(px + dx), yL = this.surfaceYAt(px - dx);
     if (yR == null || yL == null) return 0;
@@ -468,10 +551,14 @@ export class Physics {
     // finite-difference spike when the probe window straddles a sharp seam/riser at
     // a segment boundary (e.g. a ramp→stairs riser) which would briefly over-tilt
     // the body. A flat segment has slope 0 ⇒ level.
-    if (seg && seg.kind === 'ramp') {
+    // ramp / bumps (wavy surface): lean to the analytic local slope. The body tilt
+    // tracks each rise/fall of the bump field (nose up the front of a bump, down its
+    // back), capped by tiltMax. A wall's steep riser face also leans (capped) so the
+    // body climbs the ledge nose-up rather than staying flat against a vertical face.
+    if (seg && (seg.kind === 'ramp' || seg.kind === 'bumps' || seg.kind === 'wall') && typeof seg.slope === 'number') {
       return clampMag(Math.atan(seg.slope) * TUNE.tiltGain, TUNE.tiltMax);
     }
-    if (seg && (seg.kind === 'flat' || seg.kind === 'wall')) return 0;
+    if (seg && seg.kind === 'flat') return 0;
     // gap / unknown: finite-difference (and hold the current lean over a gap).
     const dx = TUNE.tiltDx;
     const yR = this.surfaceYAt(px + dx);
@@ -659,6 +746,20 @@ export class Physics {
     return Math.max(TUNE.speedFactorMin, Math.min(TUNE.speedFactorMax, f));
   }
 
+  /** Normalized reach t ∈ [0,1] over the legal reach band (MIN..MAX). */
+  reachNorm(reach) {
+    const t = (reach - LEG_REACH_MIN) / (LEG_REACH_MAX - LEG_REACH_MIN);
+    return Math.max(0, Math.min(1, t));
+  }
+
+  /** Monotone jump factor jf ∈ [0,1] from reach (spec #2): a LONG leg (reach→MAX)
+   * gives jf→1 (easy, big, far jump); a SHORT leg (reach→MIN) gives jf→0 (eases the
+   * launch gates UP so it barely/never leaves the ground, and ~0 launch boost). The
+   * power >1 suppresses the short half harder so short presets read as "no pop". */
+  jumpFactor(reach) {
+    return Math.pow(this.reachNorm(reach), TUNE.jumpReachPow);
+  }
+
   /** Max step height a given reach can climb (designed rule). */
   maxClimbHeight(reach) {
     return Math.max(0, (reach - TUNE.climbBase) / TUNE.climbK);
@@ -767,24 +868,38 @@ export class Physics {
    * Gated by minLaunchSpeed and minDropSlope so the FLAT (slope≈0, curvature 0) and
    * slow walks NEVER launch (no false jumps). */
   _maybeLaunch(v) {
-    if (v < TUNE.minLaunchSpeed) return false;        // too slow → stay grounded
+    // ── REACH-SCALED GATES (spec #2/#3) ──
+    // jf=1 (long leg) ⇒ gates EASE (launch readily, big arc); jf=0 (short leg) ⇒
+    // gates STIFFEN (rarely/never launches → walks down). lerp(short, long, jf).
+    const jf = this.jumpFactor(this._reach);
+    const lerp = (aShort, aLong) => aShort + (aLong - aShort) * jf;
+    const speedGate = TUNE.minLaunchSpeed * lerp(TUNE.launchSpeedGateShort, TUNE.launchSpeedGateLong);
+    const dropGate  = TUNE.minDropSlope   * lerp(TUNE.dropSlopeGateShort,  TUNE.dropSlopeGateLong);
+    const marginGate = TUNE.launchMargin  * lerp(TUNE.marginGateShort,     TUNE.marginGateLong);
+
+    if (v < speedGate) return false;                  // too slow for this leg → stay grounded
     const x = this._x;
     const slopeBehind = this.surfaceSlopeAt(x - TUNE.crestLookDx); // up<0, down>0
     const slopeAhead = this.surfaceSlopeAt(x + TUNE.crestAheadDx);
     const dSlope = slopeAhead - slopeBehind;          // convex crest ⇒ +（curls down）
     if (dSlope <= 0) return false;                     // concave / flat / climbing — no launch
-    if (slopeAhead < TUNE.minDropSlope) return false;  // the descent ahead is too gentle
+    if (slopeAhead < dropGate) return false;           // the descent ahead is too gentle for this leg
     const dxSpan = TUNE.crestLookDx + TUNE.crestAheadDx;
     const curvature = dSlope / dxSpan;                 // d(slope)/dx
     const aSurf = v * v * curvature;                   // downward accel demanded to stay glued
-    if (aSurf <= TUNE.gravity * TUNE.launchMargin) return false; // gravity can hold it → grounded
-    // LAUNCH. Vertical velocity = current along-surface vertical speed (tangential).
-    // On a hump the body is usually near-flat/rising at the crest, so vy0 is small
-    // or slightly upward; gravity then arcs it down onto the descent. Clamp so a
-    // freak slope can't fling it absurdly.
+    if (aSurf <= TUNE.gravity * marginGate) return false; // gravity can hold it (for this leg) → grounded
+    // LAUNCH. Base vertical velocity = current along-surface vertical speed (tangential,
+    // smooth departure). PLUS a reach-scaled UPWARD pop (jumpBoost·jf): a long stride
+    // visibly springs off the lip and glides far; a short stride gets ≈0 boost. The
+    // boost is UP (physics +down ⇒ subtract). The whole thing is clamped so a freak
+    // crest can't fling it absurdly (cap grows with the boost so the pop isn't eaten).
+    const vyTangential = v * slopeBehind;              // physics +down; rising crest ⇒ negative (up)
+    const pop = TUNE.jumpBoost * jf;                   // u/s upward, scaled by reach
+    const vy0 = vyTangential - pop;                    // subtract ⇒ more UP
+    const cap = v + pop;                               // allow the reach pop on top of the speed cap
     this._air = true;
     this._airFrames = 0;
-    this._vy = clampMag(v * slopeBehind, v); // physics +down; rising crest ⇒ negative (up)
+    this._vy = clampMag(vy0, cap);
     this._landMerge = 0;
     return true;
   }
@@ -820,15 +935,18 @@ export class Physics {
           this._x = riser.x - CUBE_SIZE * 0.5;
         }
       } else if (seg) {
-        if (seg.kind === 'ramp') {
+        if (seg.kind === 'ramp' || seg.kind === 'bumps') {
           // slope > 0 means descending (topY increases downhill since y is +down…
-          // careful: y +down so going UP is slope<0). Use sign of slope.
+          // careful: y +down so going UP is slope<0). Use sign of slope. The GAP's
+          // descent/ascent ramps and the BUMPS sub-ramps ride this same blend, so a
+          // short leg crawls UP the V-trench exit / bump fronts (uphill = slow) while
+          // a long leg either launches over (gap) or rolls across faster.
           terrain = seg.slope < 0 ? lerpSlow(seg.slope, TUNE.uphillSlow) : lerpFast(seg.slope, TUNE.downhillFast);
+        } else if (seg.kind === 'wall') {
+          // climbing the steep wall face (a climbable long leg) — slow, like stairs.
+          terrain = TUNE.stairClimbSlow;
         } else if (seg.kind === 'stairs' || (riser && this.canClimb(reach, riser.h))) {
           terrain = TUNE.stairClimbSlow;
-        } else if (seg.kind === 'gap') {
-          // over a gap there is no floor; the walker can't push — treat as blocked.
-          v = 0; this._blocked = true;
         }
       }
       v *= terrain;
@@ -895,7 +1013,18 @@ export class Physics {
     //     slips (net x ≈ 0 — NO fake forward push). When the motor is off, ω=0.
     let omega = 0;
     const cosA = Math.max(0.2, Math.cos(this._angle || 0)); // along-surface factor
-    if (drive && v > 1e-6) {
+    if (this._air) {
+      // ── AIRBORNE: FREEZE the legs (spec #1). A person leaping off a downhill edge
+      //    keeps the legs in the take-off pose and glides — the legs do NOT keep
+      //    cycling in mid-air (the previous build's airborne churn read as fake). So
+      //    while off the ground we hold _theta at the launch angle (ω = 0, no advance)
+      //    and resume cycling only on touchdown. The legs still inherit the arc TILT
+      //    (body lean) via _syncLegs, which is the natural "rigid pose follows the
+      //    flight path" look — but the gait phase is locked.
+      omega = 0;
+      this._vTip = 0;
+      this._trying = false;
+    } else if (drive && v > 1e-6) {
       const vSurf = v / cosA;
       // ry_contact = the deeper (carrying) leg's CURRENT vertical lever (== support
       // depth at the live phase+tilt). Floor it so a near-horizontal pose can't blow

@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'} SegmentKind
  */
 
 /**
@@ -14,8 +14,12 @@
  * @typedef {Object} TrackSegment
  * @property {SegmentKind} kind
  * @property {number}  length          x-direction length (world units)
- * @property {number} [height]         ramp rise/fall, wall height, or stairs total height
+ * @property {number} [height]         ramp rise/fall, wall step-up height, or stairs total height
  * @property {number} [steps]          number of steps (stairs)
+ * @property {number} [width]          GAP only: horizontal width of the V-trench (overrides length if given)
+ * @property {number} [depth]          GAP only: how deep the V-trench bottom drops below the lip
+ * @property {number} [amp]            BUMPS only: half-amplitude of the sine surface (peak-to-trough = 2*amp)
+ * @property {number} [freq]           BUMPS only: number of full sine periods over the segment length
  * @property {number} [rough]          0..1 friction (rough floor), default 0.6
  * @property {number} [bouncy]         0..1 restitution (rubber), default 0
  */
@@ -59,7 +63,7 @@ export const SEGMENT_DEFAULTS = Object.freeze({
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps'];
 
 /** @type {LegPreset[]} */
 export const LEG_PRESETS = ['wheel', 'stick', 'hook'];
@@ -84,14 +88,28 @@ export function validateTrack(t) {
   t.segments.forEach((s, i) => {
     if (!SEGMENT_KINDS.includes(s.kind))
       throw new Error(`segment[${i}].kind invalid: ${s.kind}`);
-    if (typeof s.length !== 'number' || s.length <= 0)
+    // a GAP carries its horizontal extent as `width` (the V-trench span); all other
+    // kinds use `length`. Either way the extent must be a positive number.
+    if (s.kind === 'gap') {
+      if (!(s.width > 0) && !(s.length > 0))
+        throw new Error(`segment[${i}] gap needs width>0 (or length>0)`);
+    } else if (typeof s.length !== 'number' || s.length <= 0) {
       throw new Error(`segment[${i}].length must be a positive number`);
+    }
     if (s.kind === 'stairs') {
       if (!(s.steps > 0)) throw new Error(`segment[${i}] stairs needs steps>0`);
       if (!(s.height > 0)) throw new Error(`segment[${i}] stairs needs height>0`);
     }
     if ((s.kind === 'ramp' || s.kind === 'wall') && !(typeof s.height === 'number'))
       throw new Error(`segment[${i}] ${s.kind} needs height`);
+    if (s.kind === 'gap') {
+      // a GAP is a V-trench with a floor (no soft-lock) — needs a depth to drop.
+      if (!(s.depth > 0)) throw new Error(`segment[${i}] gap needs depth>0`);
+    }
+    if (s.kind === 'bumps') {
+      if (!(s.amp > 0)) throw new Error(`segment[${i}] bumps needs amp>0`);
+      if (!(s.freq > 0)) throw new Error(`segment[${i}] bumps needs freq>0`);
+    }
   });
   if (t.rival != null) {
     const r = t.rival;

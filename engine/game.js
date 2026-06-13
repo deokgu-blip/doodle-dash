@@ -45,6 +45,13 @@ export class Game {
     this._lastStroke = null;
     this._raf = null;
     this._lastT = 0;
+    // ── SLOW-MOTION (bullet-time) while drawing (§A) ──
+    // The core loop is "redraw the leg as the path changes". To make that feel good
+    // and FAIR, the WHOLE game (player + rival) slows to 10% speed the instant the
+    // user starts a stroke and snaps back to full speed when the stroke is applied.
+    // It is a pure TIME multiplier on step() — deterministic, fixed-timestep-safe.
+    this._timeScale = 1.0;
+    this.SLOWMO_SCALE = 0.1;   // 90% slower while drawing (bullet-time)
   }
 
   // ── track loading (data only) ──
@@ -99,6 +106,14 @@ export class Game {
   setLegPreset(name) {
     this.setLegStroke(presetStroke(name));
   }
+
+  // ── SLOW-MOTION signals from the draw input (§A) ──
+  /** The user STARTED a stroke → enter bullet-time (whole game slows to 10%). It
+   * stays in 'running' (no restart, no countdown) so the cube keeps moving slowly. */
+  beginDraw() { this._timeScale = this.SLOWMO_SCALE; }
+  /** The stroke ENDED (a new leg was applied, or the gesture cancelled) → full speed. */
+  endDraw() { this._timeScale = 1.0; }
+  get timeScale() { return this._timeScale; }
 
   restart() {
     this.physics.buildTrack(this.track);
@@ -197,7 +212,11 @@ export class Game {
       let frame = t - this._lastT;
       this._lastT = t;
       if (frame > 100) frame = 100; // clamp tab-switch spikes
-      this.step(frame);
+      // SLOW-MOTION: scale REAL frame time by the current timeScale (0.1 while the
+      // user is drawing, 1.0 otherwise). The fixed-step accumulator in step() carries
+      // the sub-tick remainder, so 0.1× simply advances ~10% of the ticks per frame —
+      // both player AND rival slow together (it is applied to the whole step).
+      this.step(frame * this._timeScale);
       this.renderer.sync(this.physics);
       if (this.rivalSpec) this.renderer.syncRival(this.rival);
       this.renderer.updateCamera(this.physics);

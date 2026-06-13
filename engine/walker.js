@@ -89,8 +89,13 @@ const TUNE = {
   // atan of the rise/run, then EASE cube.angle toward it (no snap). On stairs we
   // tilt to the staircase's OVERALL diagonal (not the saw-tooth of each tread).
   tiltDx: 0.55,          // half-width (world u) of the slope-probe around the body
-  tiltLerp: 5.5,         // 1/s — how fast cube.angle eases to the target tilt (lower ⇒ gentler lean, no per-frame snap at segment seams)
-  tiltSlewMax: 0.025,    // rad/frame cap on cube.angle change (slew limiter ⇒ no per-frame lean snap at segment seams)
+  // The dynamic T01 chains STEEP up→down ramps that are only ~4u long, so the lean
+  // must swing ~1.1rad (nose-up → nose-down) across a short descent. A too-slow ease
+  // never reaches the descent target before the next seam (the body stays ~level on
+  // short descents). We raise the responsiveness so the lean tracks short ramps while
+  // staying under the (I) per-frame-snap cap (0.03 rad/frame).
+  tiltLerp: 9.0,         // 1/s — how fast cube.angle eases to the target tilt
+  tiltSlewMax: 0.029,    // rad/frame cap on cube.angle change (slew limiter ⇒ no per-frame lean snap at segment seams; just under the (I) DANG_MAX 0.03 gate)
   tiltMax: 0.65,         // rad — clamp so a near-vertical step can't flip the body (§E: lowered 0.85→0.65, the reference lean is gentler)
   tiltGain: 1.0,         // scale on the measured tangent angle (1 = exact match)
   // CLIMB RULE: a step of height h is climbable iff reach >= climbBase + climbK*h
@@ -434,9 +439,20 @@ export class Physics {
   }
 
   // ── LEG INPUT: build the drawn-stroke chain + set reach/shape. ──
+  // CONTINUE-ON-REDRAW (§A): the core fun loop is "the path changes → redraw the
+  // leg → keep going". So a redraw must NOT teleport back to startX. We CONTINUE
+  // from the CURRENT forward position whenever a leg already exists (i.e. the user
+  // is re-drawing mid-run). Only a FRESH placement — the very first leg of a track
+  // (no legs yet) — anchors at startX. Callers can force a fresh placement with
+  // spec.fresh (used by buildTrack/restart paths). The new leg's reach changes the
+  // float height, so we re-FLOAT vertically at the current x (the cube hovers to the
+  // new leg's support depth) while x / progress / phase are PRESERVED.
   setLegStroke(points, spec = {}) {
     if (!this.cube) return;
     const scale = (spec.scale ?? 1.0) * LEG_WORLD_SCALE;
+    // continue if legs already exist (mid-run redraw) UNLESS a fresh start is forced.
+    const hadLegs = this.legs.length > 0 && this.legDrawn;
+    const fresh = spec.fresh === true || !hadLegs;
 
     this.legs = [];
     if (!points || points.length < 2) { this.legDrawn = false; return; }
@@ -465,30 +481,58 @@ export class Physics {
     this._reach = reach;
     this._chain = chain;
 
-    // 5. place the cube so the foot tip just touches the start-segment surface.
-    //    The cube centre floats a designed clearance above the surface; the leg
-    //    reaches DOWN to the ground (the reference look).
-    const startSurfaceY = this.surfaceYAt(this.startX);
-    const surf = (startSurfaceY == null) ? 0 : startSurfaceY;
-    // Float the cube centre so the DEEPER leg's lowest contact point just grazes
-    // the surface (geometric support, NOT a constant clearance). The bob is the
-    // by-product of this depth changing as the legs spin. At θ=0/tilt=0 this is the
-    // creation pose's support depth.
-    const support0 = this._supportDepth(0, 0);
-    const cubeY = surf - support0;     // above the surface (physics +down)
-    this.cube.position.x = this.startX;
-    this.cube.position.y = cubeY;
-    this.cube.velocity.x = 0; this.cube.velocity.y = 0;
-    this.cube.angle = 0;
-    this._x = this.startX;
-    this._bodyY = cubeY;
-    this._bodyBaseY = cubeY;
-    this._bob = 0;
-    this._angle = 0;
-    this._theta = 0;
-    this._blocked = false;
-    this._vx = 0;
-    this._vTip = 0;
+    // 5. place / re-float the cube.
+    //    • FRESH (first leg of a track): anchor at startX, level, phase reset — the
+    //      foot tip just grazes the start-segment surface (the original behaviour).
+    //    • CONTINUE (mid-run redraw): KEEP x / progress / spin phase / tilt. Only
+    //      re-FLOAT the vertical height at the CURRENT x for the NEW leg's support
+    //      depth, so the cube hovers to the new leg without dropping/teleporting and
+    //      the run carries on from where it was. This is the "redraw to adapt, keep
+    //      going" core loop — NO restart, NO progress loss.
+    if (fresh) {
+      const startSurfaceY = this.surfaceYAt(this.startX);
+      const surf = (startSurfaceY == null) ? 0 : startSurfaceY;
+      // Float the cube centre so the DEEPER leg's lowest contact point just grazes
+      // the surface (geometric support, NOT a constant clearance). The bob is the
+      // by-product of this depth changing as the legs spin. At θ=0/tilt=0 this is the
+      // creation pose's support depth.
+      const support0 = this._supportDepth(0, 0);
+      const cubeY = surf - support0;     // above the surface (physics +down)
+      this.cube.position.x = this.startX;
+      this.cube.position.y = cubeY;
+      this.cube.velocity.x = 0; this.cube.velocity.y = 0;
+      this.cube.angle = 0;
+      this._x = this.startX;
+      this._bodyY = cubeY;
+      this._bodyBaseY = cubeY;
+      this._bob = 0;
+      this._angle = 0;
+      this._theta = 0;
+      this._blocked = false;
+      this._vx = 0;
+      this._vTip = 0;
+    } else {
+      // CONTINUE: re-float vertically at the current x for the new leg's reach. x,
+      // _theta, _angle, progress are all preserved (carry on running). The next
+      // update() step will smoothly re-settle _bodyBaseY anyway, but we set it now so
+      // a redraw while paused/inspected reads a consistent (non-penetrating) pose.
+      const curX = this._x;
+      const surfNow = this.surfaceYAt(curX);
+      const surf = (surfNow == null) ? this.cube.position.y : surfNow;
+      const supportNow = this._supportDepth(this._theta, this._angle);
+      const cubeY = surf - supportNow;
+      this.cube.position.x = curX;        // x UNCHANGED — continue from here
+      this.cube.position.y = cubeY;
+      this.cube.velocity.x = 0; this.cube.velocity.y = 0;
+      this.cube.angle = this._angle;
+      this._bodyY = cubeY;
+      this._bodyBaseY = cubeY;
+      this._bob = 0;
+      this._blocked = false;
+      this._vx = 0;
+      this._vTip = 0;
+      // _x, _theta, _angle intentionally PRESERVED.
+    }
 
     // 6. build the two leg objects the renderer reads (visual + state only —
     //    NO Matter bodies). Both share the same chain (axle-local); side gives the

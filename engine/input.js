@@ -53,6 +53,9 @@ export function attachDrawInput(drawCanvas, game, opts = {}) {
     pts.push({ x: l.x, y: l.y });
     drawCanvas.setPointerCapture && drawCanvas.setPointerCapture(e.pointerId);
     redrawStrokePreview();
+    // §A: the user STARTED drawing ⇒ enter bullet-time (whole game slows to 10%).
+    // The game stays 'running' — the cube keeps creeping forward while you redraw.
+    if (game.beginDraw) game.beginDraw();
     e.preventDefault();
   };
   const onMove = (e) => {
@@ -70,9 +73,13 @@ export function attachDrawInput(drawCanvas, game, opts = {}) {
     drawing = false;
     if (pts.length >= minPts) {
       const norm = normalize();
+      // §A: apply the new leg — CONTINUE from the current x (walker.setLegStroke
+      // preserves x mid-run), no restart. Then leave bullet-time → full speed.
       game.setLegStroke(norm);
       if (opts.onStroke) opts.onStroke(norm);
     }
+    // §A: stroke finished (applied or too-short) ⇒ back to full speed.
+    if (game.endDraw) game.endDraw();
     e.preventDefault();
   };
 

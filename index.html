@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>DOODLE DASH</title>
+<style>
+  :root{
+    --bg-top:#A6E05A; --bg-bottom:#7FC93C; --hill:#6FB836;
+    --track-a:#8E3AAE; --track-b:#C24FD6; --track-edge:#5E2480;
+    --player:#3CA5E5; --player-face:#0E2A3A; --leg:#1A1A1A;
+    --ui-text:#FFFFFF; --ui-shadow:rgba(0,0,0,.25); --accent:#F4C430;
+    --draw-box:rgba(255,255,255,.85); --draw-fill:rgba(255,255,255,.10);
+    --tap-min:44px; --safe-t:env(safe-area-inset-top); --safe-b:env(safe-area-inset-bottom);
+    --radius:18px;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+  html,body{ height:100%; overflow:hidden; background:var(--bg-bottom);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    user-select:none; -webkit-user-select:none; touch-action:none; }
+
+  /* full-window background fills any letterbox area (L12) */
+  #bg{ position:fixed; inset:0; background:linear-gradient(180deg,var(--bg-top),var(--bg-bottom)); z-index:0; }
+
+  /* fixed 9:16 design box, centered, transform-fit (creates containing block for fixed HUD — L49) */
+  #stage{
+    position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    width:100vw; height:100vh; max-width:56.25vh; max-height:177.78vw;
+    overflow:hidden; z-index:1;
+  }
+  #gl{ position:absolute; inset:0; width:100%; height:100%; display:block; }
+
+  /* ── top bar ── */
+  #topbar{ position:absolute; top:0; left:0; right:0; padding:calc(8px + var(--safe-t)) 10px 8px;
+    display:flex; align-items:center; gap:8px; z-index:5; }
+  .icon-btn{ width:var(--tap-min); height:var(--tap-min); border:none; border-radius:50%;
+    background:rgba(255,255,255,.22); color:#fff; font-size:20px; line-height:1; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; backdrop-filter:none; }
+  .icon-btn:active{ transform:scale(.92); }
+
+  /* ── progress bar ── */
+  #progress-wrap{ flex:1; height:14px; background:rgba(0,0,0,.18); border-radius:7px; position:relative; overflow:visible; }
+  #progress-fill{ position:absolute; left:0; top:0; bottom:0; width:0%; background:var(--accent); border-radius:7px; transition:width .08s linear; }
+  #you{ position:absolute; top:-6px; left:0%; width:24px; height:24px; margin-left:-12px;
+    border-radius:50%; background:var(--player); border:3px solid #fff; box-shadow:0 1px 3px var(--ui-shadow); transition:left .08s linear; }
+  #flag-end{ position:absolute; right:-2px; top:-8px; font-size:18px; }
+
+  /* ── countdown ── */
+  #countdown{ position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    font-size:24vmin; font-weight:900; color:#fff; text-shadow:0 4px 0 rgba(0,0,0,.18); z-index:6; pointer-events:none;
+    animation:pulse .5s ease-out; }
+  @keyframes pulse{ from{ transform:scale(1.4); opacity:.2; } to{ transform:scale(1); opacity:1; } }
+
+  /* ── draw box ── */
+  #drawbox{ position:absolute; left:6%; right:6%; bottom:calc(4% + var(--safe-b)); height:24%;
+    border:3px dashed var(--draw-box); border-radius:var(--radius); background:var(--draw-fill); z-index:4;
+    display:flex; align-items:center; justify-content:center; }
+  #drawcanvas{ position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
+  #draw-hint{ color:rgba(255,255,255,.8); font-size:14px; font-weight:600; pointer-events:none; letter-spacing:.5px; }
+
+  /* ── result overlay ── */
+  #overlay{ position:absolute; inset:0; display:none; align-items:center; justify-content:center; z-index:7;
+    background:rgba(0,0,0,.28); }
+  #panel{ background:#fff; border-radius:24px; padding:22px 26px; text-align:center; min-width:220px;
+    box-shadow:0 10px 30px rgba(0,0,0,.3); }
+  #overlay-title{ font-size:26px; font-weight:900; color:#8E3AAE; }
+  #overlay-crown{ font-size:42px; margin:6px 0; }
+  #overlay-btns{ display:flex; gap:10px; justify-content:center; margin-top:12px; }
+  .btn{ min-height:var(--tap-min); padding:0 18px; border:none; border-radius:14px; font-size:16px; font-weight:800;
+    color:#fff; background:var(--player); cursor:pointer; }
+  .btn.retry{ background:#999; }
+  .btn:active{ transform:scale(.95); }
+</style>
+</head>
+<body>
+  <div id="bg"></div>
+  <div id="stage">
+    <canvas id="gl"></canvas>
+
+    <div id="topbar">
+      <button class="icon-btn" id="btn-restart" title="restart">&#8635;</button>
+      <div id="progress-wrap">
+        <div id="progress-fill"></div>
+        <div id="you"></div>
+        <div id="flag-end">&#127937;</div>
+      </div>
+      <button class="icon-btn" id="btn-sound" title="sound">&#128266;</button>
+    </div>
+
+    <div id="countdown">3</div>
+
+    <div id="drawbox">
+      <span id="draw-hint">DRAW A LEG</span>
+      <canvas id="drawcanvas"></canvas>
+    </div>
+
+    <div id="overlay">
+      <div id="panel">
+        <div id="overlay-title">terrific!</div>
+        <div id="overlay-crown">&#128081;</div>
+        <div id="overlay-btns">
+          <button class="btn" id="btn-next">&#9654; NEXT</button>
+          <button class="btn retry" id="btn-retry">&#8635; RETRY</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script type="module">
+  import { Game } from './engine/game.js';
+  import { attachDrawInput } from './engine/input.js';
+
+  const $ = (id) => document.getElementById(id);
+  const gl = $('gl');
+  const drawcanvas = $('drawcanvas');
+
+  const hud = {
+    progressFill: $('progress-fill'),
+    youMarker: $('you'),
+    countdown: $('countdown'),
+    overlay: $('overlay'),
+    overlayTitle: $('overlay-title'),
+  };
+
+  const game = new Game({ canvas: gl, drawCanvas: drawcanvas, hud });
+  window.game = game;
+
+  function resizeGL(){
+    const r = gl.getBoundingClientRect();
+    game.renderer.resize(Math.max(2, r.width), Math.max(2, r.height));
+  }
+
+  let soundOn = true;
+  $('btn-sound').addEventListener('click', () => {
+    soundOn = !soundOn;
+    $('btn-sound').innerHTML = soundOn ? '&#128266;' : '&#128263;';
+    // sound hook only — files not yet present (POC)
+  });
+  $('btn-restart').addEventListener('click', () => game.restart());
+  $('btn-retry').addEventListener('click', () => game.restart());
+  $('btn-next').addEventListener('click', () => game.restart()); // single track POC
+
+  const hint = $('draw-hint');
+  attachDrawInput(drawcanvas, game, { onStroke: () => { if (hint) hint.style.display = 'none'; } });
+
+  window.addEventListener('resize', resizeGL);
+
+  // ── boot ──
+  (async () => {
+    await game.loadTrack('T01');
+    resizeGL();
+    game.startLoop();
+
+    // headless debug API (L24) — deterministic, no rendering required
+    window.__DC = {
+      loadTrack: (id) => game.loadTrack(id),
+      setLegPreset: (n) => { game.setLegPreset(n); if (hint) hint.style.display = 'none'; },
+      setLegStroke: (pts, spec) => { game.setLegStroke(pts, spec); if (hint) hint.style.display = 'none'; },
+      step: (ms) => game.step(ms),
+      forceStart: () => game.forceStart(),
+      getState: () => game.getState(),
+    };
+    window.__DC_READY = true;
+  })();
+</script>
+</body>
+</html>

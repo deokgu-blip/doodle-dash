@@ -1,0 +1,12 @@
+{
+  "id": "T01",
+  "theme": "first-steps",
+  "startX": 0,
+  "finishX": 26,
+  "segments": [
+    { "kind": "flat",   "length": 8,  "rough": 0.9 },
+    { "kind": "stairs", "length": 4,  "height": 0.9, "steps": 2, "rough": 0.9 },
+    { "kind": "flat",   "length": 18, "rough": 0.9 }
+  ],
+  "rival": null
+}

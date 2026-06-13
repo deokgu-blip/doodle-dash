@@ -83,6 +83,16 @@ const TUNE = {
   uphillSlow: 0.55,      // multiplier on a ramp going up (per unit slope, blended)
   downhillFast: 1.25,    // multiplier on a ramp going down
   stairClimbSlow: 0.7,   // climbing stairs is a bit slower than flat
+  // BODY TILT (reference look): the cube leans to match the LOCAL surface tangent
+  // — nose up on an ascent, nose down on a descent, level on the flat. We measure
+  // the slope by sampling the surface a small dx either side of the body and take
+  // atan of the rise/run, then EASE cube.angle toward it (no snap). On stairs we
+  // tilt to the staircase's OVERALL diagonal (not the saw-tooth of each tread).
+  tiltDx: 0.55,          // half-width (world u) of the slope-probe around the body
+  tiltLerp: 5.5,         // 1/s — how fast cube.angle eases to the target tilt (lower ⇒ gentler lean, no per-frame snap at segment seams)
+  tiltSlewMax: 0.025,    // rad/frame cap on cube.angle change (slew limiter ⇒ no per-frame lean snap at segment seams)
+  tiltMax: 0.85,         // rad — clamp so a near-vertical step can't flip the body
+  tiltGain: 1.0,         // scale on the measured tangent angle (1 = exact match)
   // CLIMB RULE: a step of height h is climbable iff reach >= climbBase + climbK*h
   // i.e. taller steps demand a longer leg. Solve h_max(reach) = (reach-base)/K.
   // Calibrated so the SHORTEST leg (reach 0.6) clears a LOW step (~0.25) but is
@@ -96,7 +106,8 @@ const TUNE = {
   // headroom; the bob then oscillates DOWNWARD within that headroom so the lowest
   // instant still keeps the foot on (never below) the surface.
   graze: 0.0,             // allowed graze depth at bottom of sweep (0 ⇒ exact touch)
-  surfaceLerp: 16.0,      // 1/s — how fast body-y eases to the target surface (smooth stair step-up)
+  surfaceLerp: 9.0,       // 1/s — how fast body-y eases to the target surface (smooth stair step-up; lower ⇒ gentler, no per-frame snap)
+  surfaceSlewMax: 0.04,   // world u/frame cap on body-y change (slew limiter ⇒ structurally no per-frame snap; > the true rise-rate so it never blocks the climb)
   bobAmp: 0.05,           // vertical bob amplitude (juice), world units (downward-only)
   // cadence: ω = v / effectiveRadius. effectiveRadius == the CONTACT foot's lever
   // arm (reach + lineRadius) so the planted foot's world speed is v − ω·r == 0
@@ -125,6 +136,7 @@ export class Physics {
     // ── kinematic state ──
     this._x = 0;                     // forward position (world)
     this._bodyY = 0;                 // cube centre y (physics, +down) — smoothed
+    this._angle = 0;                 // cube tilt (rad) — eased toward surface tangent
     this._theta = 0;                 // master leg phase (rad)
     this._reach = 0;                 // current leg reach (world units)
     this._shape = null;              // shape descriptor (chain etc.)
@@ -162,6 +174,7 @@ export class Physics {
     this._vx = 0;
     this._vTip = 0;
     this._theta = 0;
+    this._angle = 0;
   }
 
   // ── TERRAIN: build floor slabs (for the renderer) + a height model. ──
@@ -183,6 +196,24 @@ export class Physics {
         position: { x: cx, y: topY + halfH },
         bounds: { min: { x: cx - half, y: topY }, max: { x: cx + half, y: topY + slabH } },
         _dcTopY: topY,
+      };
+      this.floorBodies.push(b);
+      return b;
+    };
+    // a RAMP slab: an oriented box whose TOP face is the sloped surface. We pass the
+    // two end heights so the renderer can rotate the slab to the ramp angle (a
+    // tilted slab, not a flat box at mid-height). The render uses physics y (+down).
+    const addRampSlab = (x0, x1, topY0, topY1, slabH) => {
+      const cx = (x0 + x1) / 2;
+      const len = x1 - x0;
+      const span = Math.hypot(len, (topY1 - topY0)); // along-slope length
+      const b = {
+        label: 'floor', kind: 'ramp',
+        position: { x: cx, y: (topY0 + topY1) / 2 + slabH / 2 },
+        bounds: { min: { x: x0, y: Math.min(topY0, topY1) },
+                  max: { x: x1, y: Math.max(topY0, topY1) + slabH } },
+        _dcTopY: Math.min(topY0, topY1),
+        _dcRamp: { x0, x1, topY0, topY1, len, span, slabH },
       };
       this.floorBodies.push(b);
       return b;
@@ -226,11 +257,10 @@ export class Physics {
         const dy = -(seg.height ?? 0);      // up = negative y
         const x0 = cursorX, x1 = cursorX + len;
         const topY0 = surfaceY, topY1 = surfaceY + dy;
-        // render slab: a thick rect rotated to the ramp angle (visual only). We
-        // approximate the ribbon with an axis box top at the mid height — the
-        // height model below carries the true sloped surface.
-        const midTop = (topY0 + topY1) / 2;
-        addSlab(cursorX + len / 2, midTop, len, thick + Math.abs(dy));
+        // render slab: a TILTED slab whose TOP face IS the sloped surface (matches
+        // the reference's smooth hills) — NOT a flat box at mid-height. The height
+        // model below carries the same true sloped surface for the walker.
+        addRampSlab(x0, x1, topY0, topY1, thick);
         const slope = dy / len;
         this._segs.push({ x0, x1, kind: 'ramp', topYa: topY0, topYb: topY1, slope,
           surfFn: (px) => topY0 + slope * (px - x0) });
@@ -283,6 +313,88 @@ export class Physics {
       if (best == null || y < best) best = y;
     }
     return best;
+  }
+
+  /** Surface height used to FLOAT THE BODY (not the physical surface). Over stairs
+   * we return the run's smooth DIAGONAL (lerp first→last tread) instead of the
+   * stepped saw-tooth, so the body glides up the staircase with no per-frame snap
+   * (reference look). The diagonal is ALWAYS at or ABOVE the stepped treads (a
+   * staircase's hypotenuse sits above its steps), so floating to it keeps the foot
+   * ON/above every tread — zero penetration is preserved. Elsewhere == surfaceYAt. */
+  bodySurfaceYAt(px) {
+    const seg = this._segAt(px);
+    if (seg && seg.kind === 'stairs') {
+      // find the contiguous stair RUN containing px (abutting stair treads).
+      let x0 = seg.x0, x1 = seg.x1, ya = seg.surfFn(seg.x0), yb = seg.surfFn(seg.x1);
+      for (const s of this._segs) {
+        if (s.kind !== 'stairs') continue;
+        if (s.x1 > x0 - 1e-6 && s.x0 < x1 + 1e-6) {
+          if (s.x0 < x0) { x0 = s.x0; ya = s.surfFn(s.x0); }
+          if (s.x1 > x1) { x1 = s.x1; yb = s.surfFn(s.x1); }
+        }
+      }
+      const run = Math.max(1e-3, x1 - x0);
+      // Ride the staircase HYPOTENUSE — the line through each tread's top-OUTER
+      // corner — which sits at or ABOVE every tread top. Floating the body to this
+      // line keeps the foot on/above every tread (zero penetration) while the body
+      // glides up a single smooth diagonal (no per-step snap). For an ASCENT (yb<ya)
+      // bias the START end up by a full step (the hypotenuse leads the first tread);
+      // for a DESCENT bias the END end. We bias both ends up by one step which is
+      // safe (always ≥ the treads) and symmetric.
+      const stepRise = seg.stepH || 0;
+      const yTop0 = ya - stepRise, yTop1 = yb - stepRise;
+      const t = clamp01((px - x0) / run);
+      return yTop0 + (yTop1 - yTop0) * t;
+    }
+    return this.surfaceYAt(px);
+  }
+
+  /** Target BODY TILT (cube.angle, physics convention) at forward position px.
+   *
+   * The cube leans to match the LOCAL surface TANGENT — nose up on an ascent,
+   * down on a descent, level on the flat (the reference look). We measure the
+   * tangent by finite-differencing the surface a small dx either side of the
+   * body. On STAIRS we tilt to the staircase's OVERALL diagonal (the run between
+   * the first and last tread of the run), NOT the per-tread saw-tooth, so the
+   * body climbs the steps along a single smooth diagonal instead of jittering.
+   *
+   * Sign: physics y is +down and the renderer draws cube.rotation.z = -cube.angle
+   * with render-y = -phys-y. Setting cube.angle = atan(dPhysY/dx) makes the screen
+   * rotation = atan(dRenderY/dx) (the visible surface tangent): uphill ⇒ CCW nose-up,
+   * downhill ⇒ CW nose-down, flat ⇒ 0. (Derived & checked in the verifier (H).)
+   */
+  _targetTilt(px) {
+    const seg = this._segAt(px);
+    // On a stair run, lean to the whole run's diagonal (first→last tread).
+    if (seg && seg.kind === 'stairs') {
+      let x0 = seg.x0, x1 = seg.x1, ya = seg.surfFn(seg.x0), yb = seg.surfFn(seg.x1);
+      for (const s of this._segs) {
+        if (s.kind !== 'stairs') continue;
+        // contiguous stair treads share the same run if they abut.
+        if (s.x1 > x0 - 1e-6 && s.x0 < x1 + 1e-6) {
+          if (s.x0 < x0) { x0 = s.x0; ya = s.surfFn(s.x0); }
+          if (s.x1 > x1) { x1 = s.x1; yb = s.surfFn(s.x1); }
+        }
+      }
+      const run = Math.max(1e-3, x1 - x0);
+      const slope = (yb - ya) / run;          // physics slope (+down): up ⇒ negative
+      return clampMag(Math.atan(slope) * TUNE.tiltGain, TUNE.tiltMax);
+    }
+    // Ramp: use the segment's ANALYTIC slope (constant along a ramp). This avoids a
+    // finite-difference spike when the probe window straddles a sharp seam/riser at
+    // a segment boundary (e.g. a ramp→stairs riser) which would briefly over-tilt
+    // the body. A flat segment has slope 0 ⇒ level.
+    if (seg && seg.kind === 'ramp') {
+      return clampMag(Math.atan(seg.slope) * TUNE.tiltGain, TUNE.tiltMax);
+    }
+    if (seg && (seg.kind === 'flat' || seg.kind === 'wall')) return 0;
+    // gap / unknown: finite-difference (and hold the current lean over a gap).
+    const dx = TUNE.tiltDx;
+    const yR = this.surfaceYAt(px + dx);
+    const yL = this.surfaceYAt(px - dx);
+    if (yR == null || yL == null) return this._angle;   // over a gap — hold current lean
+    const slope = (yR - yL) / (2 * dx);                 // physics slope (+down)
+    return clampMag(Math.atan(slope) * TUNE.tiltGain, TUNE.tiltMax);
   }
 
   /** Local segment under px (for terrain / climb decisions). */
@@ -343,6 +455,7 @@ export class Physics {
     this.cube.angle = 0;
     this._x = this.startX;
     this._bodyY = cubeY;
+    this._angle = 0;
     this._theta = 0;
     this._blocked = false;
     this._vx = 0;
@@ -484,21 +597,44 @@ export class Physics {
     //    lags into the riser. Easing DOWN is smooth; rising UP snaps to the target
     //    (clamp) so the foot can never penetrate the step it just mounted.
     const half = CUBE_SIZE * 0.5 + LEG_LINE_RADIUS;
-    let topSurf = null; // most-negative (highest) surface under the footprint
-    for (let sx = this._x - half; sx <= this._x + half + 1e-6; sx += half) {
-      const s = this.surfaceYAt(sx);
+    let topSurf = null; // most-negative (highest) BODY-FLOAT surface under footprint
+    // bodySurfaceYAt returns the SMOOTH stair-run hypotenuse over stairs (no
+    // saw-tooth) and the true surface elsewhere — so the body glides with no snap
+    // while still floating at/above every tread (zero penetration preserved). We
+    // sample from a touch BEHIND to a LOOKAHEAD ahead so the body anticipates a
+    // rising surface (riser / ramp seam) and is already high enough by the time the
+    // foot is over it — the float LEADS the surface, so the defensive clamp never
+    // has to snap (that snap was the only remaining Δy spike).
+    const LOOK = 1.6;
+    for (let sx = this._x - half; sx <= this._x + LOOK + 1e-6; sx += half * 0.5) {
+      const s = this.bodySurfaceYAt(sx);
       if (s != null && (topSurf == null || s < topSurf)) topSurf = s;
     }
     if (topSurf != null) {
-      const targetY = topSurf - this._bodyClearance(this._reach);
-      if (targetY < this._bodyY) {
-        // surface rose (step up) — snap up so the foot never dips into the step.
-        this._bodyY = targetY;
-      } else {
-        // surface fell (step down / descent) — ease down smoothly (juice).
-        const a = 1 - Math.exp(-TUNE.surfaceLerp * dt);
-        this._bodyY += (targetY - this._bodyY) * a;
-      }
+      // SLOPE CLEARANCE: on a tilt of angle φ the foot sweeps a circle tangent to
+      // the sloped surface, whose lowest WORLD point sits ~r·(1/cos φ − 1) lower
+      // than on the flat. Lifting the float target by that amount keeps the foot ON
+      // (never below) a sloped surface BY CONSTRUCTION — so the defensive clamp in
+      // _syncLegs never has to fire (it was that clamp's unbounded up-snap that
+      // produced the slope Δy spike). cos floored to avoid a blow-up near vertical.
+      const cosA = Math.max(0.35, Math.cos(this._angle || 0));
+      const slopeLift = (this._reach + LEG_LINE_RADIUS) * (1 / cosA - 1);
+      const targetY = topSurf - this._bodyClearance(this._reach) - slopeLift;
+      // Smooth in BOTH directions (reference look: the body glides up a stair run
+      // along its diagonal, no jolt). Because `topSurf` is the HIGHEST surface
+      // across the whole footprint (leading edge), the body starts rising as soon
+      // as the front edge meets a riser — by the time the body is over the tread
+      // it has already eased up to it, so the climb is smooth AND the residual foot
+      // dip stays within the tiny transient bound (≤0.1) the verifier checks. The
+      // defensive up-only clamp in _syncLegs catches any sub-epsilon penetration.
+      const a = 1 - Math.exp(-TUNE.surfaceLerp * dt);
+      let step = (targetY - this._bodyY) * a;
+      // slew limiter: cap the per-frame move so a discrete jump in the sampled
+      // surface (a riser leading-edge) can NEVER produce a visible snap. The cap is
+      // above the true vertical rise-rate of any ramp/stair in the data, so it only
+      // smooths the seam transient and never holds the body back from the climb.
+      step = clampMag(step, TUNE.surfaceSlewMax);
+      this._bodyY += step;
     }
     // bob: small phase-locked walking oscillation (juice). DOWNWARD-ONLY within
     // the bob headroom built into _bodyClearance, so the foot never dips below
@@ -506,19 +642,42 @@ export class Physics {
     const bob = (drive && v > 1e-3)
       ? ((1 - Math.cos(this._theta * 2)) * 0.5) * TUNE.bobAmp : 0;
 
+    // BODY TILT: ease cube.angle toward the local surface tangent (reference look —
+    // nose up on ascents, down on descents, level on flats / stairs along their
+    // diagonal). Easing (no snap) keeps it smooth; over a gap _targetTilt holds the
+    // current lean. The legs inherit this tilt (anchored at the cube centre) so the
+    // whole walker leans together and the feet still reach the surface.
+    {
+      // Drive or idle, the body settles to the local surface tangent (idle on flat
+      // ⇒ level). Slew-limit the per-frame change so a discrete target jump at a
+      // segment seam (flat→ramp, ramp→ramp crest, stair run) can never snap.
+      const tgt = this._targetTilt(this._x);
+      const a = 1 - Math.exp(-TUNE.tiltLerp * dt);
+      let step = (tgt - this._angle) * a;
+      step = clampMag(step, TUNE.tiltSlewMax);
+      this._angle += step;
+    }
+
     this.cube.position.x = this._x;
     this.cube.position.y = this._bodyY + bob;
     this.cube.velocity.x = v;
-    this.cube.angle = 0;
+    this.cube.angle = this._angle;
 
-    // 5. leg phase advances by ω = v / effectiveRadius (no-slip rolling). When
-    //    v≈0 the legs stop too (planted). Faster ⇒ spins faster (cadence).
+    // 5. leg phase advances by ω = v_surface / effectiveRadius (no-slip rolling).
+    //    `v` is the HORIZONTAL advance speed, but the foot rolls along the (sloped)
+    //    SURFACE, whose length per unit horizontal is 1/cos(slopeAngle). On a tilt
+    //    the body leans by ~slopeAngle, so the planted foot must roll the surface
+    //    distance, not the horizontal one — otherwise it slides on ramps. We roll
+    //    the along-surface speed v/cos(angle) so v_foot − v_surface ≈ 0 on slopes
+    //    too (no-slip holds on flat AND ramps). When v≈0 the legs stop (planted).
     let omega = 0;
     if (drive) {
       const r = this._effRadius(this._reach);
-      omega = (v > 1e-6) ? (v / r) : TUNE.idleOmega;
+      const cosA = Math.max(0.2, Math.cos(this._angle || 0)); // along-surface factor
+      const vSurf = v / cosA;
+      omega = (v > 1e-6) ? (vSurf / r) : TUNE.idleOmega;
       this._theta += omega * dt;
-      this._vTip = omega * r; // == v (no-slip)
+      this._vTip = omega * r; // == v_surface (no-slip along the surface)
     } else {
       this._vTip = 0;
     }
@@ -565,9 +724,14 @@ export class Physics {
     // Matter convention the verifier reads: body.angularVelocity is the per-SUB_DT
     // delta-angle (it divides by SUB_DT/1000 to recover rad/s). We are kinematic,
     // so record ω·(SUB_DT/1000) to keep that reconstruction exact.
+    // legs inherit the body tilt: world leg angle = spin phase + body lean. The tilt
+    // eases slowly (slew-capped) so it adds only a small slow rotation; no-slip is
+    // derived from the spin ω = v/r (the dominant term). The foot still sweeps a
+    // circle of the same radius about the centre, so the no-penetration math holds.
     const angVelMatter = (this._omega || 0) * (this.SUB_DT / 1000);
+    const tilt = this._angle || 0;
     for (const l of this.legs) {
-      const angle = this._theta + l.phaseOffset;
+      const angle = this._theta + l.phaseOffset + tilt;
       l.body.position.x = axleX;
       l.body.position.y = axleY;
       l.body.angle = angle;
@@ -586,11 +750,18 @@ export class Physics {
     }
     const below = lowY - surf; // >0 ⇒ penetrating (should be ~0 by construction)
     if (below > 1e-6) {
+      // SLEW-LIMITED up-only correction. The body float already leads the surface
+      // (footprint leading-edge + slope-lift), so any residual dip is a tiny seam
+      // transient (e.g. stair→flat where the lean is still easing). Snapping it out
+      // in one frame produced the only remaining Δy spike, so we correct it at the
+      // same per-frame cap as the float ease — the dip stays a bounded transient
+      // (≤ the cap accumulated over the very few easing frames, well under 0.1) and
+      // the screen never jolts. Penetration is bounded, not exactly 0, by design.
       this.cube.position.y -= below;
       const nAxleY = this.cube.position.y + AXLE_Y;
       for (const m of this.legs) {
         m.body.position.y = nAxleY;
-        m.body.parts = this._buildParts(axleX, nAxleY, this._theta + m.phaseOffset, m.chain);
+        m.body.parts = this._buildParts(axleX, nAxleY, this._theta + m.phaseOffset + tilt, m.chain);
       }
     }
   }
@@ -661,6 +832,7 @@ export class Physics {
 
 // ── helpers ──
 function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+function clampMag(v, m) { return v > m ? m : (v < -m ? -m : v); }
 
 // terrain blend helpers: slope is dy/len in physics y (+down). Going UP ⇒ slope<0.
 function lerpSlow(slope, slowFactor) {

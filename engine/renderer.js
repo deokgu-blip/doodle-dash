@@ -110,13 +110,37 @@ export class Renderer {
 
     const addLane = (laneZ) => {
       for (const b of physics.floorBodies) {
+        // BoxGeometry material order: +x,-x,+y,-y,+z,-z. +y is top.
+        const mats = [sideMat, sideMat, topMat, sideMat, sideMat, sideMat];
+        if (b._dcRamp) {
+          // RAMP: a TILTED slab whose TOP face is the sloped surface (reference's
+          // smooth hills). Build a box of along-slope length and rotate it to the
+          // ramp angle (render y = -physY, so a physics up = negative-y becomes
+          // up-right on screen). The slab top sits exactly on the surface centre.
+          const r = b._dcRamp;
+          const slabH = r.slabH + RIBBON_DOWN;
+          const geo = new THREE.BoxGeometry(r.span, slabH, RIBBON_DEPTH);
+          const mesh = new THREE.Mesh(geo, mats);
+          // render angle of the top surface: up-right when ascending forward.
+          const ang = Math.atan2(-(r.topY1 - r.topY0), r.len);
+          // centre = midpoint of the surface, dropped half the slab height ALONG
+          // the slab's local down (perpendicular to the tilted top).
+          const surfMidRenderY = -((r.topY0 + r.topY1) / 2);
+          const cx = (r.x0 + r.x1) / 2;
+          mesh.position.set(
+            cx + Math.sin(ang) * (slabH / 2),
+            surfMidRenderY - Math.cos(ang) * (slabH / 2),
+            laneZ
+          );
+          mesh.rotation.z = ang;
+          this.trackGroup.add(mesh);
+          continue;
+        }
         const w = b.bounds.max.x - b.bounds.min.x;
         const h = b.bounds.max.y - b.bounds.min.y;
         const cx = b.position.x;
         const cyPhys = b.position.y; // physics y (+down)
         const geo = new THREE.BoxGeometry(w, h + RIBBON_DOWN, RIBBON_DEPTH);
-        // BoxGeometry material order: +x,-x,+y,-y,+z,-z. +y is top.
-        const mats = [sideMat, sideMat, topMat, sideMat, sideMat, sideMat];
         const mesh = new THREE.Mesh(geo, mats);
         mesh.position.set(cx, -(cyPhys + RIBBON_DOWN / 2), laneZ);
         this.trackGroup.add(mesh);

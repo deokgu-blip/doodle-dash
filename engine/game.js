@@ -128,10 +128,17 @@ export class Game {
   /** Advance the simulation by ms worth of fixed steps. Used by loop & headless. */
   step(ms) {
     const dt = this.physics.FIXED_DT;
-    let acc = ms;
-    while (acc >= dt) {
+    // PERSIST the sub-tick remainder across frames. The old `let acc = ms` threw
+    // away any leftover < dt every call, so on a high-refresh display (e.g. a
+    // 120Hz phone: ~8.3ms/frame, which is < dt 16.67ms) almost every frame ran
+    // ZERO ticks and the sim crawled far slower than real time ("slow motion"),
+    // no matter how high baseSpeed was. Carrying the remainder makes the sim
+    // advance at true real time on ANY refresh rate.
+    this._acc = (this._acc || 0) + ms;
+    if (this._acc > 250) this._acc = 250; // spiral-of-death guard (long stalls)
+    while (this._acc >= dt) {
       this._tick(dt);
-      acc -= dt;
+      this._acc -= dt;
     }
   }
 

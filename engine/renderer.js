@@ -892,7 +892,7 @@ export class Renderer {
    * cube fills ~1/3 of the screen, sat in the lower-centre with a big sky above,
    * the winding ribbon receding ahead). Follows the serpentine z-curve so the
    * cube stays framed as the band snakes. Keeps the smooth _camY vertical glide. */
-  updateCamera(physics) {
+  updateCamera(physics, dt = 1 / 60) {
     const x = physics.cube ? physics.cube.position.x : physics.startX;
     // Track the BOB-FREE base height (physics.bodyCamY), NOT the bobbing cube y, so
     // the camera glides with the terrain trend only — the cube bobs IN-FRAME (a
@@ -902,14 +902,19 @@ export class Renderer {
     // SMOOTH VERTICAL FOLLOW (kept): the body snaps up at each stair step (so the
     // foot never penetrates). Easing a separate _camY toward the bob-free base
     // turns the step-up into a glide so the screen never jolts.
+    // HEAVY dt-based low-pass: filter the per-stride BOB/LOFT + high-freq BUMP terrain
+    // wobble (the old fixed 0.10/frame ease let them leak ⇒ the screen shook with the
+    // cube). tau≈0.5s follows real slopes/hills but smooths the sub-second jitter.
+    // dt-based ⇒ frame-rate independent (we now render every rAF: 60 OR 120Hz).
+    const camA = 1 - Math.exp(-2.0 * dt);
     if (this._camY == null || !Number.isFinite(this._camY)) this._camY = cubeRenderY;
-    else this._camY += (cubeRenderY - this._camY) * 0.10;
+    else this._camY += (cubeRenderY - this._camY) * camA;
     // §C: the cube rides the serpentine band at z = laneCurveZ(x). Smoothly follow
     // that z too (ease) so the camera tracks the winding without snapping at the
     // S-curve peaks. (Camera lateral follow is a render-only effect — physics z=0.)
     const curveZ = laneCurveZ(x);
     if (this._camCurveZ == null || !Number.isFinite(this._camCurveZ)) this._camCurveZ = curveZ;
-    else this._camCurveZ += (curveZ - this._camCurveZ) * 0.10;
+    else this._camCurveZ += (curveZ - this._camCurveZ) * camA;
 
     const racing = Math.abs(this.rivalLaneZ) > 1e-3;
     // 3/4 chase framed like the reference: a narrow checker PATH winding across the

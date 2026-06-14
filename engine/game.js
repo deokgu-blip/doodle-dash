@@ -449,7 +449,7 @@ export class Game {
       // refresh. The sim being stepped above means we always draw the latest sim state.
       this.renderer.sync(this.physics);
       if (this.rivalSpec) this.renderer.syncRival(this.rival);
-      this.renderer.updateCamera(this.physics);
+      this.renderer.updateCamera(this.physics, frame / 1000);
       this.renderer.render();
       this._renderHud();
       // DEBUG OVERLAY: feed the REAL RAF timestamp `t` so achieved-FPS + render-gap are

@@ -4,9 +4,10 @@
 // WHAT is actually happening, with windows long enough to CATCH a brief spike that a 1s
 // MAX misses (the spike passes through the 1s window before the eye/finger reports it):
 //
-//   • FPS        — ACHIEVED render FPS. We cap render at 60fps (game.startLoop's RENDER_DT
-//                  gate), so the IDEAL is 60; a render over its 16.67ms budget drops the
-//                  achieved FPS below 60. Averaged over the most recent ~0.5s window.
+//   • FPS        — ACHIEVED render FPS. With the render cap REMOVED we render once per
+//                  rAF, so the IDEAL == the display refresh (60Hz ⇒ 60, 120Hz ⇒ 120); a
+//                  render over its frame budget drops the achieved FPS below that. Averaged
+//                  over the most recent ~0.5s window.
 //   • frame ms   — render-to-render gap avg / MAX over the most recent ~1s window. The 1s
 //                  MAX resets fast, so a brief spike that lands between two reads is lost —
 //                  hence worst5s + jank below.
@@ -199,8 +200,12 @@ export class DebugOverlay {
     const w5 = s.worst5s.toFixed(1).padStart(5, ' ');
     const raf = s.rafMs.toFixed(1).padStart(4, ' ');
     const heap = (s.heapMB == null) ? 'n/a' : (s.heapMB.toFixed(1) + ' ' + s.heapTrend);
+    // TARGET fps = the display refresh (now that we render every rAF, achieved should
+    // match it). Derived from the smoothed rAF interval: ~16.7 ⇒ 60, ~8.3 ⇒ 120. Falls
+    // back to 60 until the first rAF is measured.
+    const target = s.rafMs > 0 ? Math.round(1000 / s.rafMs) : 60;
     this.el.textContent =
-      `FPS ${fps}/60   raf ${raf}\n` +
+      `FPS ${fps}/${target}   raf ${raf}\n` +
       `ms  ${avg} avg  ${max} max\n` +
       `worst5s ${w5}  jank ${s.jank}\n` +
       `heap ${heap}\n` +

@@ -409,31 +409,31 @@ export class Game {
   }
 
   // ── render loop (browser only) ──
-  // PERF (RENDER CAP): on a 120/144Hz panel the RAF fires 120/144×/s. The SIM must
-  // still advance at real time every frame (so 38s races, refresh-rate independence
-  // and slow-motion are byte-identical), but RENDERING twice as often as the eye/
-  // panel needs just doubles the GPU work for no visible gain. So we SPLIT the loop:
-  //   • step()  runs EVERY rAF with the true elapsed frame·timeScale → sim is exact at
-  //     any refresh rate (the fixed-step accumulator already carries the remainder, so
-  //     this is identical to the old per-frame step).
-  //   • sync + updateCamera + render + HUD run AT a 60fps BUDGET (RENDER_DT gate). A
-  //     render-accumulator banks each frame's REAL elapsed time and fires a render when
-  //     it has banked >= RENDER_DT (1000/60), then SUBTRACTS RENDER_DT (carrying the
-  //     overshoot). Carrying the remainder makes the long-run average EXACTLY 60fps at
-  //     ANY refresh rate (60Hz ⇒ 1 render/frame; 120Hz ⇒ every 2nd; 144Hz ⇒ a 1,1,0…
-  //     cadence that still averages 60 — NOT the 48fps a coarse "since-last >= dt" gate
-  //     would give). The sim being independent of the render cadence means the cube's
-  //     on-screen position is always the latest sim state — no stutter, just fewer
-  //     redraws of the same continuously-advancing world.
-  RENDER_DT = 1000 / 60;       // 60fps render budget (sim still runs every frame).
+  // RENDER EVERY rAF (no render cap). The SIM advances at real time every frame (the
+  // fixed-step accumulator in step() carries the remainder, so 38s races, refresh-rate
+  // independence and slow-motion are byte-identical at any Hz), and we RENDER once per
+  // rAF — i.e. exactly at the display's native refresh, zero skipped frames.
+  //
+  // WHY THE OLD 60fps RENDER CAP WAS REMOVED (the real "random stutter" cause):
+  //   The cap banked real frame ms in `_renderAcc` and only rendered when it reached
+  //   RENDER_DT (1000/60). It was added assuming a 120Hz panel (render every 2nd frame).
+  //   But the user's device (iPhone 17 Pro) drives the web rAF at 60Hz — and a real 60Hz
+  //   panel's rAF interval JITTERS and tends to land just UNDER 16.667ms. When a frame's
+  //   dt fell below RENDER_DT and the carry was near zero, `_renderAcc < RENDER_DT` ⇒ THAT
+  //   frame's render was SKIPPED, so two frames' worth of motion were drawn one rAF later
+  //   in a single ~33ms step. Result: random ~33–42ms render gaps (the reported worst5s
+  //   34–42, jank 6–11/10s) with no relation to game position — a beat mismatch between a
+  //   fixed-ms cap and the device's sub-16.667ms rAF cadence. (perf_pacing.mjs shows the
+  //   same beat as cadence variance.) Rendering every rAF removes the gate entirely: one
+  //   render per refresh, zero skips. The scene is already light (unlit, ~6k tri, ~19 draw
+  //   calls) so even a 120Hz panel (120fps) is well within budget — no separate cap needed.
   startLoop() {
     if (this.headless) return;
-    this._renderAcc = this.RENDER_DT;   // render the very first frame immediately.
     const loop = (t) => {
       this._raf = requestAnimationFrame(loop);
-      // DEBUG OVERLAY (raf): feed EVERY rAF tick (before the render cap) so the overlay
-      // measures the TRUE display-refresh interval (120Hz ⇒ ~8.3ms) independent of how
-      // often we actually render (capped at 60fps). O(1); no behaviour effect.
+      // DEBUG OVERLAY (raf): feed EVERY rAF tick so the overlay measures the TRUE
+      // display-refresh interval. With the cap gone the achieved render FPS now EQUALS
+      // this rAF rate (60Hz ⇒ 60). O(1); no behaviour effect.
       if (this.debug) this.debug.raf(t);
       if (!this._lastT) this._lastT = t;
       let frame = t - this._lastT;
@@ -445,24 +445,17 @@ export class Game {
       // both player AND rival slow together (it is applied to the whole step).
       // ALWAYS step (every rAF) so the sim runs at real time on ANY refresh rate.
       this.step(frame * this._timeScale);
-      // RENDER CAP: bank REAL elapsed (NOT timeScale-scaled, so slow-motion does NOT
-      // change the render cadence — it stays 60fps redraws of a slowly-advancing sim,
-      // i.e. smooth bullet-time). Fire at most once per loop; carry the overshoot so the
-      // long-run render rate averages exactly 60 at any refresh rate.
-      this._renderAcc += frame;
-      if (this._renderAcc >= this.RENDER_DT) {
-        // cap the carry so a long stall (tab-switch) doesn't force a render burst.
-        this._renderAcc = Math.min(this._renderAcc - this.RENDER_DT, this.RENDER_DT);
-        this.renderer.sync(this.physics);
-        if (this.rivalSpec) this.renderer.syncRival(this.rival);
-        this.renderer.updateCamera(this.physics);
-        this.renderer.render();
-        this._renderHud();
-        // DEBUG OVERLAY: feed the REAL RAF timestamp `t` of THIS render (not sim/timeScale
-        // time) so the achieved-FPS + render-gap are measured against the actual screen
-        // refresh. O(1) per render; the text/DOM write inside is self-throttled to ~4×/s.
-        if (this.debug) this.debug.frame(t);
-      }
+      // RENDER EVERY rAF (no cap, no skip): always sync + camera + render + HUD once per
+      // refresh. The sim being stepped above means we always draw the latest sim state.
+      this.renderer.sync(this.physics);
+      if (this.rivalSpec) this.renderer.syncRival(this.rival);
+      this.renderer.updateCamera(this.physics);
+      this.renderer.render();
+      this._renderHud();
+      // DEBUG OVERLAY: feed the REAL RAF timestamp `t` so achieved-FPS + render-gap are
+      // measured against the actual screen refresh (now == rAF rate). Self-throttled
+      // text/DOM write (~4×/s) inside. O(1) per render.
+      if (this.debug) this.debug.frame(t);
     };
     this._raf = requestAnimationFrame(loop);
   }

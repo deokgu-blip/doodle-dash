@@ -139,9 +139,19 @@ export class Renderer {
    * `rivalSpec` is given, also build a PARALLEL lane (offset in z) + the rival
    * cube so the two racers read side-by-side in a diagonal 3/4 view. */
   buildTrack(physics, track, rivalSpec = null) {
+    // PERF / LEAK FIX: every restart()/loadTrack() rebuilds the track group + BOTH
+    // character cubes. The old code only scene.remove()'d the cubes (and the trackGroup
+    // freed geometry+materials but NOT textures), so each rebuild leaked the cube box +
+    // face plane + axle-hub geometries, the cube/face materials, the per-cube face
+    // CanvasTexture and the finish-flag CanvasTexture — measured at +12 geometries and
+    // +2 textures PER restart (geo 33→753, tex 6→126 over 60 restarts). On the device
+    // that GPU memory + the GC pressure compounds with every retry/next, which is the
+    // "still too choppy" the user reports. We now FULLY dispose what we rebuild
+    // (geometry + non-shared materials + their non-shared textures). Shared materials/
+    // textures built once in the constructor are protected by _isSharedMat/_isSharedTex.
     if (this.trackGroup) { this.scene.remove(this.trackGroup); this._disposeGroup(this.trackGroup); }
-    if (this.cubeMesh) { this.scene.remove(this.cubeMesh); }
-    if (this.rivalCubeMesh) { this.scene.remove(this.rivalCubeMesh); }
+    if (this.cubeMesh) { this.scene.remove(this.cubeMesh); this._disposeGroup(this.cubeMesh); }
+    if (this.rivalCubeMesh) { this.scene.remove(this.rivalCubeMesh); this._disposeGroup(this.rivalCubeMesh); }
     this.trackGroup = new THREE.Group();
 
     // Shared track materials/texture (built once in the constructor, reused here).
@@ -843,14 +853,13 @@ export class Renderer {
 
   _disposeMesh(m) {
     if (!m) return;
-    // a leg may be a Group of box meshes (compound limb) or a single mesh.
-    if (m.isGroup || (m.children && m.children.length)) {
-      m.traverse((o) => { if (o.isMesh && o.geometry) o.geometry.dispose(); });
-      return;
-    }
+    // a leg may be a Group of box meshes (compound limb) or a single mesh. Geometry is
+    // per-build (must be freed); materials are the SHARED _legMat (kept). Route through
+    // _disposeGroup so geometry + any non-shared material/texture are handled uniformly.
+    if (m.isGroup || (m.children && m.children.length)) { this._disposeGroup(m); return; }
     if (m.geometry) m.geometry.dispose();
-    if (Array.isArray(m.material)) m.material.forEach((mm) => mm.dispose && !this._isSharedMat(mm) && mm.dispose());
-    else if (m.material && !this._isSharedMat(m.material)) m.material.dispose();
+    if (Array.isArray(m.material)) m.material.forEach((mm) => this._disposeMaterial(mm));
+    else if (m.material) this._disposeMaterial(m.material);
   }
 
   /** True for the SHARED materials that live for the renderer's lifetime (built once
@@ -860,12 +869,32 @@ export class Renderer {
     return m === this._legMat || m === this._topMat || m === this._sideMat;
   }
 
+  /** True for the SHARED textures (built once in the constructor, reused forever). The
+   * track checker is the only long-lived texture; the per-build face + finish-flag
+   * CanvasTextures are throwaway and MUST be disposed on rebuild (leak fix). */
+  _isSharedTex(t) {
+    return t === this._checkerTex;
+  }
+
+  /** Dispose a material AND its (non-shared) textures. `material.dispose()` does NOT
+   * free the GPU texture referenced by `.map` — that is what leaked the per-cube face
+   * + finish-flag CanvasTextures across rebuilds. Shared materials/textures are kept. */
+  _disposeMaterial(m) {
+    if (!m || this._isSharedMat(m)) return;
+    // free any texture maps the material holds (these are the leaked CanvasTextures).
+    for (const k of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap', 'alphaMap', 'aoMap', 'bumpMap']) {
+      const t = m[k];
+      if (t && t.isTexture && !this._isSharedTex(t) && t.dispose) t.dispose();
+    }
+    if (m.dispose) m.dispose();
+  }
+
   _disposeGroup(g) {
     g.traverse((o) => {
       if (o.isMesh) {
         if (o.geometry) o.geometry.dispose();
-        if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose && !this._isSharedMat(m) && m.dispose());
-        else if (o.material && !this._isSharedMat(o.material)) o.material.dispose();
+        if (Array.isArray(o.material)) o.material.forEach((m) => this._disposeMaterial(m));
+        else if (o.material) this._disposeMaterial(o.material);
       }
     });
   }

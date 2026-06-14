@@ -847,12 +847,36 @@ export class Physics {
 
   /** Build WORLD-space "parts" tracing the chain rotated by `angle` about the
    * axle (axleX,axleY). parts[0] is a proxy at the axle; parts[1..] are the chain
-   * samples. The verifier's no-slip / foot scan reads parts[1..].position. */
-  _buildParts(axleX, axleY, angle, chain) {
+   * samples. The verifier's no-slip / foot scan reads parts[1..].position.
+   *
+   * PERF (GC churn): _syncLegs runs every fixed sub-step (×2 legs, ×player+rival,
+   * and AGAIN inside the up-only surface clamp), and the old version allocated a
+   * fresh array + (chain.length+1) `{position:{x,y}}` objects EACH call — at 120Hz
+   * that is thousands of throwaway objects per second feeding the GC. The leg bodies
+   * are PLAIN procedural proxies (NOT real Matter bodies in the world), and `parts`
+   * is only READ (position.x/y) — never structurally retained — so we REUSE the
+   * existing parts array + its position objects IN-PLACE when the chain length is
+   * unchanged (it only changes on a redraw, which rebuilds the leg). Same numeric
+   * values, zero per-tick allocation ⇒ behaviour-identical, GC-quiet. A `target`
+   * (the leg's current body.parts) is reused if its shape matches; otherwise a fresh
+   * array is built (first placement / after a redraw). */
+  _buildParts(axleX, axleY, angle, chain, target) {
     const ca = Math.cos(angle), sa = Math.sin(angle);
-    const parts = [{ position: { x: axleX, y: axleY } }]; // proxy
-    for (const c of chain) {
-      parts.push({ position: { x: axleX + c.x * ca - c.y * sa, y: axleY + c.x * sa + c.y * ca } });
+    const n = chain.length + 1; // proxy + one per chain sample
+    let parts = target;
+    if (!parts || parts.length !== n) {
+      // fresh build (first time, or chain length changed after a redraw).
+      parts = new Array(n);
+      parts[0] = { position: { x: axleX, y: axleY } };
+      for (let i = 1; i < n; i++) parts[i] = { position: { x: 0, y: 0 } };
+    } else {
+      parts[0].position.x = axleX; parts[0].position.y = axleY; // proxy
+    }
+    for (let i = 0; i < chain.length; i++) {
+      const c = chain[i];
+      const p = parts[i + 1].position;
+      p.x = axleX + c.x * ca - c.y * sa;
+      p.y = axleY + c.x * sa + c.y * ca;
     }
     return parts;
   }
@@ -1386,7 +1410,8 @@ export class Physics {
       l.body.position.y = axleY;
       l.body.angle = angle;
       l.body.angularVelocity = angVelMatter;
-      l.body.parts = this._buildParts(axleX, axleY, angle, l.chain);
+      // reuse the existing parts array/objects in place (no per-tick allocation).
+      l.body.parts = this._buildParts(axleX, axleY, angle, l.chain, l.body.parts);
     }
     // defensive UP-ONLY clamp against the surface UNDER EACH FOOT POINT (its own x —
     // NOT the surface at the body centre, which is wrong on a slope and would falsely
@@ -1415,7 +1440,7 @@ export class Physics {
       const nAxleY = this.cube.position.y + AXLE_Y;
       for (const m of this.legs) {
         m.body.position.y = nAxleY;
-        m.body.parts = this._buildParts(axleX, nAxleY, this._theta + m.phaseOffset + tilt, m.chain);
+        m.body.parts = this._buildParts(axleX, nAxleY, this._theta + m.phaseOffset + tilt, m.chain, m.body.parts);
       }
     }
   }

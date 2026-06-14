@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'|'blocks'|'fork'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'|'blocks'|'fork'|'curve'} SegmentKind
  */
 
 /**
@@ -14,6 +14,15 @@
  * @typedef {Object} TrackSegment
  * @property {SegmentKind} kind
  * @property {number}  length          x-direction length (world units)
+ * @property {number} [turn]           HEADING change over this segment, in DEGREES (+left = toward +z =
+ *                                     the camera side). ANY segment may carry it; the path's forward
+ *                                     HEADING (yaw) ramps smoothly (smoothstep) through `turn` across the
+ *                                     segment's arc-length, so the whole track GENUINELY turns in 3D (a
+ *                                     curving/looping road) — physics is still the 1-D arc-length model
+ *                                     (the turn is the centre-line's world-XZ shape, render-only). The
+ *                                     dedicated `curve` kind is just a flat/sloped segment that exists to
+ *                                     carry a `turn` (a clean, self-documenting bend). Default 0 (straight).
+ * @property {number} [turnDeg]        Alias for `turn` (either key is accepted).
  * @property {number} [height]         ramp rise/fall, wall step-up height, or stairs total height
  * @property {number} [steps]          number of steps (stairs)
  * @property {number} [width]          GAP only: horizontal width of the V-trench (overrides length if given)
@@ -143,7 +152,13 @@ export const SEGMENT_DEFAULTS = Object.freeze({
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls', 'blocks', 'fork'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls', 'blocks', 'fork', 'curve'];
+
+/** Read a segment's heading change (degrees) — accepts either `turn` or `turnDeg`. Default 0. */
+export function segTurnDeg(s) {
+  const t = (s && (s.turn != null ? s.turn : s.turnDeg));
+  return (typeof t === 'number' && Number.isFinite(t)) ? t : 0;
+}
 
 /** @type {LegPreset[]} */
 export const LEG_PRESETS = ['wheel', 'stick', 'hook'];
@@ -178,6 +193,17 @@ export function validateTrack(t) {
       // length is OPTIONAL for planks (computed from count/plankLen/gapLen).
     } else if (typeof s.length !== 'number' || s.length <= 0) {
       throw new Error(`segment[${i}].length must be a positive number`);
+    }
+    // `turn`/`turnDeg` (any segment): a finite heading-change in degrees (default 0).
+    if (s.turn != null && (typeof s.turn !== 'number' || !Number.isFinite(s.turn)))
+      throw new Error(`segment[${i}].turn must be a finite number (degrees)`);
+    if (s.turnDeg != null && (typeof s.turnDeg !== 'number' || !Number.isFinite(s.turnDeg)))
+      throw new Error(`segment[${i}].turnDeg must be a finite number (degrees)`);
+    if (s.kind === 'curve') {
+      // a CURVE is a flat (or `height`-sloped) run that exists to carry a `turn`. It needs a
+      // positive length (checked above) and a non-zero turn to be meaningful.
+      if (segTurnDeg(s) === 0)
+        throw new Error(`segment[${i}] curve needs a non-zero turn (degrees)`);
     }
     if (s.kind === 'stairs') {
       if (!(s.steps > 0)) throw new Error(`segment[${i}] stairs needs steps>0`);

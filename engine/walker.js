@@ -47,7 +47,7 @@
 //
 // All tunable "feel" knobs live in TUNE below (designer-adjustable).
 
-import { SEGMENT_DEFAULTS } from './track_schema.js';
+import { SEGMENT_DEFAULTS, segTurnDeg } from './track_schema.js';
 
 // Player cube edge (world units) — unchanged from the old build so the renderer
 // (PHYS_CONST.CUBE_SIZE) and the look are identical.
@@ -484,6 +484,7 @@ export class Physics {
     this._segs = [];
     this._segX0 = null;
     this._segHint = 0;
+    this.turnRegions = [];          // PATH HEADING: per-segment arc-length turn spans (render-only)
     this._blocked = false;
     this._blockedByRiser = false;
     this._blockedByTunnel = false;
@@ -579,11 +580,40 @@ export class Physics {
       if (topY < this._maxSurfaceTopY) this._maxSurfaceTopY = topY;
     };
 
+    // PATH HEADING: collect each segment's arc-length span [x0,x1] + its `turn` (degrees)
+    // so the renderer can build a heading-based curving path. Physics is UNCHANGED — these
+    // regions only describe the centre-line's world-XZ shape (render-only). Cleared in
+    // reset(); populated here as we advance the cursor per segment.
+    this.turnRegions = [];
     for (const seg of track.segments) {
       const len = seg.length;
+      const _turnX0 = cursorX;          // arc-length at this segment's start
+      const _turnDeg = segTurnDeg(seg); // heading change (degrees) carried by this segment
       if (seg.kind === 'flat') {
         addSlab(cursorX + len / 2, surfaceY, len, thick);
         addFlatSeg(cursorX, cursorX + len, surfaceY, 'flat');
+        cursorX += len;
+      } else if (seg.kind === 'curve') {
+        // CURVE = a bend in the PATH HEADING. Physically it is a flat run (or a gentle
+        // slope when `height` is given) — the walker's 1-D arc-length model is UNCHANGED;
+        // the turn is purely the centre-line's world-XZ shape (render-only, applied by the
+        // renderer's heading path). So build it exactly like a flat (or a ramp if sloped).
+        const dy = -(seg.height ?? 0);     // up = negative y (0 ⇒ flat curve)
+        const x0 = cursorX, x1 = cursorX + len;
+        if (dy === 0) {
+          addSlab(cursorX + len / 2, surfaceY, len, thick);
+          this._segs.push({ x0, x1, kind: 'curve', topYa: surfaceY, topYb: surfaceY,
+            surfFn: () => surfaceY });
+          if (surfaceY < this._maxSurfaceTopY) this._maxSurfaceTopY = surfaceY;
+        } else {
+          const topY0 = surfaceY, topY1 = surfaceY + dy;
+          addRampSlab(x0, x1, topY0, topY1, thick);
+          const slope = dy / len;
+          this._segs.push({ x0, x1, kind: 'curve', topYa: topY0, topYb: topY1, slope,
+            surfFn: (px) => topY0 + slope * (px - x0) });
+          if (topY1 < this._maxSurfaceTopY) this._maxSurfaceTopY = topY1;
+          surfaceY += dy;
+        }
         cursorX += len;
       } else if (seg.kind === 'stairs') {
         const steps = seg.steps;
@@ -964,6 +994,11 @@ export class Physics {
         cursorX += len;
         surfaceY = baseY;                                            // both routes rejoin at the base
       }
+      // PATH HEADING: record this segment's arc-length span + turn (if any). cursorX has
+      // advanced to the segment's end by here, so [_turnX0, cursorX] is its arc-length span.
+      if (_turnDeg !== 0 && cursorX > _turnX0 + 1e-6) {
+        this.turnRegions.push({ x0: _turnX0, x1: cursorX, turnRad: _turnDeg * Math.PI / 180 });
+      }
     }
 
     this.surfaceY = surfaceY;
@@ -1319,6 +1354,8 @@ export class Physics {
     // are stairs/flat (slope 0, handled below). A fork flat lead-in/out has no slope ⇒ 0.
     if (s && s.kind === 'fork') return (typeof s.slope === 'number') ? s.slope : 0;
     if (s && (s.kind === 'flat' || s.kind === 'stairs')) return 0;
+    // CURVE: a flat curve has no slope (0); a sloped curve carries an analytic slope.
+    if (s && s.kind === 'curve') return (typeof s.slope === 'number') ? s.slope : 0;
     if (s && s.kind === 'planks' && s.plank) return 0; // a plank board is level
     const dx = 0.35;
     const yR = this.surfaceYAt(px + dx), yL = this.surfaceYAt(px - dx);

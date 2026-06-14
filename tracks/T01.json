@@ -2,7 +2,7 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 281.5,
+  "finishX": 331.5,
   "segments": [
     {
       "kind": "flat",
@@ -126,6 +126,26 @@
       "amp": 0.5,
       "freq": 3,
       "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 6,
+      "rough": 0.9,
+      "_note": "STRAIGHT LEAD-IN to the curving road — the player runs straight here just before the sweeping S-bend, so the turn reads as a deliberate road shape (like the reference)."
+    },
+    {
+      "kind": "curve",
+      "length": 22,
+      "turn": 65,
+      "rough": 0.9,
+      "_note": "도는 길 — FIRST SWEEP of a broad S-curve. The path HEADING ramps smoothly (smoothstep) from 0 through +65deg over 22u, so the road GENUINELY TURNS toward the +z camera side in 3D. Physics is still the 1-D arc-length walk (the cube follows the curving centre-line and YAWS to face along it; all gates stay green). A `curve` is physically a flat run that only carries the `turn`. The RIVAL (BOLT) runs the parallel lane, its offset perpendicular to the heading, so it stays BESIDE the player through the bend."
+    },
+    {
+      "kind": "curve",
+      "length": 22,
+      "turn": -65,
+      "rough": 0.9,
+      "_note": "도는 길 — SECOND SWEEP of the S-curve. The HEADING ramps back from +65deg through -65deg (net 0), so the road sweeps the OTHER way and the cube exits running at the ORIGINAL heading — a tidy S that returns to the lane it came in on, keeping the rest of the course coherent. Together the two sweeps read as a prominent winding road (a +65/-65 S over 44u)."
     },
     {
       "kind": "flat",

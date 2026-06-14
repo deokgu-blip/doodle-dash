@@ -1,0 +1,28 @@
+{
+  "id": "CURVE_DEMO",
+  "theme": "curve-demo",
+  "startX": 0,
+  "finishX": 51,
+  "segments": [
+    {
+      "kind": "flat",
+      "length": 15,
+      "rough": 0.9,
+      "_note": "STRAIGHT LEAD-IN — must look essentially identical to today (heading is only the tiny folded serpentine sway). The cube enters straight before the bend."
+    },
+    {
+      "kind": "curve",
+      "length": 24,
+      "turn": 120,
+      "rough": 0.9,
+      "_note": "BROAD BEND — the path HEADING ramps smoothly (smoothstep) from 0 through +120deg over 24u. The road GENUINELY TURNS in 3D (toward the +z camera side); physics is still the 1-D arc-length walk, so the cube follows the curving centre-line and YAWS to face along it. A `curve` is physically a flat run (use `height` to also slope it) whose only job is to carry the `turn` (degrees, +left = toward +z)."
+    },
+    {
+      "kind": "flat",
+      "length": 15,
+      "rough": 0.9,
+      "_note": "STRAIGHT OUT — the cube exits the bend onto a straight running at the new (+120deg) heading."
+    }
+  ],
+  "rival": null
+}

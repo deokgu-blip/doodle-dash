@@ -7,6 +7,7 @@
 
 import * as THREE from './vendor/three.module.js';
 import { PHYS_CONST } from './physics.js';
+import { Path, makeHeadingFn, serpHeading } from './path.js';
 
 // POC §8 tokens
 const COL = {
@@ -25,14 +26,31 @@ const RIVAL_LANE_SIGN = -1;
 const RIBBON_DEPTH = 1.5;     // z-extrusion of the track — a THIN WINDING RIBBON like the reference (was 2.6, too wide; the cube now nearly fills the band width). lane offset / leg straddle / camera z are scaled to this below.
 const RIBBON_DOWN = 0.8;      // SLAB DEPTH below the surface — a THINNER board like the reference (was 1.2, too chunky; the user asked for a slimmer track). The width (z-depth RIBBON_DEPTH 1.5) stays NARROW and UNCHANGED; only this vertical slab thickness shrank so the path reads as a slim plank, not a deep wall. The ceiling ROOF track + the rival lane reuse the SAME value (consistent thickness, all closed boxes).
 
-// ── SERPENTINE CURVE (render-only, §C) ──────────────────────────────────────
-// The original track snakes left/right as it recedes. We bend the WHOLE render
-// world in z by laneCurveZ(x) = AMP * sin(x*FREQ). Physics x / progress / win are
-// untouched — this only offsets the ribbon centre-line, the cubes, the legs and
-// the camera target in z. (Verified: finish time identical curve on/off.)
-const CURVE_AMP = 2.5;        // peak z deflection (world units)
-const CURVE_FREQ = 0.12;      // spatial frequency (rad per world-x unit)
-export function laneCurveZ(x) { return CURVE_AMP * Math.sin(x * CURVE_FREQ); }
+// ── HEADING-BASED PATH (the track GENUINELY turns in 3D, §C + bends) ─────────
+// The track centre-line is now a HEADING (yaw) PATH (see engine/path.js): the
+// forward coordinate x is arc-length, and pathHeading(x) is the tangent yaw. The
+// world position of a point at forward x, lateral L, height y is
+//   worldX = pathX(x) + L·(-sin h),  worldZ = pathZ(x) + L·(cos h),  worldY = -y
+// (h = heading). This REPLACES the old cosmetic z-offset `laneCurveZ(x)`: the gentle
+// serpentine sway is FOLDED into the heading (serpHeading), so straights still read
+// as a gently winding ribbon, and a real bend is just a region where the heading ramps
+// through a large angle (data-driven `turn` per segment). Physics x / progress / win are
+// untouched — this only shapes the centre-line + places the cubes/legs/objects/camera.
+//
+// COMPATIBILITY: `laneCurveZ(x)` is kept as a thin wrapper returning the centre-line's
+// lateral world-z deflection. When a Path exists it delegates to path.laneCurveZ (= the
+// integrated pathZ); with NO Path (defensive / pre-build) it falls back to the OLD
+// closed-form `CURVE_AMP·sin(CURVE_FREQ·x)`. With heading ≡ 0 the transform reduces to
+// (x, -y, L) — BYTE-IDENTICAL to the old (x, -y, laneZ + 0) placement (regression guard).
+const CURVE_AMP = 2.5;        // legacy serpentine peak z deflection (matches path.SERP_AMP)
+const CURVE_FREQ = 0.12;      // legacy serpentine spatial frequency (matches path.SERP_FREQ)
+// Module-level "active path" the compat wrapper reads. Set by Renderer.buildTrack; the
+// renderer always prefers `this.path` directly, this is only for laneCurveZ() callers
+// outside a Renderer instance and for the export's back-compat.
+let _activePath = null;
+export function laneCurveZ(x) {
+  return _activePath ? _activePath.laneCurveZ(x) : CURVE_AMP * Math.sin(x * CURVE_FREQ);
+}
 
 // Ribbon sampling step along x (world units). Smaller = smoother curve but more
 // verts; 0.5 keeps the continuous band smooth while staying draw-call cheap (one
@@ -93,6 +111,15 @@ export class Renderer {
     this.cubeMesh = null;    // player cube (smiley face is a child mesh)
     this.legGroups = [];     // [{ mesh, body, side }] — one extruded disc per wheel
     this.trackGroup = null;
+
+    // HEADING-BASED PATH: the curving centre-line (built per buildTrack from the track's
+    // turn regions + the folded serpentine). All mesh placement + the camera go through
+    // this.path.transform(...). Null until the first buildTrack (laneCurveZ falls back).
+    this.path = null;
+    // Alloc-free scratch objects for the per-frame transform (no per-frame GC).
+    this._tp = { x: 0, y: 0, z: 0 };
+    this._tpL = { x: 0, y: 0, z: 0 };
+    this._tpR = { x: 0, y: 0, z: 0 };
 
     // RIVAL (computer opponent) — parallel lane, own cube + legs, offset in z.
     this.rivalCubeMesh = null;
@@ -246,6 +273,29 @@ export class Renderer {
     this.rivalLaneZ = rivalSpec
       ? RIVAL_LANE_SIGN * (rivalSpec.laneOffset ?? 2.8) : 0;
 
+    // ── HEADING-BASED PATH (built ONCE here; O(1) alloc-free lookups thereafter) ──
+    // The centre-line yaw = the folded gentle serpentine + the track's data-driven turn
+    // regions (physics.turnRegions: each segment's [x0,x1] arc-length span + turnRad). We
+    // sample a FINE LUT over [start−margin, finish+margin] so bends + the cube's pre-roll/
+    // overshoot are covered. The transform reduces to (x,-y,L) at heading 0 (regression).
+    {
+      const x0 = (physics ? physics.startX : track.startX) - 8;     // lead-in margin (cube starts at startX-3)
+      const x1 = (physics ? physics.finishX : track.finishX) + 8;   // run-out margin
+      const turns = (physics && physics.turnRegions) ? physics.turnRegions : [];
+      const headingFn = makeHeadingFn(turns, /*serpentine*/ true);
+      // ANCHOR at startX to the OLD world placement: pathX(startX)=startX and
+      // pathZ(startX)=CURVE_AMP·sin(CURVE_FREQ·startX) (the old laneCurveZ there), so the
+      // straight lead-in sits EXACTLY where it did before (no global shift from the lead-in
+      // margin integration). LUT step 0.25u — finer than the ribbon sampling (RIBBON_DX 0.5)
+      // so the centre-line stays smooth through bends; ~(x1-x0)/0.25 samples built once.
+      const startX = physics ? physics.startX : track.startX;
+      this.path = new Path(x0, x1, 0.25, headingFn, {
+        anchorX: startX,
+        anchorZ: CURVE_AMP * Math.sin(CURVE_FREQ * startX),
+      });
+      _activePath = this.path;          // back-compat: the exported laneCurveZ() reads this
+    }
+
     // §B+§C: each lane is ONE CONTINUOUS ribbon mesh (a constant-width band of
     // RIBBON_DEPTH) whose centre-line follows (x, surfaceY(x), laneZ+laneCurveZ(x)).
     // The surface (flats, ramps, stair steps) is traced unbroken, and the
@@ -278,7 +328,9 @@ export class Renderer {
     // ── rival cube (our own opponent — distinct colour, on the parallel lane) ──
     if (rivalSpec) {
       this.rivalCubeMesh = this._buildCharacterCube(COL.rival, COL.rivalFace);
-      this.rivalCubeMesh.position.z = this.rivalLaneZ;
+      // placeholder pose on the parallel lane at startX (overwritten each frame in syncRival).
+      const rp = this.path.transform(physics ? physics.startX : 0, this.rivalLaneZ, 0, this._tp);
+      this.rivalCubeMesh.position.set(rp.x, rp.y, rp.z);
       this.scene.add(this.rivalCubeMesh);
     } else {
       this.rivalCubeMesh = null;
@@ -313,7 +365,8 @@ export class Renderer {
       const mesh = new THREE.Mesh(this._ballGeo, this._ballMat);
       const r = b.r || 0.34;
       mesh.scale.set(r, r, r);                 // unit sphere → ball radius
-      mesh.position.set(b.x, -b.y, laneZ + laneCurveZ(b.x));
+      const p = this.path.transform(b.x, laneZ, b.y, this._tp);
+      mesh.position.set(p.x, p.y, p.z);
       this.scene.add(mesh);
       this[listRef].push(mesh);
     }
@@ -328,7 +381,8 @@ export class Renderer {
     const n = Math.min(balls.length, meshes.length);
     for (let i = 0; i < n; i++) {
       const b = balls[i];
-      meshes[i].position.set(b.x, -b.y, laneZ + laneCurveZ(b.x));
+      const p = this.path.transform(b.x, laneZ, b.y, this._tp);
+      meshes[i].position.set(p.x, p.y, p.z);
     }
   }
 
@@ -353,8 +407,10 @@ export class Renderer {
         // a CLOSED box sized to the block; slightly under the path width in z so it reads on
         // the band. Centre y = mid-height (render y = -((topY+baseY)/2)); top = -topY.
         mesh.scale.set(b.w, b.h, Math.min(RIBBON_DEPTH * 0.9, b.w * 1.4));
-        const cy = -(b.topY + b.baseY) / 2;   // render-y of the block centre (up)
-        mesh.position.set(b.x, cy, laneZ + laneCurveZ(b.x));
+        const cyPhys = (b.topY + b.baseY) / 2;   // physics-y of the block centre (+down)
+        const p = this.path.transform(b.x, laneZ, cyPhys, this._tp);
+        mesh.position.set(p.x, p.y, p.z);
+        mesh.rotation.y = this.path.heading(b.x);  // box faces along the (turning) path
         mesh.visible = !b.broken;
         this.scene.add(mesh);
         this[blkRef].push(mesh);
@@ -367,7 +423,8 @@ export class Renderer {
         const mesh = new THREE.Mesh(this._blockGeo, this._debrisMat);
         const s = d.r * 2; // chip edge == 2× the half-size collision radius
         mesh.scale.set(s, s, s);
-        mesh.position.set(d.x, -d.y, laneZ + laneCurveZ(d.x));
+        const p = this.path.transform(d.x, laneZ, d.y, this._tp);
+        mesh.position.set(p.x, p.y, p.z);
         mesh.visible = !!d.active;
         this.scene.add(mesh);
         this[debRef].push(mesh);
@@ -392,7 +449,8 @@ export class Renderer {
         const d = debris[i], m = debrisMeshes[i];
         m.visible = !!d.active;
         if (!d.active) continue;
-        m.position.set(d.x, -d.y, laneZ + laneCurveZ(d.x));
+        const p = this.path.transform(d.x, laneZ, d.y, this._tp);
+        m.position.set(p.x, p.y, p.z);
         // cheap tumble: rotate by a function of position so flying chips look like they spin
         // (no per-chip angular state — purely cosmetic, deterministic).
         m.rotation.z = d.x * 1.7 + i;
@@ -558,17 +616,26 @@ export class Renderer {
     const vRepeat = 1;
     for (let i = 0; i < N; i++) {
       const x = xs[i];
-      const ry = -surfY(x, yHints[i]);      // render y (up) — exact profile y at risers (sharp steps)
-      const cz = laneZ + laneCurveZ(x);     // serpentine z centre
-      const zN = cz - half, zF = cz + half; // near / far edges
+      const sy = surfY(x, yHints[i]);       // physics surface y (+down) — exact profile y at risers
+      const syB = sy + RIBBON_DOWN;         // slab bottom (dropped) in physics y
+      // PATH TRANSFORM: the band's two long edges are PERPENDICULAR to the heading at
+      // L = laneZ ± half, so the band TURNS WITH THE PATH (no z-shear). At heading 0 these
+      // reduce to (x, -sy, laneZ∓half) — identical to the old zN/zF placement.
+      const N0 = this.path.transform(x, laneZ - half, sy, this._tpL);   // near edge top
+      const F0 = this.path.transform(x, laneZ + half, sy, this._tpR);   // far edge top
+      const nTx = N0.x, nTy = N0.y, nTz = N0.z, fTx = F0.x, fTy = F0.y, fTz = F0.z;
       // TOP strip: 2 verts (near, far) at the surface.
-      topPos.push(x, ry, zN, x, ry, zF);
+      topPos.push(nTx, nTy, nTz, fTx, fTy, fTz);
       topUV.push(x * uScale, 0, x * uScale, vRepeat);
-      // SIDE/bottom strip: top edges (= surface) + bottom edges (dropped).
-      const by = ry - RIBBON_DOWN;
+      // SIDE/bottom strip: top edges (= surface) + bottom edges (dropped). The bottom
+      // edges share the SAME lateral L (perpendicular), just a lower height.
+      const Nb = this.path.transform(x, laneZ - half, syB, this._tpL);  // near edge bottom
+      const nBx = Nb.x, nBy = Nb.y, nBz = Nb.z;
+      const Fb = this.path.transform(x, laneZ + half, syB, this._tpR);  // far edge bottom
+      const fBx = Fb.x, fBy = Fb.y, fBz = Fb.z;
       sidePos.push(
-        x, ry, zN,  x, by, zN,   // near wall top, bottom
-        x, ry, zF,  x, by, zF    // far wall top, bottom
+        nTx, nTy, nTz,  nBx, nBy, nBz,   // near wall top, bottom
+        fTx, fTy, fTz,  fBx, fBy, fBz    // far wall top, bottom
       );
       // PLANKS VOID: a break BEFORE this ring (the previous span was a void) ⇒ do NOT
       // bridge a quad across the empty space, and the previous ring CLOSES its board.
@@ -653,25 +720,29 @@ export class Renderer {
       const n = Math.max(1, Math.floor(span / RIBBON_DX));
       for (let k = 0; k <= n; k++) xs.push(c.x0 + span * (k / n));
 
-      // The board's UNDERSIDE sits at the head-room line (render y = -ceilingY); its
-      // stripe TOP is RIBBON_DOWN above that (same slab thickness as the floor track).
-      const underRy = -c.ceilingY;          // underside (the surface a too-long leg hits)
-      const topRy = underRy + RIBBON_DOWN;   // bright stripe top of the overhead board
+      // The board's UNDERSIDE sits at the head-room line (physics y = ceilingY); its
+      // stripe TOP is RIBBON_DOWN above that (physics y = ceilingY − RIBBON_DOWN).
+      const underPy = c.ceilingY;            // underside physics y (the surface a too-long leg hits)
+      const topPy = c.ceilingY - RIBBON_DOWN; // bright stripe top of the overhead board (physics y)
 
       const topPos = [], topUV = [], topIdx = [];
       const sidePos = [], sideIdx = [];
       const N = xs.length;
       for (let i = 0; i < N; i++) {
         const x = xs[i];
-        const cz = laneZ + laneCurveZ(x);    // SAME lane centre + serpentine as the floor
-        const zN = cz - half, zF = cz + half;
+        // PATH TRANSFORM: same lane centre + heading as the floor, edges perpendicular.
+        const Nt = this.path.transform(x, laneZ - half, topPy, this._tpL);
+        const Ft = this.path.transform(x, laneZ + half, topPy, this._tpR);
+        const ntX = Nt.x, ntY = Nt.y, ntZ = Nt.z, ftX = Ft.x, ftY = Ft.y, ftZ = Ft.z;
         // TOP strip (checker) at the board's top face.
-        topPos.push(x, topRy, zN, x, topRy, zF);
+        topPos.push(ntX, ntY, ntZ, ftX, ftY, ftZ);
         topUV.push(x * uScale, 0, x * uScale, vRepeat);
         // SIDE/underside strip: top edges (= board top) + bottom edges (= underside).
+        const Nu = this.path.transform(x, laneZ - half, underPy, this._tpL);
+        const Fu = this.path.transform(x, laneZ + half, underPy, this._tpR);
         sidePos.push(
-          x, topRy, zN,  x, underRy, zN,    // near wall top, bottom
-          x, topRy, zF,  x, underRy, zF     // far wall top, bottom
+          ntX, ntY, ntZ,  Nu.x, Nu.y, Nu.z,    // near wall top, bottom (underside)
+          ftX, ftY, ftZ,  Fu.x, Fu.y, Fu.z     // far wall top, bottom (underside)
         );
         if (i > 0) {
           const a = (i - 1) * 2, b = a + 1, cc = i * 2, d = cc + 1;
@@ -765,13 +836,17 @@ export class Renderer {
       const N = xs.length;
       for (let i = 0; i < N; i++) {
         const x = xs[i];
-        const ry = -profY(x);                      // render y (up) of the arch surface
-        const cz = laneZ + laneCurveZ(x);          // SAME lane centre + serpentine as the floor
-        const zN = cz - half, zF = cz + half;
-        topPos.push(x, ry, zN, x, ry, zF);
+        const sy = profY(x);                       // arch surface physics y (+down)
+        const syB = sy + RIBBON_DOWN;              // slab bottom (dropped) physics y
+        // PATH TRANSFORM: same lane centre + heading as the floor, edges perpendicular.
+        const Nt = this.path.transform(x, laneZ - half, sy, this._tpL);
+        const Ft = this.path.transform(x, laneZ + half, sy, this._tpR);
+        const ntX = Nt.x, ntY = Nt.y, ntZ = Nt.z, ftX = Ft.x, ftY = Ft.y, ftZ = Ft.z;
+        topPos.push(ntX, ntY, ntZ, ftX, ftY, ftZ);
         topUV.push(x * uScale, 0, x * uScale, vRepeat);
-        const by = ry - RIBBON_DOWN;               // slab bottom (dropped)
-        sidePos.push(x, ry, zN, x, by, zN, x, ry, zF, x, by, zF);
+        const Nb = this.path.transform(x, laneZ - half, syB, this._tpL);
+        const Fb = this.path.transform(x, laneZ + half, syB, this._tpR);
+        sidePos.push(ntX, ntY, ntZ, Nb.x, Nb.y, Nb.z, ftX, ftY, ftZ, Fb.x, Fb.y, Fb.z);
         if (i > 0) {
           const a = (i - 1) * 2, b = a + 1, cc = i * 2, d = cc + 1;
           topIdx.push(a, cc, b, b, cc, d);
@@ -881,24 +956,26 @@ export class Renderer {
   _buildFinish(track, rivalSpec = null, physics = null) {
     const flagTex = this._makeChecker(6);
     const lanes = rivalSpec ? [0, this.rivalLaneZ] : [0];
-    // sit the flag ON the surface at finishX (render y = -surfaceY) and on the
-    // serpentine band (z + laneCurveZ) so it stays planted as the track winds.
-    const surfY = physics && physics.surfaceYAt(track.finishX);
-    const baseY = (surfY != null) ? -surfY : 0;
-    const cz = laneCurveZ(track.finishX);
+    // sit the flag ON the surface at finishX (physics y = surfaceY) and on the curving
+    // band via the path transform so it stays planted as the track turns. The pole/flag
+    // heights are added in render-y AFTER the transform (the transform's worldY = -physY).
+    const surfY = (physics && physics.surfaceYAt(track.finishX)) || 0;
+    const fx = track.finishX;
     for (const laneZ of lanes) {
-      const z = laneZ + cz;
+      const base = this.path ? this.path.transform(fx, laneZ, surfY, this._tp) : { x: fx, y: -surfY, z: laneZ };
       const pole = new THREE.Mesh(
         new THREE.PlaneGeometry(0.15, 3),
         new THREE.MeshBasicMaterial({ color: 0xffffff })
       );
-      pole.position.set(track.finishX, baseY + 1.5, z);
+      pole.position.set(base.x, base.y + 1.5, base.z);
       this.trackGroup.add(pole);
       const flag = new THREE.Mesh(
         new THREE.PlaneGeometry(1.2, 0.8),
         new THREE.MeshBasicMaterial({ map: flagTex, side: THREE.DoubleSide })
       );
-      flag.position.set(track.finishX + 0.6, baseY + 2.5, z);
+      // offset the flag a little FORWARD along the heading (was +0.6 in x).
+      const fwd = this.path ? this.path.transform(fx + 0.6, laneZ, surfY, this._tpL) : { x: fx + 0.6, y: -surfY, z: laneZ };
+      flag.position.set(fwd.x, base.y + 2.5, fwd.z);
       this.trackGroup.add(flag);
     }
   }
@@ -1032,13 +1109,16 @@ export class Renderer {
       if (mesh) grp.add(mesh);
       if (hidden) grp.visible = false;
       this.scene.add(grp);
-      // z offset by side (straddle) PLUS the lane centre offset. The serpentine
-      // curve z (laneCurveZ(x)) is ADDED per-frame in _syncLegGroups (it depends
-      // on the live x), so we keep the static part here and the dynamic part there.
-      // RENDER INTERPOLATION: store the leg's phaseOffset so _syncLegGroups can rebuild
-      // the INTERPOLATED world angle (= lerp(θ) + phaseOffset + lerp(tilt)) from the
-      // walker, instead of reading the raw (un-interpolated) body.angle.
-      groups.push({ mesh: grp, body, side: l.side, phaseOffset: l.phaseOffset || 0, laneZ, z: laneZ + l.side * LEG_Z_OFFSET });
+      // LATERAL offset = lane centre + the side straddle (±LEG_Z_OFFSET). This is the
+      // PERPENDICULAR-to-heading offset L the path transform applies per-frame in
+      // _syncLegGroups (it depends on the live x → heading), so the two legs stay a clean
+      // left/right pair as the path turns. RENDER INTERPOLATION: store the leg's
+      // phaseOffset so _syncLegGroups can rebuild the INTERPOLATED world angle.
+      // `lateral` = the perpendicular-to-heading offset the transform uses; `z` is kept as
+      // an alias (== lateral) for back-compat: at heading 0 it IS the world z, and its sign
+      // (left<0 / right>0) is exactly what the leg-straddle assertions check.
+      const lateral = laneZ + l.side * LEG_Z_OFFSET;
+      groups.push({ mesh: grp, body, side: l.side, phaseOffset: l.phaseOffset || 0, laneZ, lateral, z: lateral });
     }
     return groups;
   }
@@ -1200,8 +1280,11 @@ export class Renderer {
       // INTERPOLATED forward x + full body y + tilt (lerp prev→curr by alpha).
       const ix = physics.interpX(alpha);
       const iy = physics.interpBodyY(alpha);
-      this.cubeMesh.position.set(ix, -iy, laneCurveZ(ix));
-      this.cubeMesh.rotation.z = -physics.interpAngle(alpha);
+      // PATH TRANSFORM: cube on the lane centre (L=0). It yaws by the heading so it FACES
+      // along the (turning) path, plus its forward/back tilt about z (interpAngle).
+      const p = this.path.transform(ix, 0, iy, this._tp);
+      this.cubeMesh.position.set(p.x, p.y, p.z);
+      this.cubeMesh.rotation.set(0, this.path.heading(ix), -physics.interpAngle(alpha));
     }
     this._syncLegGroups(this.legGroups, physics, alpha);
     // BALL-FIELD: drive the reused player-lane sphere meshes from the live pile.
@@ -1216,8 +1299,10 @@ export class Renderer {
       // §C: rival lane base + serpentine curve at its own x. INTERPOLATED (see sync()).
       const ix = rival.interpX(alpha);
       const iy = rival.interpBodyY(alpha);
-      this.rivalCubeMesh.position.set(ix, -iy, this.rivalLaneZ + laneCurveZ(ix));
-      this.rivalCubeMesh.rotation.z = -rival.interpAngle(alpha);
+      // PATH TRANSFORM: rival on its parallel lane (L = rivalLaneZ), yawed to face the path.
+      const p = this.path.transform(ix, this.rivalLaneZ, iy, this._tp);
+      this.rivalCubeMesh.position.set(p.x, p.y, p.z);
+      this.rivalCubeMesh.rotation.set(0, this.path.heading(ix), -rival.interpAngle(alpha));
     }
     this._syncLegGroups(this.rivalLegGroups, rival, alpha);
     // BALL-FIELD (rival lane): lazily build the rival pile meshes the first time we see
@@ -1249,21 +1334,24 @@ export class Renderer {
       const body = lg.body;
       const bx = (ax != null) ? ax : body.position.x;
       const by = (ay != null) ? ay : body.position.y;
-      // Both legs share the same physics x/y; the static z offset gives the
-      // two-leg (left/right) straddle, and §C adds laneCurveZ(x) so the legs ride
-      // the serpentine band with the cube. Each leg spins at its own 180°-offset
-      // angle — the alternating walk.
-      lg.mesh.position.set(bx, -by, lg.z + laneCurveZ(bx));
+      // PATH TRANSFORM: both legs share the cube x/y; the stored `lateral` (lane centre +
+      // the side straddle) is the perpendicular-to-heading offset, so the legs stay a
+      // clean left/right pair as the path turns. The drawn stroke spins about z in the
+      // path-local plane (interpLegAngle), and the WHOLE group additionally yaws by the
+      // heading so that local plane stays oriented along the (turning) path.
+      const p = this.path.transform(bx, lg.lateral, by, this._tp);
+      lg.mesh.position.set(p.x, p.y, p.z);
       // render y = -physY -> a CCW physics rotation appears CW on screen.
       const ang = physics ? physics.interpLegAngle(alpha, lg.phaseOffset) : body.angle;
-      lg.mesh.rotation.z = -ang;
+      lg.mesh.rotation.set(0, this.path.heading(bx), -ang);
     }
   }
 
-  /** §D — 3/4 chase camera, CLOSER + LOWER than before (reference framing: the
-   * cube fills ~1/3 of the screen, sat in the lower-centre with a big sky above,
-   * the winding ribbon receding ahead). Follows the serpentine z-curve so the
-   * cube stays framed as the band snakes. Keeps the smooth _camY vertical glide. */
+  /** §D — 3/4 chase camera that FOLLOWS THE HEADING so a real bend reads as a turn
+   * (chase-cam swinging through the curve), while staying ~identical to today on
+   * straights and SMOOTH (eased heading + eased vertical, no snap/shake). Reference
+   * framing: the cube fills ~1/3 of the screen, lower-centre, big sky, the winding
+   * ribbon receding ahead. Keeps the smooth _camY vertical glide and the render interp. */
   updateCamera(physics, dt = 1 / 60, alpha = 0) {
     // RENDER INTERPOLATION: follow the INTERPOLATED forward x + bob-free base y (same
     // alpha the cube/legs use) so the camera tracks the cube in lock-step — no relative
@@ -1286,12 +1374,14 @@ export class Renderer {
     const camA = 1 - Math.exp(-2.0 * dt);
     if (this._camY == null || !Number.isFinite(this._camY)) this._camY = cubeRenderY;
     else this._camY += (cubeRenderY - this._camY) * camA;
-    // §C: the cube rides the serpentine band at z = laneCurveZ(x). Smoothly follow
-    // that z too (ease) so the camera tracks the winding without snapping at the
-    // S-curve peaks. (Camera lateral follow is a render-only effect — physics z=0.)
-    const curveZ = laneCurveZ(x);
-    if (this._camCurveZ == null || !Number.isFinite(this._camCurveZ)) this._camCurveZ = curveZ;
-    else this._camCurveZ += (curveZ - this._camCurveZ) * camA;
+    // HEADING FOLLOW: ease a _camHeading toward the path heading at the cube (same
+    // dt-based low-pass as the vertical glide) so the camera SWINGS smoothly through a
+    // bend — no snap, no shake. On a straight the heading is the tiny serpentine sway, so
+    // the camera reads essentially identical to before. Frame-rate independent (60/120Hz).
+    const tgtH = this.path ? this.path.heading(x) : 0;
+    if (this._camHeading == null || !Number.isFinite(this._camHeading)) this._camHeading = tgtH;
+    else this._camHeading += (tgtH - this._camHeading) * camA;
+    const hc = this._camHeading;
 
     const racing = Math.abs(this.rivalLaneZ) > 1e-3;
     // 3/4 chase framed like the reference: a narrow checker PATH winding across the
@@ -1318,12 +1408,35 @@ export class Renderer {
     // checker path filling a meaningful slice of the frame — not a far-off hairline —
     // while keeping the low, side-on, winding-track reference framing. camY is lowered a
     // touch to keep the cube + its two (now closer) legs reading as a left/right pair.
-    const camX = x - 3.2;
-    const camY = this._camY + (racing ? 5.0 : 4.5);
-    const camZ = (racing ? 11.2 : 10.6) + this._camCurveZ;
+    // HEADING-FOLLOW CHASE: build the camera offset in the PATH-LOCAL frame (the EXACT
+    // same relative geometry as before — a bit BEHIND along the tangent, UP, and to the
+    // +lateral/camera side), then rotate it by the eased heading `hc` so it SWINGS with
+    // the path. On a straight (hc≈0) T=(1,0,0), Lat=(0,0,1) ⇒ the math below reduces to
+    // exactly the old camX=x-3.2 / camZ=centreZ+10.6 / lookAt(x+1.5,…,centreZ) — identical.
+    //   BEHIND_T : behind the cube along -tangent (was the -3.2 in x)
+    //   SIDE_LAT : to the +z camera side along +lateral (was the 10.6/11.2 in z)
+    //   FWD_T    : look a little ahead along +tangent (was the +1.5 in x)
+    const BEHIND_T = -3.2;
+    const SIDE_LAT = racing ? 11.2 : 10.6;
+    const camYoff = racing ? 5.0 : 4.5;
+    const FWD_T = 1.5;
+    const lookLat = racing ? this.rivalLaneZ * 0.30 : 0;
+    const cosH = Math.cos(hc), sinH = Math.sin(hc);
+    // path-local basis in the horizontal (XZ) plane:
+    //   tangent  T   = ( cosH, sinH)   (+x at hc=0)
+    //   lateral  Lat = (-sinH, cosH)   (+z at hc=0, == the transform's +L direction)
+    // cube centre-line world XZ (lane centre L=0), at the cube's forward x.
+    const cx = this.path ? this.path.pathX(x) : x;
+    const cz = this.path ? this.path.pathZ(x) : 0;
+    // camera eye = centre + BEHIND·T + SIDE·Lat (horizontal) and camY (vertical).
+    const camX = cx + BEHIND_T * cosH + SIDE_LAT * (-sinH);
+    const camZ = cz + BEHIND_T * sinH + SIDE_LAT * (cosH);
+    const camY = this._camY + camYoff;
     this.camera.position.set(camX, camY, camZ);
-    const lookZ = (racing ? this.rivalLaneZ * 0.30 : 0) + this._camCurveZ;
-    this.camera.lookAt(x + 1.5, this._camY + 0.2, lookZ);
+    // look at the cube a little ahead along the tangent (+ a small lateral when racing).
+    const lookX = cx + FWD_T * cosH + lookLat * (-sinH);
+    const lookZ = cz + FWD_T * sinH + lookLat * (cosH);
+    this.camera.lookAt(lookX, this._camY + 0.2, lookZ);
   }
 
   /** Debug/verify info: how many meshes the track group holds (continuous ribbon

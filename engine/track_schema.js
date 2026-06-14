@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'} SegmentKind
  */
 
 /**
@@ -33,6 +33,12 @@
  * @property {number} [gapDepth]       PLANKS only: how deep the gap's recovery trench drops below the board top
  *                                     (a short leg falls this far, then crawls out — never a bottomless pit).
  *                                     Default SEGMENT_DEFAULTS.plankGapDepth.
+ * @property {number} [count]          BALLS only: number of dynamic physics balls piled on the flat (re-used key;
+ *                                     for BALLS this is the ball count, default SEGMENT_DEFAULTS.ballCount, capped
+ *                                     at SEGMENT_DEFAULTS.ballCountMax for performance).
+ * @property {number} [ballR]          BALLS only: ball radius (world units). Default SEGMENT_DEFAULTS.ballR.
+ * @property {number} [ballSpread]     BALLS only: x-extent the pile is initially scattered over (default = a
+ *                                     fraction of the segment length so the pile blocks the path mid-segment).
  * @property {number} [rough]          0..1 friction (rough floor), default 0.6
  * @property {number} [bouncy]         0..1 restitution (rubber), default 0
  */
@@ -83,10 +89,19 @@ export const SEGMENT_DEFAULTS = Object.freeze({
   plankLen: 1.4,
   gapLen: 1.0,
   plankGapDepth: 1.6,
+  // BALLS: a pile of dynamic physics spheres lying on a flat stretch that the cube must
+  // shove out of the way. The cube does NOT auto-stop (no soft-lock) — pushing the balls
+  // costs SPEED (resistance ∝ how many it is in contact with), so the cube slows through
+  // the pile and accelerates back out once clear. Light single-sphere physics (pos/vel +
+  // gravity + ground clamp + ball-ball separation + ball-cube push + linear friction).
+  ballCount: 14,        // default ball count for a `balls` segment
+  ballCountMax: 20,     // PERF cap — O(N²) separation stays cheap for N<=20
+  ballR: 0.34,          // ball radius (world units) — a touch under the cube half-size
+  ballSpreadFrac: 0.5,  // initial x-scatter = this fraction of the segment length (pile mid-segment)
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls'];
 
 /** @type {LegPreset[]} */
 export const LEG_PRESETS = ['wheel', 'stick', 'hook'];
@@ -151,6 +166,17 @@ export function validateTrack(t) {
         throw new Error(`segment[${i}] planks gapLen must be > 0`);
       if (s.gapDepth != null && !(s.gapDepth > 0))
         throw new Error(`segment[${i}] planks gapDepth must be > 0`);
+    }
+    if (s.kind === 'balls') {
+      // a BALLS pile lies on a flat run — needs a positive length to walk over. count /
+      // ballR / ballSpread are optional (fall back to SEGMENT_DEFAULTS); if present they
+      // must be positive. The count is later clamped to ballCountMax for performance.
+      if (s.count != null && !(s.count > 0))
+        throw new Error(`segment[${i}] balls count must be > 0`);
+      if (s.ballR != null && !(s.ballR > 0))
+        throw new Error(`segment[${i}] balls ballR must be > 0`);
+      if (s.ballSpread != null && !(s.ballSpread > 0))
+        throw new Error(`segment[${i}] balls ballSpread must be > 0`);
     }
   });
   if (t.rival != null) {

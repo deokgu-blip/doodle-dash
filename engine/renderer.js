@@ -99,6 +99,13 @@ export class Renderer {
     this.rivalLegGroups = [];
     this.rivalLaneZ = 0;     // z centre of the rival lane (set in buildTrack)
 
+    // BALL-FIELD meshes — one reused Mesh per ball (a sphere), sharing ONE SphereGeometry
+    // (unit radius, scaled per ball) and ONE material so the whole pile is cheap. Built in
+    // buildTrack from the physics ball count; positions updated each frame in syncBalls
+    // (NO per-frame geometry/alloc). Player + rival piles each get their own mesh list.
+    this.ballMeshes = [];      // player lane balls
+    this.rivalBallMeshes = []; // rival lane balls
+
     // The leg is a DRAWN PEN LINE, not a shaded 3D object. A flat, unlit material
     // keeps it reading as a single solid black stroke (no per-bump specular
     // highlights that made the old circle-chain look like a beaded wheel).
@@ -139,6 +146,16 @@ export class Renderer {
     // cost is minor (unlit shader, thin ribbon, DPR≤1.5) and the real frame-drop causes
     // (render-cap beat-skip + fixed-timestep judder) were fixed separately, not by this cull.
     this._sideMat = new THREE.MeshBasicMaterial({ color: COL.trackEdge, side: THREE.DoubleSide });
+
+    // ── BALL-FIELD shared geometry + material (built ONCE, reused for every ball). ──
+    // A modest-poly unit sphere (radius 1, scaled per ball) keeps the pile light: one
+    // geometry + one material shared across all balls (player + rival), so a 14-ball pile
+    // adds 14 draw calls of a tiny shared sphere. Lambert so the balls catch the key light
+    // and read as 3D spheres (top brighter), at a fraction of PBR cost. A bright warm tone
+    // (golden-amber) so the pile POPS against the lime field + purple track (palette-aware,
+    // distinct from the cube blue / rival green). Shared ⇒ never disposed on rebuild.
+    this._ballGeo = new THREE.SphereGeometry(1, 12, 10); // unit sphere, ~12×10 (low-poly, scaled per ball)
+    this._ballMat = new THREE.MeshLambertMaterial({ color: 0xF2A93B }); // golden-amber pile
   }
 
   _buildBackground() {
@@ -188,6 +205,10 @@ export class Renderer {
     if (this.trackGroup) { this.scene.remove(this.trackGroup); this._disposeGroup(this.trackGroup); }
     if (this.cubeMesh) { this.scene.remove(this.cubeMesh); this._disposeGroup(this.cubeMesh); }
     if (this.rivalCubeMesh) { this.scene.remove(this.rivalCubeMesh); this._disposeGroup(this.rivalCubeMesh); }
+    // BALL-FIELD: drop old ball meshes (the shared geo/material are kept — see _isSharedMat).
+    for (const m of this.ballMeshes) this.scene.remove(m);
+    for (const m of this.rivalBallMeshes) this.scene.remove(m);
+    this.ballMeshes = []; this.rivalBallMeshes = [];
     // PERF (SPIKE FIX): a track (re)build invalidates the prebuilt rival leg variant
     // geometry (lane z / chain can change), so free the cache here. The game re-arms it
     // via prebuildRivalLegVariants() right after this build, before the run starts.
@@ -233,6 +254,46 @@ export class Renderer {
 
     // finish flag (simple marker at finishX) — spans both lanes when racing.
     this._buildFinish(track, rivalSpec, physics);
+
+    // ── BALL-FIELD: build one reused sphere mesh per physics ball (player lane). The
+    //    rival pile (its own physics field) is built when syncRival first sees it. ──
+    this._buildBalls(physics, 0);
+  }
+
+  /** Build the reusable sphere meshes for a walker's ball field on the given lane.
+   * One Mesh per ball sharing the constructor's _ballGeo + _ballMat; scaled to the
+   * ball's radius. Old meshes are removed/freed (geometry is shared ⇒ only the Mesh
+   * wrapper is dropped). Positions are set every frame in _syncBalls (no rebuild). */
+  _buildBalls(physics, laneZ) {
+    const isRival = Math.abs(laneZ) > 1e-3;
+    const listRef = isRival ? 'rivalBallMeshes' : 'ballMeshes';
+    // tear down any previous meshes (geometry/material are shared — only remove the Mesh).
+    for (const m of this[listRef]) this.scene.remove(m);
+    this[listRef] = [];
+    const balls = physics.balls;
+    if (!balls || !balls.length) return;
+    for (let i = 0; i < balls.length; i++) {
+      const b = balls[i];
+      const mesh = new THREE.Mesh(this._ballGeo, this._ballMat);
+      const r = b.r || 0.34;
+      mesh.scale.set(r, r, r);                 // unit sphere → ball radius
+      mesh.position.set(b.x, -b.y, laneZ + laneCurveZ(b.x));
+      this.scene.add(mesh);
+      this[listRef].push(mesh);
+    }
+  }
+
+  /** Update every ball mesh's position from the live physics field (call every frame).
+   * Render y = -physY; the ball rides the serpentine band at its own x. Position-only
+   * write (no geometry, no allocation). The pile is small (N<=20) ⇒ trivially cheap. */
+  _syncBalls(physics, laneZ, meshes) {
+    const balls = physics.balls;
+    if (!balls || !meshes.length) return;
+    const n = Math.min(balls.length, meshes.length);
+    for (let i = 0; i < n; i++) {
+      const b = balls[i];
+      meshes[i].position.set(b.x, -b.y, laneZ + laneCurveZ(b.x));
+    }
   }
 
   /** Build the ordered (x, surfaceY) profile of the track surface from the physics
@@ -933,6 +994,8 @@ export class Renderer {
       this.cubeMesh.rotation.z = -physics.interpAngle(alpha);
     }
     this._syncLegGroups(this.legGroups, physics, alpha);
+    // BALL-FIELD: drive the reused player-lane sphere meshes from the live pile.
+    if (this.ballMeshes.length) this._syncBalls(physics, 0, this.ballMeshes);
   }
 
   /** Sync the rival cube + its legs (call every frame when racing). alpha: see sync(). */
@@ -945,6 +1008,12 @@ export class Renderer {
       this.rivalCubeMesh.rotation.z = -rival.interpAngle(alpha);
     }
     this._syncLegGroups(this.rivalLegGroups, rival, alpha);
+    // BALL-FIELD (rival lane): lazily build the rival pile meshes the first time we see
+    // its field (the rival walker is built after the player buildTrack), then drive them.
+    if (rival.ballCount && this.rivalBallMeshes.length !== rival.ballCount) {
+      this._buildBalls(rival, this.rivalLaneZ);
+    }
+    if (this.rivalBallMeshes.length) this._syncBalls(rival, this.rivalLaneZ, this.rivalBallMeshes);
   }
 
   _syncLegGroups(groups, physics = null, alpha = 0) {
@@ -1169,7 +1238,7 @@ export class Renderer {
    * in the constructor, reused on every rebuild). They must NEVER be disposed when a
    * track/leg group is torn down, or the next build would render with a dead material. */
   _isSharedMat(m) {
-    return m === this._legMat || m === this._topMat || m === this._sideMat;
+    return m === this._legMat || m === this._topMat || m === this._sideMat || m === this._ballMat;
   }
 
   /** True for the SHARED textures (built once in the constructor, reused forever). The

@@ -2,7 +2,7 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 247.4,
+  "finishX": 258.4,
   "segments": [
     {
       "kind": "flat",
@@ -64,7 +64,20 @@
     },
     {
       "kind": "flat",
-      "length": 4,
+      "length": 3,
+      "rough": 0.9
+    },
+    {
+      "kind": "balls",
+      "length": 9,
+      "count": 16,
+      "ballR": 0.34,
+      "rough": 0.9,
+      "_note": "PHYSICS BALL PILE — a heap of dynamic spheres the cube must SHOVE aside. Plowing through slows the cube (resistance ∝ contacts, floored ⇒ no soft-lock); the balls roll/scatter ahead. Pure additive obstacle (no gate)."
+    },
+    {
+      "kind": "flat",
+      "length": 3,
       "rough": 0.9
     },
     {

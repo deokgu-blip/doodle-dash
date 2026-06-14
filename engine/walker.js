@@ -226,6 +226,30 @@ const TUNE = {
   idleBobAmp: 0.22,      // world-u — peak-to-base amplitude of the idle bob (gentle "둥실")
   idleBobHz: 0.55,       // Hz — idle bob frequency (slow, calm)
   idleLerp: 8.0,         // 1/s — how fast the body eases into / out of the float pose (smooth float→ground settle, no snap)
+
+  // ── BALL-FIELD (a pile of dynamic physics spheres that BLOCKS the cube) ──
+  // A `balls` segment lays N light physics balls on a FLAT stretch. They are NOT real
+  // rigid bodies — each is a single sphere with pos/vel under gravity, clamped onto the
+  // track surface (surfaceYAt), separated from its neighbours, and PUSHED by the cube.
+  // The cube does NOT auto-stop on them (no soft-lock): plowing through the pile costs
+  // SPEED (a resistance multiplier ∝ how many balls it is shoving), so the cube visibly
+  // slows in the pile and speeds back up once clear. The leg推進 (drive) is untouched —
+  // only an extra deceleration is added, so no-slip / no-penetration / every gate stay
+  // intact (the ball system is purely additive). All knobs are designer-tunable here.
+  ballGravity: 26.0,     // world u/s² downward (physics +down) — light, settles fast
+  ballFriction: 5.0,     // 1/s linear velocity damping (rolling/ground friction) — settles balls
+  ballRestitution: 0.18, // 0..1 bounce on ground / separation (a little lively, mostly damped)
+  ballSepStiff: 22.0,    // 1/s ball-ball separation push rate (positional, impulse-like)
+  ballPushSpeed: 1.35,   // multiplier on the cube's forward speed imparted to a ball it shoves (ball accelerates ahead)
+  ballPushUp: 0.45,      // fraction of the push that also lifts the ball (so it pops up & rolls off, not just slides)
+  ballCubeHalf: 0.55,    // cube collision half-extent (radius of the cube's push circle) — a touch over CUBE_SIZE/2
+  // RESISTANCE: each ball the cube is in contact with multiplies its speed DOWN. The
+  // factor is (1 − ballSlowPerContact)^contacts, clamped at ballSlowMin so the cube
+  // NEVER fully stops (no soft-lock) — it always grinds through. Tuned so a dense pile
+  // roughly halves speed (clear "방해") but the cube keeps moving and recovers after.
+  ballSlowPerContact: 0.20, // each contacting ball costs 20% of speed (compounding) — a clear "방해"
+  ballSlowMin: 0.30,        // hard floor on the slow factor (cube keeps ≥30% pace ⇒ never soft-locks)
+  ballContactPad: 0.10,     // extra world-u so a ball "in contact" is counted a hair before exact touch
 };
 
 export class Physics {
@@ -303,6 +327,23 @@ export class Physics {
     this._segX0 = null;              // Float64Array of segment x0 (ascending) — for O(log n) lookup
     this._segHint = 0;               // last-resolved segment index (current-segment pointer cache)
     this._maxSurfaceTopY = 0;
+
+    // ── BALL-FIELD (dynamic physics-ball piles) ──
+    // Each `balls` segment spawns N light spheres onto a flat run. We keep them in flat
+    // arrays for cache-friendly stepping (no per-ball object churn) plus a small `_ballR`
+    // array of radii. The renderer reads `balls` (an array of {x,y,r} views rebuilt
+    // each frame from these arrays — see ballRenderList) to place its reused sphere
+    // meshes. `_ballResist` is the last-applied resistance slow-factor (1 = no pile) the
+    // verifier reads to prove the cube slows in a pile. All allocated ONCE per build.
+    this._ballN = 0;                 // number of balls in the field (0 ⇒ none)
+    this._ballX = null;              // Float64Array — ball x (world)
+    this._ballY = null;              // Float64Array — ball y (physics +down; surface clamp keeps it on track)
+    this._ballVX = null;            // Float64Array — ball x velocity
+    this._ballVY = null;            // Float64Array — ball y velocity (+down)
+    this._ballR = null;              // Float64Array — ball radius
+    this._ballResist = 1;            // last cube speed slow-factor from the pile (1 = clear)
+    this._ballContacts = 0;          // # balls the cube was in contact with last step (diagnostic)
+    this._ballRenderList = null;     // reusable [{x,y,r}] views for the renderer (no per-frame alloc)
 
     // ── PRE-RACE IDLE FLOAT (reference start look) ──
     // When `_idleFloat` is on, update() ignores the locomotion body-height path and
@@ -394,6 +435,10 @@ export class Physics {
     this._prevLoft = 0;
     this._idleFloat = false;
     this._idlePhase = 0;
+    // BALL-FIELD: cleared here and rebuilt in buildTrack (the segment scan spawns them).
+    this._ballN = 0;
+    this._ballX = null; this._ballY = null; this._ballVX = null; this._ballVY = null; this._ballR = null;
+    this._ballResist = 1; this._ballContacts = 0; this._ballRenderList = null;
   }
 
   /** Pre-race idle float toggle (reference start look). While ON the cube hovers
@@ -657,6 +702,28 @@ export class Physics {
         this.ceilingBodies.push({ x0: tx0, x1: tx1, ceilingY, floorY, clearance });
         cursorX += len;
         // surfaceY unchanged (flat floor through the tunnel).
+      } else if (seg.kind === 'balls') {
+        // BALLS = a FLAT run with a PILE OF DYNAMIC PHYSICS SPHERES lying on it. The
+        // floor is an ordinary flat surface (the cube walks it with the normal gait —
+        // no special terrain factor, no climb/tunnel gate). The OBSTACLE is the balls:
+        // they sit on the surface under gravity and the cube must SHOVE them aside to
+        // pass (a resistance that SLOWS the cube, applied in update()). We add the flat
+        // surface here and RECORD the pile spec; the actual balls are spawned AFTER the
+        // loop (once every surfaceFn exists so we can clamp them onto the surface).
+        const bx0 = cursorX, bx1 = cursorX + len;
+        addSlab(bx0 + len / 2, surfaceY, len, thick);
+        this._segs.push({ x0: bx0, x1: bx1, kind: 'balls', topYa: surfaceY, topYb: surfaceY,
+          surfFn: () => surfaceY });
+        if (surfaceY < this._maxSurfaceTopY) this._maxSurfaceTopY = surfaceY;
+        // pile spec (spawned post-loop). Re-uses `count` as the ball count (schema).
+        const bCount = Math.min(SEGMENT_DEFAULTS.ballCountMax,
+          Math.max(1, (seg.count != null ? seg.count : SEGMENT_DEFAULTS.ballCount) | 0));
+        const bR = (seg.ballR != null) ? seg.ballR : SEGMENT_DEFAULTS.ballR;
+        const bSpread = (seg.ballSpread != null) ? seg.ballSpread
+          : len * SEGMENT_DEFAULTS.ballSpreadFrac;
+        (this._ballSpecs || (this._ballSpecs = [])).push({ x0: bx0, x1: bx1, count: bCount, r: bR, spread: bSpread, surfaceY });
+        cursorX += len;
+        // surfaceY unchanged (flat run under the pile).
       }
     }
 
@@ -674,6 +741,59 @@ export class Physics {
     for (let i = 0; i < this._segs.length; i++) xs[i] = this._segs[i].x0;
     this._segX0 = xs;
     this._segHint = 0;
+
+    // ── SPAWN THE BALL PILES (AFTER the lookup index so surfaceYAt resolves). ──
+    // We pack all piles into ONE set of flat arrays (cache-friendly stepping). Each ball
+    // is scattered over the pile's mid-segment x window, in a few rows so they READ as a
+    // heap (not a flat line), then dropped — gravity + the post-build settle land them on
+    // the surface. Allocated ONCE here; update() only mutates values (zero per-frame alloc).
+    if (this._ballSpecs && this._ballSpecs.length) {
+      let total = 0;
+      for (const sp of this._ballSpecs) total += sp.count;
+      this._ballN = total;
+      this._ballX = new Float64Array(total);
+      this._ballY = new Float64Array(total);
+      this._ballVX = new Float64Array(total);
+      this._ballVY = new Float64Array(total);
+      this._ballR = new Float64Array(total);
+      this._ballRenderList = new Array(total);
+      let idx = 0;
+      for (const sp of this._ballSpecs) {
+        // centre the pile in the segment so the cube hits it mid-stretch. Scatter over
+        // `spread` in x; stack a few rows in y so it looks like a heap. Deterministic
+        // pseudo-random jitter (index-seeded) so a rebuild reproduces the same pile.
+        const cx = (sp.x0 + sp.x1) / 2;
+        const x0 = cx - sp.spread / 2;
+        const perRow = Math.max(1, Math.ceil(Math.sqrt(sp.count)));
+        for (let k = 0; k < sp.count; k++) {
+          const col = k % perRow;
+          const row = Math.floor(k / perRow);
+          // jitter: cheap hash on (idx) → [-0.5,0.5)
+          const j = ((Math.sin(idx * 12.9898) * 43758.5453) % 1 + 1) % 1 - 0.5;
+          const bx = x0 + (col + 0.5 + j * 0.5) * (sp.spread / perRow);
+          const surf = this.surfaceYAt(bx);
+          const baseY = (surf == null ? sp.surfaceY : surf) - sp.r; // ball centre rests at surf - r
+          // stack rows ABOVE the surface (physics +down ⇒ subtract per row) so they drop
+          // and settle into a heap.
+          const by = baseY - row * sp.r * 1.7;
+          this._ballX[idx] = bx;
+          this._ballY[idx] = by;
+          this._ballVX[idx] = 0;
+          this._ballVY[idx] = 0;
+          this._ballR[idx] = sp.r;
+          this._ballRenderList[idx] = { x: bx, y: by, r: sp.r };
+          idx++;
+        }
+      }
+      // SETTLE the pile so it starts at rest (no drop animation at the start line). Run a
+      // handful of fixed steps of the ball-only physics (cube far away ⇒ no push) so the
+      // heap is already resting on the surface when the race begins.
+      for (let s = 0; s < 60; s++) this._stepBalls(this.FIXED_DT / 1000, -1e9, 0, 0);
+      this._syncBallRenderList(); // reflect the settled rest pose for the first render
+      this._ballSpecs = null; // specs consumed
+    } else {
+      this._ballN = 0;
+    }
 
     // create the cube (positioned in setLegStroke once we know the reach)
     this.cube = {
@@ -1319,6 +1439,139 @@ export class Physics {
     return 0.5 * (1 - Math.cos(2 * theta));
   }
 
+  // ── BALL-FIELD PHYSICS (light single-sphere model) ──
+  /** Advance the dynamic ball pile by `dt` seconds. The cube (centre cubeX,cubeY of
+   * half-extent ballCubeHalf, moving forward at vCube) PUSHES any ball it overlaps in
+   * the +x direction (and a little up) so the cube shoves the pile aside. Each ball:
+   *   • falls under gravity, clamps onto the track surface beneath it (surfaceYAt) with a
+   *     small restitution bounce (never sinks below — structural, like the cube's foot),
+   *   • separates from neighbours with a positional impulse (O(N²), N<=20 ⇒ cheap),
+   *   • is damped by linear friction so it rolls to rest after being shoved.
+   * Returns the number of balls the cube was IN CONTACT with this step (for the cube
+   * resistance / verifier). Pure value mutation of the flat arrays — ZERO allocation.
+   * `cubeX = -1e9` (the settle path) ⇒ the cube is "infinitely far" ⇒ no push. */
+  _stepBalls(dt, cubeX, cubeY, vCube) {
+    const N = this._ballN;
+    if (!N) { this._ballContacts = 0; return 0; }
+    const X = this._ballX, Y = this._ballY, VX = this._ballVX, VY = this._ballVY, R = this._ballR;
+    const g = TUNE.ballGravity, fr = TUNE.ballFriction, rest = TUNE.ballRestitution;
+    const cubeHalf = TUNE.ballCubeHalf;
+    let contacts = 0;
+    // 1. integrate gravity + friction, advect, ground-clamp.
+    const damp = Math.exp(-fr * dt);
+    for (let i = 0; i < N; i++) {
+      VY[i] += g * dt;          // gravity (+down)
+      VX[i] *= damp;            // linear friction (rolling resistance)
+      VY[i] *= damp;
+      X[i] += VX[i] * dt;
+      Y[i] += VY[i] * dt;
+      // GROUND CLAMP: the ball CENTRE must stay >= r above the surface under it (so the
+      // ball never sinks into the track). surfaceY is +down; "above" = smaller y. The
+      // ball rests when its centre y == surfaceY - r.
+      const surf = this.surfaceYAt(X[i]);
+      if (surf != null) {
+        const restY = surf - R[i];     // centre y at rest on the surface
+        if (Y[i] > restY) {            // below the surface (penetrating) ⇒ pop back up
+          Y[i] = restY;
+          if (VY[i] > 0) VY[i] = -VY[i] * rest; // bounce a little, mostly absorbed
+        }
+      }
+    }
+    // 2. ball-ball separation (positional, O(N²) — N<=20). Push overlapping pairs apart
+    //    along their centre line; share the correction; add a damped impulse so a shoved
+    //    ball nudges its neighbours (the pile spreads when the cube plows in).
+    const sepStiff = TUNE.ballSepStiff;
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        let dx = X[j] - X[i], dy = Y[j] - Y[i];
+        let dist = Math.hypot(dx, dy);
+        const minD = R[i] + R[j];
+        if (dist < minD && dist > 1e-6) {
+          const overlap = minD - dist;
+          const nx = dx / dist, ny = dy / dist;
+          const corr = overlap * 0.5;
+          X[i] -= nx * corr; Y[i] -= ny * corr;
+          X[j] += nx * corr; Y[j] += ny * corr;
+          // velocity exchange along the normal (separation impulse, damped).
+          const rel = (VX[j] - VX[i]) * nx + (VY[j] - VY[i]) * ny;
+          if (rel < 0) {
+            const imp = -rel * sepStiff * dt * 0.5;
+            VX[i] -= nx * imp; VY[i] -= ny * imp;
+            VX[j] += nx * imp; VY[j] += ny * imp;
+          }
+        } else if (dist <= 1e-6) {
+          // exact overlap (degenerate) — nudge apart along x deterministically.
+          X[j] += R[j] * 0.5; X[i] -= R[i] * 0.5;
+        }
+      }
+    }
+    // 3. CUBE → BALL PUSH. The cube (centre, half-extent cubeHalf) shoves any ball whose
+    //    centre is within (cubeHalf + r) — push it FORWARD (+x, the cube's travel) and a
+    //    little UP so it pops over/rolls off, and count it as a "contact" (the cube's
+    //    resistance scales with the contact count). The push speed scales with the cube's
+    //    own forward speed (a fast cube flings them harder). No push during the settle
+    //    pass (cubeX == -1e9) or when the cube is behind the ball (only shove ahead).
+    if (cubeX > -1e8) {
+      for (let i = 0; i < N; i++) {
+        const dx = X[i] - cubeX, dy = Y[i] - cubeY;
+        const reach = cubeHalf + R[i] + TUNE.ballContactPad;
+        const dist = Math.hypot(dx, dy);
+        if (dist < reach) {
+          contacts++;
+          // only PUSH balls at/ahead of the cube (dx >= a small negative) so it shoves
+          // the pile forward; balls already behind it are left to settle.
+          if (dx > -R[i]) {
+            // separate the ball out of the cube along the contact normal (positional).
+            const over = reach - dist;
+            let nx = dist > 1e-6 ? dx / dist : 1, ny = dist > 1e-6 ? dy / dist : 0;
+            X[i] += nx * over; Y[i] += ny * over;
+            // impart the cube's forward speed (× ballPushSpeed) + a little lift so the
+            // ball accelerates ahead and pops up (rolls off), not just slides flat.
+            const push = Math.max(0, vCube) * TUNE.ballPushSpeed;
+            if (push > VX[i]) VX[i] = push;            // never slow a faster ball
+            VY[i] -= push * TUNE.ballPushUp;           // up (physics +down ⇒ subtract)
+          }
+        }
+      }
+    }
+    // 4. FINAL GROUND CLAMP. Separation (step 2) and the cube push (step 3) move balls
+    //    POSITIONALLY without a ground constraint, so a shoved/separated ball can end the
+    //    step below its surface. Re-clamp every ball onto the surface here so the pile can
+    //    NEVER sink into the track (structural — same guarantee as the cube's foot). Zero
+    //    allocation; one pass.
+    for (let i = 0; i < N; i++) {
+      const surf = this.surfaceYAt(X[i]);
+      if (surf == null) continue;
+      const restY = surf - R[i];
+      if (Y[i] > restY) {            // below the surface ⇒ pop up to rest
+        Y[i] = restY;
+        if (VY[i] > 0) VY[i] = 0;    // kill downward velocity at the floor (settled)
+      }
+    }
+    this._ballContacts = contacts;
+    return contacts;
+  }
+
+  /** Resistance slow-factor for the cube from the pile it is currently shoving. Each
+   * contacting ball compounds a slowdown (1−ballSlowPerContact)^contacts, floored at
+   * ballSlowMin so the cube NEVER stops (no soft-lock) — it always grinds through and
+   * accelerates back out once the pile thins. 1 = no pile / clear. */
+  _ballResistFactor(contacts) {
+    if (!contacts) return 1;
+    const f = Math.pow(1 - TUNE.ballSlowPerContact, contacts);
+    return Math.max(TUNE.ballSlowMin, f);
+  }
+
+  /** Refresh the renderer's [{x,y,r}] views from the flat arrays (reused objects, no
+   * per-frame allocation). Called once per update() when a field exists. */
+  _syncBallRenderList() {
+    if (!this._ballN || !this._ballRenderList) return;
+    for (let i = 0; i < this._ballN; i++) {
+      const v = this._ballRenderList[i];
+      v.x = this._ballX[i]; v.y = this._ballY[i]; v.r = this._ballR[i];
+    }
+  }
+
   // ── MAIN STEP ──
   update(dtMs, running) {
     if (!this.cube) return;
@@ -1367,6 +1620,14 @@ export class Physics {
       this.cube.angle = 0;
       // keep the (frozen) legs glued under the floating body so they hover too.
       this._syncLegs();
+      // BALL-FIELD: keep the pile settling/resting while the cube floats pre-race (the
+      // cube is far away ⇒ no push). Sync the render views so the balls show during the
+      // countdown too. No resistance while idle (cube isn't advancing).
+      if (this._ballN) {
+        this._stepBalls(dt, this._x, this.cube.position.y, 0);
+        this._ballResist = 1;
+        this._syncBallRenderList();
+      }
       return;
     }
 
@@ -1467,6 +1728,15 @@ export class Physics {
       // RIVAL pace scaling: applied to the realized speed so ω = v/r still gives
       // exact no-slip and the foot still grazes (never penetrates) the surface.
       v *= this.paceFactor;
+
+      // BALL-FIELD RESISTANCE: if the cube is shoving a pile of dynamic balls, slow it
+      // by the resistance factor (∝ how many it is in contact with, floored so it never
+      // soft-locks). This is the ONLY effect the balls have on the cube — the leg推進
+      // (drive), no-slip ω, body height / contact are all unchanged, so every other gate
+      // and invariant is intact. `_ballResist` is updated AFTER the ball step below using
+      // THIS frame's contact count; applying last frame's factor here is a 1-step lag of
+      // no consequence (sub-16ms). 1 = clear (no slowdown).
+      v *= this._ballResist;
 
       // 3. advance
       const adv = v * dt;
@@ -1660,6 +1930,18 @@ export class Physics {
     //    clamped to sit ON the surface (never below) — structural 0 penetration.
     this._syncLegs();
 
+    // 7. BALL-FIELD: step the dynamic pile with THIS frame's cube position + forward
+    //    speed so the cube shoves the balls aside, then recompute the resistance factor
+    //    (applied to v NEXT frame — a 1-step lag of no consequence). The push uses the
+    //    cube's realized forward velocity (v) so a faster cube flings them harder. The
+    //    render views are refreshed for the sphere meshes. The ball system is purely
+    //    additive: it never touches _x / _bodyY / legs / gates beyond the v slowdown.
+    if (this._ballN) {
+      const contacts = this._stepBalls(dt, this._x, this.cube.position.y, v);
+      this._ballResist = this._ballResistFactor(contacts);
+      this._syncBallRenderList();
+    }
+
     // safety: NaN guard (kinematic can't explode, but assert anyway)
     if (!Number.isFinite(this._x) || !Number.isFinite(this._bodyY)) this._exploded = true;
   }
@@ -1837,6 +2119,27 @@ export class Physics {
     const mt = maxTurnAngleDeg(chain, TUNE.hookTurnWindow);
     return { isHook: mt >= TUNE.hookAngleDeg, maxTurnDeg: +mt.toFixed(2), reach: +reach.toFixed(3), n: chain.length };
   }
+  // ── BALL-FIELD getters (renderer + verifier read these) ──
+  /** Number of dynamic balls in the field (0 ⇒ none). */
+  get ballCount() { return this._ballN || 0; }
+  /** Reusable [{x,y,r}] views of every ball (physics y +down) for the renderer's reused
+   * sphere meshes. Same array object across frames (only the field values change) ⇒ zero
+   * per-frame allocation. null when there are no balls. */
+  get balls() { return this._ballN ? this._ballRenderList : null; }
+  /** Last-applied cube speed slow-factor from the pile (1 = clear, <1 = being shoved /
+   * slowed; floored at TUNE.ballSlowMin so it never reaches 0 — no soft-lock). */
+  get ballResist() { return this._ballResist; }
+  /** # balls the cube was in contact with last step (diagnostic). */
+  get ballContacts() { return this._ballContacts || 0; }
+  /** Snapshot of ball centres as {x,y,r} (NEW objects — for the verifier's movement
+   * delta; not used on the hot render path). */
+  ballSnapshot() {
+    if (!this._ballN) return [];
+    const out = new Array(this._ballN);
+    for (let i = 0; i < this._ballN; i++) out[i] = { x: this._ballX[i], y: this._ballY[i], r: this._ballR[i] };
+    return out;
+  }
+
   /** True while the walker is in a ballistic flight (off the ground at a crest). */
   get airborne() { return !!this._air; }
   /** Vertical velocity (physics +down; up = negative) — non-zero only while airborne. */

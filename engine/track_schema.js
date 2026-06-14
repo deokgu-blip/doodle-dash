@@ -131,7 +131,11 @@ export const SEGMENT_DEFAULTS = Object.freeze({
   // ALWAYS smashes through (no soft-lock) — breaking + plowing the rubble just costs speed.
   blockCount: 4,        // default standing blocks per `blocks` segment
   blockW: 0.7,          // each standing block's x-width (world units)
-  blockH: 1.4,          // each standing block's height (world units) — taller than the cube ⇒ a real wall
+  blockH: 0.8,          // each standing block's height (world units). KEPT JUST UNDER the cube
+                        // (CUBE_SIZE 0.9) so the cube clearly SITS ON / rides OVER the blocks &
+                        // rubble — never sunk among taller boxes (the "buried" look). It still
+                        // reads as a low wall the cube SMASHES through, but the cube stays visible
+                        // on top, smashing & riding the rubble rather than wading between towers.
   debrisPerBlock: 5,    // fragments a broken block becomes
   debrisCapTotal: 24,   // PERF hard cap on total debris (O(N²) separation stays cheap)
   debrisRfrac: 0.26,    // debris fragment half-size as a fraction of blockW (small chips)

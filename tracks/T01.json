@@ -22,10 +22,12 @@
       "rough": 0.9
     },
     {
-      "kind": "wall",
-      "length": 1,
+      "kind": "stairs",
+      "length": 2.4,
       "height": 0.95,
-      "rough": 0.9
+      "steps": 2,
+      "rough": 0.9,
+      "_note": "WAS a `wall` (height 0.95) — a near-vertical riser that read as a TELEPORT up. Converted to a short STAIRCASE of the SAME total height so the climb is visibly STEPPED (2 treads, riser 0.475u over 1.2u run each). LENGTH-GATE preserved: overall slope 0.396 < steepThresh 0.6 ⇒ NOT hook-gated (a normal length-gated staircase); each riser 0.475u > maxClimb(0.6)=0.30 ⇒ a SHORT leg (reach ~0.6) is BLOCKED at the foot (struggle-in-place, no soft-lock), a LONG leg climbs it tread-by-tread. So a too-short leg is still blocked SOMEWHERE (NO-SINGLE-LEG holds) but there is NO vertical snap."
     },
     {
       "kind": "flat",
@@ -100,10 +102,10 @@
       "length": 10,
       "blockCount": 4,
       "blockW": 0.7,
-      "blockH": 1.4,
+      "blockH": 0.8,
       "debrisPerBlock": 5,
       "rough": 0.9,
-      "_note": "BREAKING BLOCKS — a wall of upright boxes barring the path. The cube SMASHES each on contact: the block bursts into debris that falls, litters the floor, and SLOWS the cube grinding over the rubble (resistance ∝ contacts, floored ⇒ no soft-lock). The cube always breaks through. Reuses the ball-debris physics (gravity/clamp/separation/cube-push)."
+      "_note": "BREAKING BLOCKS — a low wall of upright boxes barring the path. blockH 0.8 is JUST UNDER the cube (CUBE_SIZE 0.9) so the cube clearly SITS ON / rides OVER the blocks and the rubble (NOT buried among taller towers — was 1.4, which sank the cube). The cube SMASHES each on contact: the block bursts into debris that falls, litters the floor, and SLOWS the cube grinding over the rubble (resistance ∝ contacts, floored ⇒ no soft-lock). The cube always breaks through, riding on top. Reuses the ball-debris physics (gravity/clamp/separation/cube-push)."
     },
     {
       "kind": "flat",
@@ -165,10 +167,12 @@
       "rough": 0.9
     },
     {
-      "kind": "wall",
-      "length": 1,
+      "kind": "stairs",
+      "length": 2.6,
       "height": 1.0,
-      "rough": 0.9
+      "steps": 2,
+      "rough": 0.9,
+      "_note": "WAS a `wall` (height 1.0). Converted to a 2-step STAIRCASE of the SAME total height (riser 0.5u over 1.3u run each). slope 0.385 < 0.6 ⇒ length-gated (NOT hook-gated); riser 0.5u > maxClimb(0.6)=0.30 ⇒ short leg BLOCKED, long leg climbs stepped. No vertical snap."
     },
     {
       "kind": "flat",
@@ -221,10 +225,12 @@
       "rough": 0.9
     },
     {
-      "kind": "wall",
-      "length": 1,
+      "kind": "stairs",
+      "length": 2.4,
       "height": 0.95,
-      "rough": 0.9
+      "steps": 2,
+      "rough": 0.9,
+      "_note": "WAS a `wall` (height 0.95). Converted to a 2-step STAIRCASE of the SAME total height (riser 0.475u over 1.2u run each). slope 0.396 < 0.6 ⇒ length-gated (NOT hook-gated); riser 0.475u > maxClimb(0.6)=0.30 ⇒ short leg BLOCKED, long leg climbs stepped. No vertical snap."
     },
     {
       "kind": "flat",

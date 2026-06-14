@@ -119,16 +119,25 @@ const TUNE = {
   climbBase: 0.30,       // a reach of 0.30+ clears an infinitesimal lip
   climbK: 1.0,           // each +1 unit of step height needs +1.0 reach
   // ── HOOK (shape) RULE — the STEEP-RAMP gate is by SHAPE, not length ──
-  // A gated STEEP UPHILL ramp can only be grip-and-stepped-over by a leg whose drawn
-  // shape is a HOOK / ㄱ / L / claw — i.e. it has a SHARP BEND. We measure "hookiness"
-  // as the MAX TURN ANGLE between consecutive direction vectors along the normalized
-  // leg chain (sampled with a small lookahead window so the resampling micro-jitter on
-  // a smooth arc/circle does not accumulate to a false corner). A hook/L/zigzag has a
-  // ~75°+ bend; a straight stick / bar / smooth arc / circle / wheel / blobby limb is
-  // < ~53°. So a threshold in the gap [53°,74°] cleanly classifies. reach is IRRELEVANT
-  // here — a long straight leg is NOT a hook, a short ㄱ IS a hook.
-  //   isHook = (maxTurnAngle >= hookAngleDeg)
-  hookAngleDeg: 62,      // degrees — bend above this ⇒ the leg is a HOOK (tuned: hooks≈75°+, non-hooks≤53°)
+  // A gated STEEP UPHILL climb can only be grip-and-stepped (짚고) over by a leg whose
+  // drawn shape is a GENUINE HOOK / ㄱ / J / L / claw — i.e. ONE clear directional bend
+  // that can CATCH on a step edge. A messy zigzag / scribble must NOT qualify (you can't
+  // grip a step with a wiggly line). So "hookiness" is TWO conditions, both required:
+  //   (1) a SHARP enough bend somewhere — maxTurnAngle >= hookAngleDeg, AND
+  //   (2) the bend is DIRECTIONALLY COHERENT (curls ONE way — a clean ㄱ/J/L), NOT a
+  //       back-and-forth scribble. We measure the SIGNED turn (cross product) at each SHARP
+  //       vertex and count DIRECTION REVERSALS (sign flips). A genuine hook turns the SAME
+  //       way throughout (0 reversals); a zigzag alternates left-right-left (>=2 reversals).
+  //       So a HOOK requires signReversals <= hookMaxReversals. This is LENGTH-ROBUST (a
+  //       SHORT clean ㄱ still has 0 reversals — unlike a sharp-fraction test that penalizes
+  //       short strokes), so a short hook IS a hook and a long scribble is NOT.
+  // Measured on the normalized leg chain with a small lookahead window (so resampling
+  // micro-jitter on a smooth arc/circle does not fake a corner). reach is IRRELEVANT — a
+  // long straight leg is NOT a hook, a short clean ㄱ IS a hook, a long scribble is NOT.
+  //   isHook = (maxTurnAngle >= hookAngleDeg) && (signReversals <= hookMaxReversals)
+  hookAngleDeg: 70,      // degrees — a clear corner this sharp is needed (genuine hooks≈75–78°; non-hooks: wheel 50, limb_long 52, arc_big 44 ⇒ all below)
+  sharpAngleDeg: 20,     // degrees — a chain vertex turning at least this much counts as a "sharp" corner whose TURN DIRECTION we track (for the reversal/scribble test)
+  hookMaxReversals: 0,   // max direction reversals among sharp corners for a HOOK (clean ㄱ/J/L curls ONE way ⇒ 0; zigzag alternates ⇒ >=2 ⇒ FAILS — can't grip with a wiggle)
   hookTurnWindow: 2,     // chain-sample lookahead each side for the turn-angle measure (smooths arc jitter, keeps sharp corners)
   // STEEP-RAMP GATE: an UPHILL ramp (physics slope<0) is "steep" (hook-gated) iff its
   // |slope| >= steepThresh. Gentle/medium uphills (|slope| < this) are NOT gated — any
@@ -215,6 +224,19 @@ const TUNE = {
   landMergeLerp: 14.0,   // 1/s — residual touchdown re-settle ease (kept for cosmetic continuity)
   // reach factor floor: even the shortest leg still runs and lofts a little (never 0).
   loftReachFloor: 0.55,  // min reach-factor (so short legs hop less, but are not frozen-grounded)
+
+  // ── STEEP-STAIR GRIP CADENCE (짚고 올라가기 — the hook PLANTS on each tread & pulls up) ──
+  // On a HOOK-gated STEEP staircase the body would otherwise glide smoothly up the stepped
+  // surface, which reads as a float/auto-climb. To make it READ as the hook GRIPPING each
+  // step and pulling the body up tread-by-tread, we add a small PHASE-LOCKED UPWARD pulse on
+  // top of the grounded pose, peaking at each foot-PLANT (the moment the hook catches an
+  // edge). It is UPWARD-ONLY (it only RAISES the body — subtracts from physics-y), so it can
+  // NEVER push the body into a riser ⇒ structurally penetration-free. The amplitude is small
+  // and eased in/out so there is no jitter; it is the "tasteful middle ground" cadence layered
+  // on the smooth climb (NOT a hard teleport-per-step that would jitter). Active ONLY while on
+  // a steep-gated stair run with a hook actually driving the climb.
+  gripLiftMax: 0.16,     // world-u — peak per-plant upward hitch on a steep-stair grip climb (small ⇒ no motion sickness)
+  gripLerp: 12.0,        // 1/s — how fast the grip-lift eases in/out at the run boundaries (smooth, no pop)
 
   // ── PRE-RACE IDLE FLOAT (reference start look) ──
   // Before the race starts (the player has not yet started drawing a leg, OR is drawing
@@ -339,6 +361,8 @@ export class Physics {
     this._loft = 0;                  // live per-frame loft height above the grounded pose (world u, eased toward the phase target)
     this._loftAmpLive = 0;           // eased loft AMPLITUDE for the current steep×speed (so stride-stretch & loft share one value)
     this._prevLoft = 0;              // previous frame's loft (for the body vertical velocity)
+    this._grip = 0;                  // live STEEP-STAIR grip-cadence lift (world u, upward-only) — the per-plant hitch on a hook climb (짚고)
+    this._gripLiveAmp = 0;           // eased grip-lift amplitude (0 off steep stairs ⇒ a clean smooth ramp/flat; ramps in on a steep hook climb)
 
     // gate used by the verifier's leg-driven assertion (motor-off ⇒ no motion).
     this.motorEnabled = true;
@@ -601,10 +625,13 @@ export class Physics {
         const dy = -(seg.height ?? 0);     // up = negative y (0 ⇒ flat curve)
         const x0 = cursorX, x1 = cursorX + len;
         if (dy === 0) {
-          addSlab(cursorX + len / 2, surfaceY, len, thick);
-          this._segs.push({ x0, x1, kind: 'curve', topYa: surfaceY, topYb: surfaceY,
-            surfFn: () => surfaceY });
-          if (surfaceY < this._maxSurfaceTopY) this._maxSurfaceTopY = surfaceY;
+          // CAPTURE the level in a per-segment CONST — `surfaceY` is a mutating loop var;
+          // a closure over it would read the FINAL track level (closure bug). Freeze it.
+          const curveY = surfaceY;
+          addSlab(cursorX + len / 2, curveY, len, thick);
+          this._segs.push({ x0, x1, kind: 'curve', topYa: curveY, topYb: curveY,
+            surfFn: () => curveY });
+          if (curveY < this._maxSurfaceTopY) this._maxSurfaceTopY = curveY;
         } else {
           const topY0 = surfaceY, topY1 = surfaceY + dy;
           addRampSlab(x0, x1, topY0, topY1, thick);
@@ -836,17 +863,21 @@ export class Physics {
         // surface here and RECORD the pile spec; the actual balls are spawned AFTER the
         // loop (once every surfaceFn exists so we can clamp them onto the surface).
         const bx0 = cursorX, bx1 = cursorX + len;
-        addSlab(bx0 + len / 2, surfaceY, len, thick);
-        this._segs.push({ x0: bx0, x1: bx1, kind: 'balls', topYa: surfaceY, topYb: surfaceY,
-          surfFn: () => surfaceY });
-        if (surfaceY < this._maxSurfaceTopY) this._maxSurfaceTopY = surfaceY;
+        // CAPTURE the floor level in a per-segment CONST — `surfaceY` is a mutating loop var;
+        // a closure `() => surfaceY` would read the FINAL track level (closure bug ⇒ the balls
+        // floor / surfaceYAt would teleport up to the end-of-track height). Freeze it here.
+        const ballsY = surfaceY;
+        addSlab(bx0 + len / 2, ballsY, len, thick);
+        this._segs.push({ x0: bx0, x1: bx1, kind: 'balls', topYa: ballsY, topYb: ballsY,
+          surfFn: () => ballsY });
+        if (ballsY < this._maxSurfaceTopY) this._maxSurfaceTopY = ballsY;
         // pile spec (spawned post-loop). Re-uses `count` as the ball count (schema).
         const bCount = Math.min(SEGMENT_DEFAULTS.ballCountMax,
           Math.max(1, (seg.count != null ? seg.count : SEGMENT_DEFAULTS.ballCount) | 0));
         const bR = (seg.ballR != null) ? seg.ballR : SEGMENT_DEFAULTS.ballR;
         const bSpread = (seg.ballSpread != null) ? seg.ballSpread
           : len * SEGMENT_DEFAULTS.ballSpreadFrac;
-        (this._ballSpecs || (this._ballSpecs = [])).push({ x0: bx0, x1: bx1, count: bCount, r: bR, spread: bSpread, surfaceY });
+        (this._ballSpecs || (this._ballSpecs = [])).push({ x0: bx0, x1: bx1, count: bCount, r: bR, spread: bSpread, surfaceY: ballsY });
         cursorX += len;
         // surfaceY unchanged (flat run under the pile).
       } else if (seg.kind === 'blocks') {
@@ -859,16 +890,21 @@ export class Physics {
         // RECORD the wall spec; the blocks + debris are built AFTER the loop (once every
         // surfaceFn exists so we can clamp debris onto the surface).
         const bx0 = cursorX, bx1 = cursorX + len;
-        addSlab(bx0 + len / 2, surfaceY, len, thick);
-        this._segs.push({ x0: bx0, x1: bx1, kind: 'blocks', topYa: surfaceY, topYb: surfaceY,
-          surfFn: () => surfaceY });
-        if (surfaceY < this._maxSurfaceTopY) this._maxSurfaceTopY = surfaceY;
+        // CAPTURE the floor level in a per-segment CONST — `surfaceY` is a mutating loop var;
+        // a closure `() => surfaceY` would read the FINAL track level (closure bug ⇒ the blocks
+        // floor / surfaceYAt + the standing-block bases would float to the end-of-track height,
+        // making the cube + blocks read as sunk/teleported). Freeze it here.
+        const blocksY = surfaceY;
+        addSlab(bx0 + len / 2, blocksY, len, thick);
+        this._segs.push({ x0: bx0, x1: bx1, kind: 'blocks', topYa: blocksY, topYb: blocksY,
+          surfFn: () => blocksY });
+        if (blocksY < this._maxSurfaceTopY) this._maxSurfaceTopY = blocksY;
         const blkCount = Math.max(1, (seg.blockCount != null ? seg.blockCount : SEGMENT_DEFAULTS.blockCount) | 0);
         const blkW = (seg.blockW != null) ? seg.blockW : SEGMENT_DEFAULTS.blockW;
         const blkH = (seg.blockH != null) ? seg.blockH : SEGMENT_DEFAULTS.blockH;
         const debPer = Math.max(1, (seg.debrisPerBlock != null ? seg.debrisPerBlock : SEGMENT_DEFAULTS.debrisPerBlock) | 0);
         (this._blockSpecs || (this._blockSpecs = [])).push({
-          x0: bx0, x1: bx1, count: blkCount, w: blkW, h: blkH, debrisPer: debPer, surfaceY });
+          x0: bx0, x1: bx1, count: blkCount, w: blkW, h: blkH, debrisPer: debPer, surfaceY: blocksY });
         cursorX += len;
         // surfaceY unchanged (flat run under the wall).
       } else if (seg.kind === 'fork') {
@@ -1204,6 +1240,8 @@ export class Physics {
     this._loft = 0;
     this._loftAmpLive = 0;
     this._prevLoft = 0;
+    this._grip = 0;
+    this._gripLiveAmp = 0;
     const startSurf0 = this.surfaceYAt(track.startX);
     this._footBaseY = (startSurf0 == null) ? groundY : startSurf0;
     this._prevFootBaseY = this._footBaseY;
@@ -1572,8 +1610,14 @@ export class Physics {
     //     hook / ㄱ / L / claw has a sharp (~75°+) bend; a straight stick / bar / smooth
     //     arc / circle / wheel / blobby limb is < ~53°. isHook = bend >= hookAngleDeg.
     //     This is fully independent of reach — used ONLY by the STEEP-RAMP gate.
-    this._maxTurnDeg = maxTurnAngleDeg(chain, TUNE.hookTurnWindow);
-    this._isHook = this._maxTurnDeg >= TUNE.hookAngleDeg;
+    {
+      const hm = hookMetrics(chain, TUNE.hookTurnWindow);
+      this._maxTurnDeg = hm.maxTurnDeg;
+      this._signReversals = hm.signReversals;
+      // GENUINE HOOK: a sharp enough corner AND a directionally-coherent bend (curls ONE way
+      // — a clean ㄱ/J/L), NOT a back-and-forth zigzag/scribble (you can't grip with a wiggle).
+      this._isHook = (hm.maxTurnDeg >= TUNE.hookAngleDeg) && (hm.signReversals <= TUNE.hookMaxReversals);
+    }
 
     // 5. place / re-float the cube.
     //    • FRESH (first leg of a track): anchor at startX, level, phase reset — the
@@ -1612,6 +1656,8 @@ export class Physics {
       this._landMerge = 0;
       this._loft = 0;
       this._loftAmpLive = 0;
+      this._grip = 0;
+      this._gripLiveAmp = 0;
       this._footBaseY = surf;
       this._prevFootBaseY = surf;
       // RENDER INTERPOLATION: a fresh leg teleports x to startX — drop any stale prev so
@@ -2318,6 +2364,7 @@ export class Physics {
       this._bob = Math.abs(bob);
       this._vx = 0; this._vTip = 0; this._omega = 0; this._vy = 0;
       this._air = false; this._airFrames = 0; this._loft = 0;
+      this._grip = 0; this._gripLiveAmp = 0;
       this._footBaseY = surf; this._prevFootBaseY = surf;
       this.cube.position.x = this._x;
       this.cube.position.y = this._bodyY;
@@ -2649,17 +2696,40 @@ export class Physics {
       this._loft += (loftTargetH - this._loft) * a;
       if (this._loft < 1e-4) this._loft = 0;
     }
-    // body sits at the grounded pose RAISED by the loft (physics +down ⇒ subtract).
-    this._bodyY = groundedY - this._loft;
+    // ── STEEP-STAIR GRIP CADENCE (짚고 — the hook PLANTS on each tread & pulls the body up) ──
+    // While the cube is HOOK-climbing a steep-gated staircase, add a small UPWARD pulse that
+    // peaks at each foot-PLANT (the instant the hook catches a step edge). gripPulse = (1−hop)
+    // is 1 at a plant (θ=0,π…) and 0 mid-float, so the body HITCHES UP as the hook bites and
+    // settles between bites — it READS as gripping/stepping tread-by-tread instead of a smooth
+    // glide. The amplitude eases in/out at the run boundaries (no pop) and is small (no
+    // jitter / motion-sickness). It is UPWARD-ONLY (RAISES the body), so it can never push the
+    // body INTO a riser ⇒ zero penetration is structurally preserved. Active only when a HOOK
+    // is actually driving a steep-stair climb (v>0, on a steep-gated run).
+    {
+      const gripping = drive && v > 1e-6 && this._isHook && this._onSteepStairRun(this._x);
+      const gripTarget = gripping ? TUNE.gripLiftMax : 0;
+      const ag = 1 - Math.exp(-TUNE.gripLerp * dt);
+      this._gripLiveAmp += (gripTarget - this._gripLiveAmp) * ag;
+      if (this._gripLiveAmp < 1e-4) this._gripLiveAmp = 0;
+      const gripPulse = 0.5 * (1 + Math.cos(2 * this._theta)); // 1 at plant, 0 mid-float
+      this._grip = this._gripLiveAmp * gripPulse;
+    }
+    // body sits at the grounded pose RAISED by the loft AND the grip-cadence hitch (physics
+    // +down ⇒ subtract to raise). Both are upward-only ⇒ the body never dips below the
+    // grounded (foot-grazing) pose, so no-penetration is preserved by construction.
+    this._bodyY = groundedY - this._loft - this._grip;
     // vertical velocity of the body (for cube.velocity / render) — the loft's rate.
     this._vy = -(this._loft - (this._prevLoft || 0)) / Math.max(1e-4, dt);
     this._prevLoft = this._loft;
-    // "airborne" === the loft has lifted the foot clear of the surface in this stride.
-    // Legs STILL roll throughout (ω>0); this flag only tells the verifier the foot is
-    // legitimately off the ground (so it skips the contact gap / slip / penetration
-    // checks for these frames — they are the float phase of a stride, not a violation).
+    // "airborne" === the foot is legitimately lifted clear of the surface in THIS stride
+    // phase — either by the downhill gait LOFT (hop) or by the steep-stair GRIP pull-up (the
+    // hook bites a step edge and the body rises off the tread). Legs STILL roll/grip
+    // throughout (ω>0); this flag only tells the verifier the foot is intentionally off the
+    // ground (so it skips the contact-gap / slip / penetration checks for these frames — they
+    // are a deliberate stride phase, not a float bug). The grip lift is upward-only, so it
+    // NEVER drives the foot BELOW the surface (zero penetration is still asserted everywhere).
     const wasAir = this._air;
-    this._air = this._loft > LOFT_AIR_EPS;
+    this._air = (this._loft > LOFT_AIR_EPS) || (this._grip > LOFT_AIR_EPS);
     if (this._air) this._airFrames++; else this._airFrames = 0;
     if (wasAir && !this._air) this._landMerge = 1; // touchdown this frame (cosmetic)
     if (this._landMerge > 1e-3) this._landMerge *= Math.exp(-TUNE.landMergeLerp * dt);
@@ -2784,8 +2854,11 @@ export class Physics {
     // "floating on slopes" gap). While AIRBORNE the body is meant to be above the
     // surface (positive clearance), so the clamp is skipped entirely. During the PRE-RACE
     // IDLE FLOAT the body is DELIBERATELY hovering above the surface (a drawn first leg
-    // points down past the surface), so the clamp must NOT yank it down to ground.
-    if (this._air || this._idleFloat) return;
+    // points down past the surface), so the clamp must NOT yank it down to ground. NOTE the
+    // STEEP-STAIR GRIP lift is NOT skipped here: it is upward-only (it can never push a foot
+    // BELOW the surface), so we KEEP the up-only clamp running through a grip pull-up — a
+    // belt-and-braces guarantee of ZERO penetration on the steep climb.
+    if (this._loft > LOFT_AIR_EPS || this._idleFloat) return;
     let below = 0; // worst penetration of any foot point below ITS local surface
     for (const l of this.legs) {
       for (let i = 1; i < l.body.parts.length; i++) {
@@ -2920,8 +2993,10 @@ export class Physics {
     if (rawReach > 1e-6 && Math.abs(reach - rawReach) > 1e-6) {
       const k = reach / rawReach; chain = chain.map((c) => ({ x: c.x * k, y: c.y * k }));
     }
-    const mt = maxTurnAngleDeg(chain, TUNE.hookTurnWindow);
-    return { isHook: mt >= TUNE.hookAngleDeg, maxTurnDeg: +mt.toFixed(2), reach: +reach.toFixed(3), n: chain.length };
+    const hm = hookMetrics(chain, TUNE.hookTurnWindow);
+    const isHook = (hm.maxTurnDeg >= TUNE.hookAngleDeg) && (hm.signReversals <= TUNE.hookMaxReversals);
+    return { isHook, maxTurnDeg: +hm.maxTurnDeg.toFixed(2), signReversals: hm.signReversals,
+      nSharp: hm.nSharp, reach: +reach.toFixed(3), n: chain.length };
   }
   // ── BALL-FIELD getters (renderer + verifier read these) ──
   /** Number of dynamic balls in the field (0 ⇒ none). */
@@ -2973,6 +3048,9 @@ export class Physics {
 
   /** True while the walker is in a ballistic flight (off the ground at a crest). */
   get airborne() { return !!this._air; }
+  /** Live STEEP-STAIR GRIP-cadence lift (world u, upward-only) — the per-plant hitch as the
+   * hook bites each tread and pulls the body up (짚고). 0 off a steep-stair hook climb. */
+  get gripLift() { return this._grip || 0; }
   /** Vertical velocity (physics +down; up = negative) — non-zero only while airborne. */
   get vy() { return this._vy || 0; }
   /** Clearance of the support foot's lowest point ABOVE the surface under the body
@@ -3079,8 +3157,25 @@ function lerpFast(slope, fastFactor) {
  * (~75°+) corner; a straight bar / smooth arc / circle / wheel stays low (< ~53°).
  * Chains too short to have an interior sample (n <= 2w) return 0 (cannot be a hook). */
 function maxTurnAngleDeg(chain, w) {
+  return hookMetrics(chain, w).maxTurnDeg;
+}
+
+/** Shape metrics for the HOOK classifier (single source). Walks the chain measuring the
+ * turn at each interior vertex (with the lookahead window `w` to smooth resample jitter)
+ * and returns:
+ *   • maxTurnDeg     — the SHARPEST bend anywhere (degrees) — "is there a corner at all?"
+ *   • signReversals  — # of TURN-DIRECTION reversals among SHARP corners (>= sharpAngleDeg).
+ *                      We take the signed turn (cross product) at each sharp vertex and count
+ *                      how many times its sign flips along the chain. A genuine ㄱ/J/L curls
+ *                      ONE way ⇒ 0 reversals; a zigzag alternates left-right-left ⇒ >=2. This
+ *                      is the SCRIBBLE test and is LENGTH-ROBUST (a short clean hook stays 0).
+ *   • nSharp         — # sharp corners measured (for transparency).
+ * Zero allocation beyond the returned plain object (called only on a redraw / in the
+ * verifier — never on the per-frame hot path). */
+function hookMetrics(chain, w) {
   const win = Math.max(1, w | 0);
-  let mx = 0;
+  let mx = 0, nSharp = 0, reversals = 0, prevSign = 0;
+  const sharpRad = TUNE.sharpAngleDeg * Math.PI / 180;
   for (let i = win; i < chain.length - win; i++) {
     const ax = chain[i].x - chain[i - win].x, ay = chain[i].y - chain[i - win].y;
     const bx = chain[i + win].x - chain[i].x, by = chain[i + win].y - chain[i].y;
@@ -3090,8 +3185,25 @@ function maxTurnAngleDeg(chain, w) {
     if (cos > 1) cos = 1; else if (cos < -1) cos = -1;
     const ang = Math.acos(cos);
     if (ang > mx) mx = ang;
+    if (ang >= sharpRad) {
+      nSharp++;
+      const cross = ax * by - ay * bx;          // signed turn direction (+left / -right)
+      const sign = cross > 0 ? 1 : (cross < 0 ? -1 : 0);
+      if (sign !== 0) {
+        if (prevSign !== 0 && sign !== prevSign) reversals++;
+        prevSign = sign;
+      }
+    }
   }
-  return mx * 180 / Math.PI;
+  return { maxTurnDeg: mx * 180 / Math.PI, signReversals: reversals, nSharp };
+}
+
+/** True iff `chain` reads as a GENUINE HOOK (one clear graspable bend), NOT a scribble.
+ * isHook = (maxTurnDeg >= hookAngleDeg) && (signReversals <= hookMaxReversals). See the TUNE
+ * HOOK RULE comment. Single source for setLegStroke + classifyHook. */
+function isHookChain(chain, w) {
+  const m = hookMetrics(chain, w);
+  return (m.maxTurnDeg >= TUNE.hookAngleDeg) && (m.signReversals <= TUNE.hookMaxReversals);
 }
 
 function convexHullArea(pts) {
@@ -3146,6 +3258,10 @@ export function presetStroke(name) {
   }
   if (name === 'stick') return [{ x: -0.9, y: 0 }, { x: 0.9, y: 0 }];
   if (name === 'hook') return [{ x: -0.2, y: -0.8 }, { x: -0.2, y: 0.4 }, { x: 0.5, y: 0.7 }, { x: 0.85, y: 0.2 }];
+  // a SHORT genuine ㄱ hook (single dominant bend, short reach ≈0.7) — proves the hook gate
+  // is by SHAPE not reach: this short hook CLIMBS the steep staircase while a long straight is
+  // blocked. ONE clean ~90° corner that curls ONE way (0 direction reversals) ⇒ a HOOK; not a scribble.
+  if (name === 'hook_short') return [{ x: 0.0, y: -0.5 }, { x: 0.0, y: 0.0 }, { x: 0.5, y: 0.0 }];
   if (name === 'limb') return [{ x: 0.0, y: 0.0 }, { x: 0.0, y: 0.55 }, { x: 0.45, y: 0.95 }];
   // §E: a LONGER demo/verify limb so the drawn leg reads as a real long stride
   // (more pronounced two-leg gait). Farthest sample ≈1.6 (clamps under LEG_REACH_MAX 1.7).

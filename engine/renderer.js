@@ -23,7 +23,7 @@ const COL = {
 const RIVAL_LANE_SIGN = -1;
 
 const RIBBON_DEPTH = 1.5;     // z-extrusion of the track — a THIN WINDING RIBBON like the reference (was 2.6, too wide; the cube now nearly fills the band width). lane offset / leg straddle / camera z are scaled to this below.
-const RIBBON_DOWN = 1.2;      // SLAB DEPTH below the surface — a THICK, DOTOOM slab like the reference (was 0.45, too thin). The width (z-depth RIBBON_DEPTH) stays NARROW; only this vertical slab thickness grew so the path reads as a chunky board. The ceiling ROOF track reuses the SAME value (consistent thickness).
+const RIBBON_DOWN = 0.8;      // SLAB DEPTH below the surface — a THINNER board like the reference (was 1.2, too chunky; the user asked for a slimmer track). The width (z-depth RIBBON_DEPTH 1.5) stays NARROW and UNCHANGED; only this vertical slab thickness shrank so the path reads as a slim plank, not a deep wall. The ceiling ROOF track + the rival lane reuse the SAME value (consistent thickness, all closed boxes).
 
 // ── SERPENTINE CURVE (render-only, §C) ──────────────────────────────────────
 // The original track snakes left/right as it recedes. We bend the WHOLE render
@@ -38,6 +38,15 @@ export function laneCurveZ(x) { return CURVE_AMP * Math.sin(x * CURVE_FREQ); }
 // verts; 0.5 keeps the continuous band smooth while staying draw-call cheap (one
 // mesh per lane). Stairs are sampled at their riser/tread edges on top of this.
 const RIBBON_DX = 0.5;
+
+// ── STRIPE TOP texture mapping (shared by the floor ribbon AND the tunnel roof so the
+//    band rhythm is identical on both). The stripe texture (see _makeStripes) has
+//    STRIPE_BANDS bands per repeat that alternate along the texture's U axis. We map
+//    U = worldX * RIBBON_USCALE, so a single band spans (1/RIBBON_USCALE)/STRIPE_BANDS
+//    world-x. With USCALE 0.42 and 2 bands/repeat ⇒ ≈1.19u per band → a clean transverse
+//    bar a touch wider than the 1.5u path width (the reference's calm striped look). ──
+const RIBBON_USCALE = 0.42;
+const STRIPE_BANDS = 2;          // bands per texture repeat (even ⇒ seamless wrap)
 
 // Two legs straddle the cube in DEPTH (z). The cube is ~1.08 deep; legs sit
 // just outside its faces so they clearly read as a left and a right leg.
@@ -96,14 +105,18 @@ export class Renderer {
     this._legMat = new THREE.MeshBasicMaterial({ color: COL.leg, side: THREE.DoubleSide });
 
     // ── SHARED TRACK MATERIALS / TEXTURE (built ONCE, reused on every buildTrack) ──
-    // The checker texture + the two track materials never change between rebuilds, so
+    // The stripe texture + the two track materials never change between rebuilds, so
     // making them once (instead of per buildTrack) removes a per-restart GPU
     // texture-upload + material-compile churn. The dispose paths skip these (kept).
-    this._checkerTex = this._makeChecker();
-    // TOP is UNLIT (MeshBasicMaterial): the checker top ignores scene lighting and
+    // STRIPES (was a checker): a calmer, cleaner reference look — TRANSVERSE bands that
+    // run ACROSS the path (perpendicular to travel), alternating two purple tones. The
+    // band colour changes along the path's U axis (forward x), so as the cube advances it
+    // crosses one band after another (a striped road), NOT a busy checker grid.
+    this._stripeTex = this._makeStripes();
+    // TOP is UNLIT (MeshBasicMaterial): the stripe top ignores scene lighting and
     // always renders at the texture's full vivid colour at ANY camera angle.
     // DoubleSide so the top face shows regardless of triangle winding.
-    this._topMat = new THREE.MeshBasicMaterial({ map: this._checkerTex, side: THREE.DoubleSide });
+    this._topMat = new THREE.MeshBasicMaterial({ map: this._stripeTex, side: THREE.DoubleSide });
     // The side/under/end faces of the CLOSED box. PERF (§B.2): FrontSide (default
     // back-face culling) — the box is FULLY CLOSED (near+far walls, bottom, AND first/
     // last end-caps), so every visible face has its outward winding and the back faces
@@ -325,17 +338,20 @@ export class Renderer {
     const half = RIBBON_DEPTH / 2;
 
     // Build a top strip (2 rails) + a bottom strip (2 rails, dropped RIBBON_DOWN) so
-    // we get a top face (check) and the two side walls + a bottom (edge colour).
+    // we get a top face (stripes) + the two side walls + a bottom (edge colour).
     const topPos = [], topUV = [], topIdx = [];
     const sidePos = [], sideIdx = [];
     let topV = 0, sideV = 0;
     let prevX = null;
     const N = xs.length;
-    // checker repeat: bigger cells (reference look). ~0.5 cell/world-u along x and
-    // ~0.85 cells across the (now THIN) band width (v 0→vRepeat) so each square stays
-    // roughly square on the narrower ribbon — not stretched into thin stripes.
-    const uScale = 0.42;
-    const vRepeat = 0.85;
+    // STRIPE mapping: the stripe texture has STRIPE_BANDS bands per repeat that change
+    // along the U axis (the path's FORWARD x). U = x*RIBBON_USCALE, so one band spans
+    // (1/RIBBON_USCALE)/STRIPE_BANDS ≈ 1.19u of world-x — a clean transverse rhythm (a
+    // band a touch under the 1.5u path width reads as the reference's chunky bars, not a
+    // busy grid). V is the across-path coord (0→1) — the stripes are CONSTANT in V (they
+    // run straight across the band), so vRepeat is just a single span.
+    const uScale = RIBBON_USCALE;
+    const vRepeat = 1;
     for (let i = 0; i < N; i++) {
       const x = xs[i];
       const ry = -surfY(x);                 // render y (up)
@@ -395,7 +411,7 @@ export class Renderer {
   /** Build the TUNNEL as a ROOF made of the SAME TRACK RIBBON laid OVERHEAD (the
    * reference's "low route on top" look) — NOT a front-facing box/bar you crash into.
    * Each tunnel renders as one extra ribbon segment, identical in appearance to the
-   * floor track (same purple checker top, same narrow width RIBBON_DEPTH, same thick
+   * floor track (same purple stripe top, same narrow width RIBBON_DEPTH, same thin
    * slab RIBBON_DOWN), but flipped so its UNDERSIDE sits exactly at the physics
    * ceilingY (the head-room gate, WYSIWYG). It rides the SAME lane centre + serpentine
    * curve as the floor track, so it sits DIRECTLY ABOVE the floor track (same z) and
@@ -406,15 +422,15 @@ export class Renderer {
    * Render-only — ceilingY is the physics gate; the gate logic is untouched.
    *
    * Geometry: I sample x across [x0,x1] (densified for the serpentine bend), put the
-   * checker TOP face at the slab's TOP (ceilingY − RIBBON_DOWN, i.e. render y =
+   * stripe TOP face at the slab's TOP (ceilingY − RIBBON_DOWN, i.e. render y =
    * -ceilingY + RIBBON_DOWN) and the slab walls/underside dropping down to the
-   * head-room line (render y = -ceilingY). So the bright checker is the visible top
+   * head-room line (render y = -ceilingY). So the bright stripe is the visible top
    * of the overhead board and the underside is the surface a long leg hits. */
   _buildCeilings(physics, laneZ, topMat, sideMat) {
     const ceils = physics.ceilingBodies;
     if (!ceils || !ceils.length) return;
     const half = RIBBON_DEPTH / 2;
-    const uScale = 0.42, vRepeat = 0.85;   // SAME checker mapping as the floor ribbon
+    const uScale = RIBBON_USCALE, vRepeat = 1;   // SAME stripe mapping as the floor ribbon
     for (const c of ceils) {
       // densify x across the tunnel span so the overhead board snakes with the lane.
       const xs = [];
@@ -423,9 +439,9 @@ export class Renderer {
       for (let k = 0; k <= n; k++) xs.push(c.x0 + span * (k / n));
 
       // The board's UNDERSIDE sits at the head-room line (render y = -ceilingY); its
-      // checker TOP is RIBBON_DOWN above that (same slab thickness as the floor track).
+      // stripe TOP is RIBBON_DOWN above that (same slab thickness as the floor track).
       const underRy = -c.ceilingY;          // underside (the surface a too-long leg hits)
-      const topRy = underRy + RIBBON_DOWN;   // bright checker top of the overhead board
+      const topRy = underRy + RIBBON_DOWN;   // bright stripe top of the overhead board
 
       const topPos = [], topUV = [], topIdx = [];
       const sidePos = [], sideIdx = [];
@@ -1024,6 +1040,38 @@ export class Renderer {
   }
 
   // ── procedural textures ──
+  /** TRANSVERSE STRIPE texture for the track top (replaces the old checker) — a calm,
+   * clean reference look: two purple TONES alternating in bands that run ACROSS the path
+   * (perpendicular to travel). The bands alternate along the texture's U axis (which we
+   * map to the path's forward x in _buildRibbon), so as the cube advances it crosses one
+   * band after another — a striped road, NOT a busy grid. Built ONCE (cached in the
+   * constructor) and reused on every buildTrack (no per-rebuild regeneration). Small
+   * (64×8 px): the stripe is 1-D along U, so width carries the bands and height is
+   * trivial; NEAREST filtering keeps the band edges crisp at any distance. The colours
+   * are the design-token track purples (--track-a #8E3AAE deep / --track-b #C24FD6
+   * bright), staying vivid + on-palette. */
+  _makeStripes() {
+    const c = document.createElement('canvas');
+    c.width = 64; c.height = 8;            // small (1-D stripe along U); cached once
+    const ctx = c.getContext('2d');
+    // STRIPE_BANDS bands across the texture width; each band is a flat purple tone. With
+    // an even band count the wrap is seamless (last band of one repeat ≠ first of the next
+    // only if odd, so we keep it even).
+    const bandW = c.width / STRIPE_BANDS;
+    const TONES = ['#8E3AAE', '#C24FD6'];  // --track-a (deep) ↔ --track-b (bright)
+    for (let i = 0; i < STRIPE_BANDS; i++) {
+      ctx.fillStyle = TONES[i % 2];
+      ctx.fillRect(Math.round(i * bandW), 0, Math.ceil(bandW), c.height);
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.magFilter = THREE.NearestFilter;   // crisp band edges (no muddy blur)
+    tex.minFilter = THREE.NearestFilter;   // and crisp at distance (avoid mip-averaging to a blob)
+    tex.generateMipmaps = false;
+    return tex;
+  }
+
   _makeChecker(n = 8) {
     const c = document.createElement('canvas');
     c.width = c.height = 128;
@@ -1084,10 +1132,10 @@ export class Renderer {
   }
 
   /** True for the SHARED textures (built once in the constructor, reused forever). The
-   * track checker is the only long-lived texture; the per-build face + finish-flag
+   * track stripe texture is the only long-lived texture; the per-build face + finish-flag
    * CanvasTextures are throwaway and MUST be disposed on rebuild (leak fix). */
   _isSharedTex(t) {
-    return t === this._checkerTex;
+    return t === this._stripeTex;
   }
 
   /** Dispose a material AND its (non-shared) textures. `material.dispose()` does NOT

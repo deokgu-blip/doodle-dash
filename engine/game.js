@@ -431,6 +431,10 @@ export class Game {
     this._renderAcc = this.RENDER_DT;   // render the very first frame immediately.
     const loop = (t) => {
       this._raf = requestAnimationFrame(loop);
+      // DEBUG OVERLAY (raf): feed EVERY rAF tick (before the render cap) so the overlay
+      // measures the TRUE display-refresh interval (120Hz ⇒ ~8.3ms) independent of how
+      // often we actually render (capped at 60fps). O(1); no behaviour effect.
+      if (this.debug) this.debug.raf(t);
       if (!this._lastT) this._lastT = t;
       let frame = t - this._lastT;
       this._lastT = t;

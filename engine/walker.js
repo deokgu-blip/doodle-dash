@@ -290,6 +290,18 @@ export class Physics {
     // advances with engine dt so the bob is deterministic + refresh-rate independent.
     this._idleFloat = false;
     this._idlePhase = 0;             // rad — idle bob sine phase (engine-time driven)
+
+    // ── PER-FRAME ALLOCATION SCRATCH (GC-pressure fix) ──
+    // The steady-running hot path (_supportDepth / _groundedCubeY / _nextRiser /
+    // _nextTunnel) used to allocate a fresh 2-element `offs` array and a `{x,...}`
+    // result object EVERY call (×1-3 per frame, ×player+rival, ×fixed sub-steps).
+    // At 120Hz that is thousands of throwaway objects/s feeding the young-gen GC —
+    // a likely source of the random mid-run hitch (a GC sweep landing on a frame).
+    // We REUSE these instance scratch objects: the two `offs` loops are now 2-case
+    // UNROLLED (no array), and the riser/tunnel scans WRITE INTO a reusable object
+    // (callers read the fields the same step ⇒ no aliasing). Byte-identical results.
+    this._riserHit = { found: false, x: 0, h: 0 };
+    this._tunnelHit = { found: false, x: 0, clearance: 0 };
   }
 
   reset() {
@@ -1003,14 +1015,21 @@ export class Physics {
   /** Find the next TUNNEL whose mouth (x0) lies in (fromX, toX]. Returns { x, clearance }
    * or null. The mouth is where a too-long leg is stopped (struggle-in-place). */
   _nextTunnel(fromX, toX) {
-    let best = null;
+    // REUSE a scratch result object (no per-frame {x,clearance} allocation). The
+    // caller (update) reads .x/.clearance THIS step before any other _nextTunnel
+    // call, so a single reused object is safe. `found` distinguishes "no tunnel" from
+    // a stale scratch. Byte-identical fields to the old freshly-allocated object.
+    let bestX = Infinity, bestClr = 0, any = false;
     for (const s of this._segs) {
       if (s.kind !== 'tunnel') continue;
       if (s.x0 > fromX && s.x0 <= toX) {
-        if (!best || s.x0 < best.x) best = { x: s.x0, clearance: s.clearance };
+        if (!any || s.x0 < bestX) { bestX = s.x0; bestClr = s.clearance; any = true; }
       }
     }
-    return best;
+    if (!any) { this._tunnelHit.found = false; return null; }
+    const h = this._tunnelHit;
+    h.found = true; h.x = bestX; h.clearance = bestClr;
+    return h;
   }
 
   /** Effective rolling radius for ω = v/r. This is the CONTACT foot's lever arm
@@ -1049,13 +1068,12 @@ export class Physics {
    * each step to FLOAT the body so the deepest contact just grazes the surface
    * (structural 0 penetration) — the bob falls straight out of this geometry. */
   _supportDepth(theta, tilt) {
-    let support = 0;
-    const offs = [0, this._legPhaseOffset];
-    for (const off of offs) {
-      const d = this._legSupportDepth(theta + off + (tilt || 0));
-      if (d > support) support = d;
-    }
-    return support;
+    // 2-CASE UNROLL (no `offs` array allocation — the two legs are 180° apart, i.e.
+    // phase offsets 0 and _legPhaseOffset). Byte-identical to the old max-over-[0,off].
+    const t = theta + (tilt || 0);
+    const d0 = this._legSupportDepth(t);
+    const d1 = this._legSupportDepth(t + this._legPhaseOffset);
+    return d0 > d1 ? d0 : d1;
   }
 
   /** EXACT GROUNDED PLACEMENT. Given the cube at forward x with the legs rotated by
@@ -1074,26 +1092,40 @@ export class Physics {
       const s = this.surfaceYAt(axleX);
       return (s == null) ? this._bodyY : s - (this._reach + LEG_LINE_RADIUS);
     }
-    const offs = [0, this._legPhaseOffset];
-    let bestY = null; // the LOWEST (most-negative, highest body) centreY that still grazes
-    for (const off of offs) {
-      const a = theta + off + (tilt || 0);
-      const ca = Math.cos(a), sa = Math.sin(a);
-      for (let i = 0; i < ch.length; i++) {
-        const rx = ch[i].x * ca - ch[i].y * sa;   // world offset from axle (x)
-        const ry = ch[i].x * sa + ch[i].y * ca;   // world offset from axle (y, +down)
-        const surfUnder = this.surfaceYAt(axleX + rx);
-        if (surfUnder == null) continue;
-        // centreY that puts THIS sample's bottom (ry + lineRadius) exactly on the
-        // surface under it: centreY = surfUnder − ry − lineRadius. The body must sit
-        // at the MIN such centreY (highest body) so NO sample dips below its surface.
-        const cY = surfUnder - ry - LEG_LINE_RADIUS;
-        if (bestY == null || cY < bestY) bestY = cY;
-      }
-    }
+    // 2-CASE UNROLL (no `offs` array): scan the chain at BOTH leg angles (offsets 0
+    // and _legPhaseOffset), tracking the LOWEST (most-negative, highest body) centreY
+    // that still grazes. Byte-identical to the old min-over-[0,off]×chain.
+    const t = theta + (tilt || 0);
+    const best0 = this._legGroundedCubeY(axleX, t, ch);
+    const best1 = this._legGroundedCubeY(axleX, t + this._legPhaseOffset, ch);
+    let bestY;
+    if (best0 == null) bestY = best1;
+    else if (best1 == null) bestY = best0;
+    else bestY = best0 < best1 ? best0 : best1;
     if (bestY == null) {
       const s = this.surfaceYAt(axleX);
       return (s == null) ? this._bodyY : s - (this._reach + LEG_LINE_RADIUS);
+    }
+    return bestY;
+  }
+
+  /** ONE leg's grounded-cube-Y candidate: the MIN centreY over its chain samples
+   * (rotated by world angle `a` about the axle) that still grazes the surface under
+   * each sample. Returns null if no sample is over a surface. Split out of
+   * _groundedCubeY so the two legs are scanned WITHOUT allocating an `offs` array. */
+  _legGroundedCubeY(axleX, a, ch) {
+    const ca = Math.cos(a), sa = Math.sin(a);
+    let bestY = null;
+    for (let i = 0; i < ch.length; i++) {
+      const rx = ch[i].x * ca - ch[i].y * sa;   // world offset from axle (x)
+      const ry = ch[i].x * sa + ch[i].y * ca;   // world offset from axle (y, +down)
+      const surfUnder = this.surfaceYAt(axleX + rx);
+      if (surfUnder == null) continue;
+      // centreY that puts THIS sample's bottom (ry + lineRadius) exactly on the
+      // surface under it: centreY = surfUnder − ry − lineRadius. The body must sit
+      // at the MIN such centreY (highest body) so NO sample dips below its surface.
+      const cY = surfUnder - ry - LEG_LINE_RADIUS;
+      if (bestY == null || cY < bestY) bestY = cY;
     }
     return bestY;
   }
@@ -1462,21 +1494,27 @@ export class Physics {
    * Returns { x, h } or null. A riser is the boundary where the surface JUMPS UP
    * (topY decreases) between adjacent segments. */
   _nextRiser(fromX, toX) {
-    let best = null;
+    // REUSE a scratch result object (no per-frame {x,h} allocation). The caller
+    // (update) reads .x/.h THIS step before any other _nextRiser call, so a single
+    // reused object is safe. Byte-identical fields to the old freshly-allocated one.
+    let bestX = Infinity, bestH = 0, any = false;
     for (const s of this._segs) {
       if (s.kind === 'stairs' && s.stepH > 0) {
         // the riser sits at the LEFT edge of a stairs tread (x0).
         if (s.x0 > fromX && s.x0 <= toX) {
-          if (!best || s.x0 < best.x) best = { x: s.x0, h: s.stepH };
+          if (!any || s.x0 < bestX) { bestX = s.x0; bestH = s.stepH; any = true; }
         }
       } else if (s.kind === 'wall' && s.stepH > 0) {
         const rx = (s.x0 + s.x1) / 2;
         if (rx > fromX && rx <= toX) {
-          if (!best || rx < best.x) best = { x: rx, h: s.stepH };
+          if (!any || rx < bestX) { bestX = rx; bestH = s.stepH; any = true; }
         }
       }
     }
-    return best;
+    if (!any) { this._riserHit.found = false; return null; }
+    const h = this._riserHit;
+    h.found = true; h.x = bestX; h.h = bestH;
+    return h;
   }
 
   /** Recompute both legs' world transform + parts from the current cube + phase.

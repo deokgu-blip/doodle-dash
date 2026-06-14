@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'} SegmentKind
  */
 
 /**
@@ -20,6 +20,10 @@
  * @property {number} [depth]          GAP only: how deep the V-trench bottom drops below the lip
  * @property {number} [amp]            BUMPS only: half-amplitude of the sine surface (peak-to-trough = 2*amp)
  * @property {number} [freq]           BUMPS only: number of full sine periods over the segment length
+ * @property {number} [clearance]      TUNNEL only: the LOW CEILING's max passable leg reach. A leg passes
+ *                                     iff reach <= clearance (the LONGER the leg, the more it strikes the
+ *                                     ceiling). Smaller clearance ⇒ only shorter legs fit. The inverse of
+ *                                     a WALL (which needs a LONG leg). Default SEGMENT_DEFAULTS.tunnelClearance.
  * @property {number} [rough]          0..1 friction (rough floor), default 0.6
  * @property {number} [bouncy]         0..1 restitution (rubber), default 0
  */
@@ -60,10 +64,14 @@ export const RIVAL_DEFAULTS = Object.freeze({
 export const SEGMENT_DEFAULTS = Object.freeze({
   rough: 0.6,
   bouncy: 0.0,
+  // TUNNEL: default LOW-CEILING max passable reach. A leg passes iff reach <= this.
+  // The walls require reach >= ~1.15 (Rw), so a tunnel clearance below that makes the
+  // two gimmicks MUTUALLY EXCLUSIVE — no single reach passes both (see walker.js TUNE).
+  tunnelClearance: 0.95,
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel'];
 
 /** @type {LegPreset[]} */
 export const LEG_PRESETS = ['wheel', 'stick', 'hook'];
@@ -109,6 +117,12 @@ export function validateTrack(t) {
     if (s.kind === 'bumps') {
       if (!(s.amp > 0)) throw new Error(`segment[${i}] bumps needs amp>0`);
       if (!(s.freq > 0)) throw new Error(`segment[${i}] bumps needs freq>0`);
+    }
+    if (s.kind === 'tunnel') {
+      // a TUNNEL is a low-ceiling stretch gated by leg reach. clearance is optional
+      // (falls back to SEGMENT_DEFAULTS.tunnelClearance); if given it must be positive.
+      if (s.clearance != null && !(s.clearance > 0))
+        throw new Error(`segment[${i}] tunnel clearance must be > 0`);
     }
   });
   if (t.rival != null) {

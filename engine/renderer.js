@@ -143,6 +143,11 @@ export class Renderer {
     // (winding) are solved in one builder. Physics x is untouched.
     this._buildRibbon(physics, 0, topMat, sideMat);
     if (rivalSpec) this._buildRibbon(physics, this.rivalLaneZ, topMat, sideMat);
+
+    // TUNNEL low ceilings — a visible bar/slab hanging over the floor so the player
+    // reads it as a "low passage" only short legs fit through. One per lane.
+    this._buildCeilings(physics, 0);
+    if (rivalSpec) this._buildCeilings(physics, this.rivalLaneZ);
     this.scene.add(this.trackGroup);
 
     // ── player cube ──
@@ -272,13 +277,70 @@ export class Renderer {
     topGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(topUV), 2));
     topGeo.setIndex(topIdx);
     topGeo.computeVertexNormals();
-    this.trackGroup.add(new THREE.Mesh(topGeo, topMat));
+    const topMesh = new THREE.Mesh(topGeo, topMat);
+    topMesh.userData.ribbon = true;
+    this.trackGroup.add(topMesh);
 
     const sideGeo = new THREE.BufferGeometry();
     sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
     sideGeo.setIndex(sideIdx);
     sideGeo.computeVertexNormals();
-    this.trackGroup.add(new THREE.Mesh(sideGeo, sideMat));
+    const sideMesh = new THREE.Mesh(sideGeo, sideMat);
+    sideMesh.userData.ribbon = true;
+    this.trackGroup.add(sideMesh);
+  }
+
+  /** Build the TUNNEL low ceilings for a lane: each tunnel's ceiling is a thick BAR
+   * hanging at physics ceilingY (render y = -ceilingY) over the floor span, plus two
+   * end POSTS dropping to the floor so it clearly reads as a "low passage / doorway"
+   * in the side camera (a leg that is too long strikes this bar at the mouth). The bar
+   * uses the purple checker top + dark edge sides (palette-consistent with the track),
+   * tinted a touch darker so it reads as an obstacle, not more path. Render-only. */
+  _buildCeilings(physics, laneZ) {
+    const ceils = physics.ceilingBodies;
+    if (!ceils || !ceils.length) return;
+    const half = RIBBON_DEPTH / 2;
+    const barMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.7, metalness: 0.05 });
+    const faceMat = new THREE.MeshBasicMaterial({ color: 0xC24FD6 });   // bright lilac underside (visible, palette)
+    const postMat = new THREE.MeshStandardMaterial({ color: 0x5E2480, roughness: 0.8 });
+    for (const c of ceils) {
+      const len = c.x1 - c.x0;
+      const cx = (c.x0 + c.x1) / 2;
+      const cz = laneZ + laneCurveZ(cx);
+      const ry = -c.ceilingY;            // render y of the ceiling underside region
+      const BAR_H = 0.55;                // bar thickness (reads as a solid lintel)
+      // the ceiling BAR (a box spanning the tunnel, sitting at the ceiling level).
+      const bar = new THREE.Mesh(
+        new THREE.BoxGeometry(len, BAR_H, RIBBON_DEPTH * 1.05),
+        barMat
+      );
+      bar.position.set(cx, ry + BAR_H / 2, cz);
+      this.trackGroup.add(bar);
+      // a bright underside plane so the low ceiling reads clearly from the side cam.
+      const under = new THREE.Mesh(
+        new THREE.PlaneGeometry(len, RIBBON_DEPTH * 1.05),
+        faceMat
+      );
+      under.rotation.x = Math.PI / 2;    // face down
+      under.position.set(cx, ry - 0.001, cz);
+      this.trackGroup.add(under);
+      // end POSTS: thin pillars from the bar down toward the floor at each mouth, so the
+      // gimmick reads as a doorway. They stop short of the floor (the gap the cube walks
+      // through) so they don't look like a wall.
+      const floorRy = -c.floorY;
+      const postTopRy = ry;
+      const postBottomRy = floorRy + (postTopRy - floorRy) * 0.32; // leave the lower ~1/3 open
+      const postH = Math.max(0.2, postTopRy - postBottomRy);
+      for (const px of [c.x0, c.x1]) {
+        const pz = laneZ + laneCurveZ(px);
+        const post = new THREE.Mesh(
+          new THREE.BoxGeometry(0.28, postH, RIBBON_DEPTH * 1.05),
+          postMat
+        );
+        post.position.set(px, postBottomRy + postH / 2, pz);
+        this.trackGroup.add(post);
+      }
+    }
   }
 
   /** Build a smiley character cube (body colour + face colour) with a dot-eye
@@ -653,7 +715,10 @@ export class Renderer {
    * ⇒ a small fixed count: per lane 1 top + 1 side, plus finish poles/flags — NOT
    * one slab per segment), and a few serpentine-curve z samples (evidence §B/§C). */
   ribbonInfo(physics) {
-    const meshes = this.trackGroup ? this.trackGroup.children.filter((c) => c.isMesh).length : 0;
+    // count only the continuous RIBBON meshes (top+side per lane) — NOT the tunnel
+    // ceilings / finish flags (those are separate obstacle/marker geometry, not the
+    // band-continuity evidence the §B assertion is about).
+    const meshes = this.trackGroup ? this.trackGroup.children.filter((c) => c.isMesh && c.userData.ribbon).length : 0;
     const x0 = physics ? physics.startX : 0, x1 = physics ? physics.finishX : 1;
     const samples = [];
     for (let k = 0; k <= 8; k++) {

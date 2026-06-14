@@ -111,6 +111,18 @@ const TUNE = {
   // clears them all. maxClimb(0.6)=0.30, maxClimb(1.05)=0.75, maxClimb(1.7)=1.40.
   climbBase: 0.30,       // a reach of 0.30+ clears an infinitesimal lip
   climbK: 1.0,           // each +1 unit of step height needs +1.0 reach
+  // ── TUNNEL RULE (the INVERSE of the climb/wall rule) ──
+  // A LOW CEILING segment blocks a leg whose REACH is too long: the rotating leg
+  // (radius ≈ reach about the axle) sweeps UP and strikes the ceiling. So a tunnel
+  // passes iff reach <= tunnelMaxReach(clearance). The WALL rule needs reach >= ~Rw
+  // (0.30 + wallHeight); we keep wall heights so Rw > the tunnel clearance band, so
+  // NO single reach passes BOTH a wall and a tunnel (mutually-exclusive gimmicks —
+  // the user MUST redraw long↔short). tunnelClearanceDefault is the fallback ceiling
+  // when a segment omits `clearance`. tunnelEnterGap = how far ahead of the ceiling a
+  // too-long leg is stopped (so the leg visibly hits the ceiling mouth, struggling).
+  tunnelClearanceDefault: 0.95, // max passable reach when a tunnel omits `clearance`
+  tunnelEnterGap: 0.30,         // world-u — stop a too-long leg this far before the ceiling start
+  tunnelCeilLift: 0.06,         // world-u — render the ceiling this far ABOVE (reach+r) of the max passable leg so a passing leg never punches it
   // body — the cube centre floats so the foot tip just GRAZES the surface at the
   // bottom of its circular sweep and is ABOVE everywhere else (structural 0
   // penetration). clearance = (max chain distance from axle) + lineRadius + bob
@@ -189,6 +201,7 @@ export class Physics {
     this.cube = null;                // { position:{x,y}, angle, velocity:{x,y} }
     this.legs = [];                  // [{ body, side, chain, pinLocal, lineRadius, ... }]
     this.floorBodies = [];           // render slabs ({ bounds, position, _dcTopY, label })
+    this.ceilingBodies = [];         // TUNNEL low-ceiling render bars ({ x0,x1, ceilingY, floorY, clearance })
     this.legDrawn = false;
     this.startX = 0;
     this.finishX = 1;
@@ -207,6 +220,7 @@ export class Physics {
     this._legPhaseOffset = Math.PI;  // second leg is 180° out of phase
     this._blocked = false;           // true when stopped at an unclimbable step
     this._blockedByRiser = false;    // §C: blocked specifically by a riser (climb) — legs keep trying
+    this._blockedByTunnel = false;   // blocked specifically by a low ceiling (too-long leg) — legs keep trying
     this._trying = false;            // §C: true while struggling in place (legs churn, x≈0)
     this._vx = 0;                    // last realized forward speed (u/s)
     this._vTip = 0;                  // last foot tip linear speed (u/s)
@@ -243,11 +257,13 @@ export class Physics {
     this.cube = null;
     this.legs = [];
     this.floorBodies = [];
+    this.ceilingBodies = [];
     this.legDrawn = false;
     this._exploded = false;
     this._segs = [];
     this._blocked = false;
     this._blockedByRiser = false;
+    this._blockedByTunnel = false;
     this._trying = false;
     this._vx = 0;
     this._vTip = 0;
@@ -426,6 +442,39 @@ export class Physics {
         }
         cursorX += len;
         // surfaceY unchanged (whole periods ⇒ ends at baseY).
+      } else if (seg.kind === 'tunnel') {
+        // TUNNEL = a flat FLOOR stretch with a LOW CEILING above it (the inverse of a
+        // WALL). The floor is a normal flat surface (the cube walks it). The ceiling is
+        // a low bar gated by leg reach: a leg passes iff reach <= clearance. A too-long
+        // leg's rotating sweep (radius ≈ reach about the axle) would strike the ceiling,
+        // so the walker is BLOCKED at the tunnel MOUTH (struggle-in-place, no advance) —
+        // the user must redraw a SHORTER leg. A short leg passes under with headroom.
+        const clearance = (seg.clearance != null) ? seg.clearance : SEGMENT_DEFAULTS.tunnelClearance;
+        const tx0 = cursorX, tx1 = cursorX + len;
+        // CAPTURE the floor level in a per-segment CONST. `surfaceY` is a mutating loop
+        // variable; a closure over it would read the FINAL surface (after later ramps),
+        // so the tunnel floor would wrongly sample the end-of-track height (same closure
+        // bug the stairs `treadY` const fixes). Freeze it here.
+        const floorY = surfaceY;
+        // floor render slab (same look as a flat).
+        addSlab(tx0 + len / 2, floorY, len, thick);
+        // CEILING world-y (physics +down ⇒ smaller y is higher). The leg pivots about
+        // the cube CENTRE (axle) and sweeps a FULL circle of radius ≈ reach+lineRadius,
+        // so its TOPMOST point rises reach+r ABOVE the axle. The axle itself floats
+        // ≈ reach+r above the floor (vertical-plant support). So a leg of reach R reaches
+        // ≈ 2·(R+r) above the floor at the top of its sweep. We anchor the ceiling just
+        // ABOVE the LONGEST passable leg (reach==clearance): 2·(clearance+r) + a small
+        // lift, so that leg clears it with headroom and ANY longer leg strikes it. Render
+        // + gate share this ceilingY (WYSIWYG: the bar you see is the bar you hit).
+        const ceilGapAboveFloor = 2 * (clearance + LEG_LINE_RADIUS) + TUNE.tunnelCeilLift;
+        const ceilingY = floorY - ceilGapAboveFloor; // up = negative y
+        this._segs.push({ x0: tx0, x1: tx1, kind: 'tunnel', topYa: floorY, topYb: floorY,
+          clearance, ceilingY, surfFn: () => floorY });
+        if (floorY < this._maxSurfaceTopY) this._maxSurfaceTopY = floorY;
+        // record the ceiling as a render body (a low bar the renderer draws as an obstacle).
+        this.ceilingBodies.push({ x0: tx0, x1: tx1, ceilingY, floorY, clearance });
+        cursorX += len;
+        // surfaceY unchanged (flat floor through the tunnel).
       }
     }
 
@@ -567,6 +616,38 @@ export class Physics {
     if (yR == null || yL == null) return this._angle;   // over a gap — hold current lean
     const slope = (yR - yL) / (2 * dx);                 // physics slope (+down)
     return clampMag(Math.atan(slope) * TUNE.tiltGain, TUNE.tiltMax);
+  }
+
+  /** TUNNEL ceiling y (physics +down) at px, or null if no ceiling there. A passing
+   * (short) leg's topmost point must stay BELOW (>=) this (no ceiling penetration). */
+  ceilingYAt(px) {
+    for (const s of this._segs) {
+      if (s.kind !== 'tunnel') continue;
+      if (px < s.x0 || px > s.x1) continue;
+      return s.ceilingY;
+    }
+    return null;
+  }
+
+  /** Smallest clearance of any leg point BELOW the tunnel ceiling above it (world u).
+   * >0 ⇒ the leg stays under the ceiling (clearance), <0 ⇒ a point punched through the
+   * ceiling (penetration). null if not under any ceiling. For the TUNNEL no-penetration
+   * verification (a passing short leg must never strike the ceiling). */
+  ceilingClearance() {
+    if (!this.legs.length || !this.cube) return null;
+    let closest = Infinity;
+    for (const l of this.legs) {
+      for (let i = 1; i < l.body.parts.length; i++) {
+        const p = l.body.parts[i];
+        const cy = this.ceilingYAt(p.position.x);
+        if (cy == null) continue;
+        // ceiling is ABOVE (smaller y); the leg point's TOP is p.y − lineRadius. clearance
+        // below the ceiling = (top of leg point) − ceilingY  (>0 ⇒ leg is below ceiling).
+        const gap = (p.position.y - l.lineRadius) - cy;
+        if (gap < closest) closest = gap;
+      }
+    }
+    return closest === Infinity ? null : closest;
   }
 
   /** Local segment under px (for terrain / climb decisions). */
@@ -773,6 +854,27 @@ export class Physics {
     return reach >= TUNE.climbBase + TUNE.climbK * h;
   }
 
+  /** TUNNEL gate (the INVERSE of canClimb): a low ceiling of `clearance` passes a leg
+   * iff its REACH is short enough (the rotating leg of radius ≈ reach would otherwise
+   * strike the ceiling). reach <= clearance ⇒ pass; longer ⇒ BLOCKED at the mouth. */
+  canPassTunnel(reach, clearance) {
+    const c = (clearance != null) ? clearance : TUNE.tunnelClearanceDefault;
+    return reach <= c;
+  }
+
+  /** Find the next TUNNEL whose mouth (x0) lies in (fromX, toX]. Returns { x, clearance }
+   * or null. The mouth is where a too-long leg is stopped (struggle-in-place). */
+  _nextTunnel(fromX, toX) {
+    let best = null;
+    for (const s of this._segs) {
+      if (s.kind !== 'tunnel') continue;
+      if (s.x0 > fromX && s.x0 <= toX) {
+        if (!best || s.x0 < best.x) best = { x: s.x0, clearance: s.clearance };
+      }
+    }
+    return best;
+  }
+
   /** Effective rolling radius for ω = v/r. This is the CONTACT foot's lever arm
    * (== the body clearance == the distance from the axle/centre down to the foot
    * at the bottom of the sweep). Using exactly this makes the planted foot's world
@@ -912,10 +1014,28 @@ export class Physics {
       let terrain = 1;
       this._blocked = false;
       this._blockedByRiser = false;  // §C: a CLIMB block (vs a gap) ⇒ legs keep trying
+      this._blockedByTunnel = false; // a LOW-CEILING block (too-long leg) ⇒ legs keep trying
 
-      // climb rule: if a stairs/wall step lies just ahead, gate on reach.
+      // climb rule: if a stairs/wall step lies just ahead, gate on reach (LONG leg needed).
       const riser = this._nextRiser(this._x, lookX + 0.5);
-      if (riser && !this.canClimb(reach, riser.h)) {
+      // tunnel rule (INVERSE): if a low-ceiling mouth lies just ahead, gate on reach
+      // (SHORT leg needed). A too-long leg's rotating sweep strikes the ceiling, so we
+      // stop it at the mouth (struggle-in-place), the user must redraw shorter.
+      const tunnel = this._nextTunnel(this._x, lookX + 0.5);
+      const tunnelBlocks = tunnel && !this.canPassTunnel(reach, tunnel.clearance);
+      // whichever gate's stop-point comes FIRST along x wins (so a wall just before a
+      // tunnel, or vice-versa, blocks at the nearer obstacle).
+      const riserStopX = (riser && !this.canClimb(reach, riser.h)) ? (riser.x - CUBE_SIZE * 0.5) : Infinity;
+      const tunnelStopX = tunnelBlocks ? (tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap) : Infinity;
+      if (tunnelBlocks && tunnelStopX <= riserStopX) {
+        // BLOCKED by the low ceiling: stop just before the tunnel mouth. The leg is too
+        // long — it churns in place (struggle) and makes NO net forward progress until a
+        // SHORTER leg is drawn (canPassTunnel). No artificial advance, not a soft-lock.
+        v = 0;
+        this._blocked = true;
+        this._blockedByTunnel = true;
+        if (this._x > tunnelStopX) this._x = tunnelStopX;
+      } else if (riser && !this.canClimb(reach, riser.h)) {
         // blocked: stop just before the riser.
         v = 0;
         this._blocked = true;
@@ -1026,10 +1146,11 @@ export class Physics {
       this._theta += omega * dt;
       this._vTip = omega * ryContact; // == v_surface at a plant (planted foot stationary)
       this._trying = false;
-    } else if (drive && this._blockedByRiser && this._reach > CUBE_SIZE * 0.5) {
-      // §C: struggle in place. Spin at the cadence the leg would have if walking on
-      // the flat (vNatural/effR) so the churn looks like a real walking effort. The
-      // body x does NOT advance (v stays 0) — the foot slips on the riser.
+    } else if (drive && (this._blockedByRiser || this._blockedByTunnel) && this._reach > CUBE_SIZE * 0.5) {
+      // §C: struggle in place (riser climb OR low-ceiling tunnel). Spin at the cadence
+      // the leg would have if walking on the flat (vNatural/effR) so the churn looks like
+      // a real walking effort. The body x does NOT advance (v stays 0) — the foot slips
+      // against the wall (riser) or the leg keeps spinning into the low ceiling (tunnel).
       const vNat = TUNE.baseSpeed * this.legSpeedFactor(this._reach) * this.paceFactor;
       const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
       omega = vNat / ryContact;
@@ -1227,6 +1348,10 @@ export class Physics {
    * the bob-free base; ≥ 0). Exposed for the verifier's (J) bob-amplitude report. */
   get bob() { return this._bob || 0; }
   get trying() { return !!this._trying; }
+  /** True while blocked specifically by a low ceiling (a too-long leg at a tunnel mouth). */
+  get blockedByTunnel() { return !!this._blockedByTunnel; }
+  /** True while blocked specifically by a riser (a too-short leg at a wall/stairs step). */
+  get blockedByRiser() { return !!this._blockedByRiser; }
   /** True while the walker is in a ballistic flight (off the ground at a crest). */
   get airborne() { return !!this._air; }
   /** Vertical velocity (physics +down; up = negative) — non-zero only while airborne. */

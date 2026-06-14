@@ -83,7 +83,15 @@ export class Game {
 
   /** Build the rival walker for the current track (no-op if no rival). The rival
    * gets its OWN buildTrack (independent surface model) + a fixed designed leg
-   * preset + a pace multiplier so it is "competitive" but tunable from data. */
+   * preset + a pace multiplier so it is "competitive" but tunable from data.
+   *
+   * ADAPTIVE RIVAL (leg-swap-by-x): because the course now alternates WALL/GAP/stairs
+   * (need a LONG leg) with TUNNEL (need a SHORT leg) — mutually exclusive — NO single
+   * leg can finish. So the rival (BOLT) must REDRAW its leg per zone, exactly like the
+   * player. We build an x-scheduled list of (untilX → preset) from the track segments:
+   * a SHORT preset just before each tunnel, a LONG preset before each wall/gap/stairs.
+   * The rival then swaps presets as it crosses each threshold (mid-run, continue branch
+   * — no teleport), so it completes the course and the race stays a real contest. */
   _setupRival() {
     const spec = this.track.rival
       ? { ...RIVAL_DEFAULTS, ...this.track.rival }
@@ -92,8 +100,79 @@ export class Game {
     if (!spec) { this.state.rivalProgress = 0; return; }
     this.rival.buildTrack(this.track);
     this.rival.paceFactor = spec.pace;
-    this.rival.setLegStroke(presetStroke(spec.legPreset));
+    this._rivalSchedule = this._buildRivalSchedule();
+    this._rivalLegIdx = -1;
+    this._applyRivalLegForX(this.rival.bodyX, true); // fresh first leg
     this.state.rivalProgress = this.rival.progress;
+  }
+
+  /** Build the rival's leg-swap-by-x schedule from the segment model. Each entry is
+   * { x, preset }: AT (and after) x the rival uses `preset`, until the next entry. We
+   * place a SHORT leg ('short') a little BEFORE each tunnel mouth and a LONG leg
+   * ('long') a little before each wall/gap/stairs gate (and at the very start). The
+   * presets are chosen so 'short'.reach (~0.73) passes every tunnel (clearance>=0.85)
+   * and 'long'.reach (~1.7) clears every wall/gap/stairs. The schedule is derived from
+   * the DATA (segment kinds + their x ranges), never hardcoded x values. */
+  _buildRivalSchedule() {
+    const segs = this.rival._segs || [];
+    if (!segs.length) return [{ x: -Infinity, preset: 'long' }];
+    // collect gate windows with their kind. tunnels need SHORT; wall/gap/stairs need LONG.
+    const gates = [];
+    const seen = new Set();
+    for (const s of segs) {
+      const key = s.kind + ':' + Math.round(s.x0 * 100);
+      if (s.kind === 'tunnel') gates.push({ x: s.x0, need: 'short' });
+      else if (s.kind === 'wall') gates.push({ x: s.x0, need: 'long' });
+      else if (s.kind === 'gap') gates.push({ x: s.x0, need: 'long' });
+      else if (s.kind === 'stairs' && !seen.has('stairsrun')) {
+        // first tread of a stairs run only (treads abut) — gate once per run.
+        gates.push({ x: s.x0, need: 'long' });
+      }
+    }
+    // also gate each stairs RUN once (group abutting treads) — replace the naive add.
+    // Rebuild cleanly: scan and group stairs.
+    gates.length = 0;
+    let prevStairX1 = -Infinity;
+    for (const s of segs) {
+      if (s.kind === 'tunnel') gates.push({ x: s.x0, need: 'short' });
+      else if (s.kind === 'wall' || s.kind === 'gap') gates.push({ x: s.x0, need: 'long' });
+      else if (s.kind === 'stairs') {
+        if (s.x0 > prevStairX1 + 0.05) gates.push({ x: s.x0, need: 'long' });
+        prevStairX1 = s.x1;
+      }
+    }
+    gates.sort((a, b) => a.x - b.x);
+    // build the schedule: switch to the gate's required preset SWITCH_LEAD before its x
+    // (so the rival has the right leg AT the gate). Start with a LONG leg (the start zone
+    // before the first gate typically wants to reach a wall/gap). Collapse consecutive
+    // equal presets.
+    const SWITCH_LEAD = 2.5; // world u before the gate to have swapped (clears countdown jitter)
+    const presetFor = (need) => (need === 'short' ? 'short' : 'long');
+    const out = [{ x: -Infinity, preset: 'long' }];
+    for (const gate of gates) {
+      const p = presetFor(gate.need);
+      const last = out[out.length - 1];
+      if (last.preset === p) continue;          // already on the right leg
+      out.push({ x: gate.x - SWITCH_LEAD, preset: p });
+    }
+    return out;
+  }
+
+  /** Apply the scheduled rival leg for forward position x (swaps when crossing the
+   * next threshold). `fresh` forces a fresh placement (start). Uses the continue
+   * branch otherwise so a mid-run swap never teleports the rival. */
+  _applyRivalLegForX(x, fresh = false) {
+    if (!this._rivalSchedule || !this._rivalSchedule.length) return;
+    // find the latest schedule entry whose x <= current x.
+    let idx = 0;
+    for (let i = 0; i < this._rivalSchedule.length; i++) {
+      if (this._rivalSchedule[i].x <= x) idx = i; else break;
+    }
+    if (idx === this._rivalLegIdx && !fresh) return; // no change
+    this._rivalLegIdx = idx;
+    const preset = this._rivalSchedule[idx].preset;
+    this.rival.setLegStroke(presetStroke(preset), fresh ? { fresh: true } : {});
+    if (this.renderer) this.renderer.rebuildRivalLegs(this.rival);
   }
 
   // ── leg input ──
@@ -198,8 +277,11 @@ export class Game {
       if (s.countdownMs <= 0) this._enterPhase('running');
     } else if (s.phase === 'running') {
       s.timeMs += dt;
-      // RACE: both walkers advance every step. The rival is autonomous (its leg
-      // is already set), the player is driven by the drawn leg.
+      // RACE: both walkers advance every step. The rival is autonomous; it SWAPS its
+      // leg per the x-schedule (long↔short) as it crosses each gate so it can clear both
+      // the long-required (wall/gap/stairs) and short-required (tunnel) gimmicks. The
+      // player is driven by the user's drawn leg.
+      if (hasRival) this._applyRivalLegForX(this.rival.bodyX);
       this.physics.update(dt, true);
       if (hasRival) this.rival.update(dt, true);
       s.bodyX = this.physics.bodyX;
@@ -339,7 +421,9 @@ export class Game {
     if (!this.rivalSpec) { this.state.rivalProgress = 0; return; }
     this.rival.buildTrack(this.track);
     this.rival.paceFactor = this.rivalSpec.pace;
-    this.rival.setLegStroke(presetStroke(this.rivalSpec.legPreset));
+    this._rivalSchedule = this._buildRivalSchedule();
+    this._rivalLegIdx = -1;
+    this._applyRivalLegForX(this.rival.bodyX, true);
     this.state.rivalProgress = this.rival.progress;
   }
 }

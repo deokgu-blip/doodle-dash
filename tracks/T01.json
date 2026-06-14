@@ -2,35 +2,46 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 239,
+  "finishX": 232,
   "segments": [
     {
       "kind": "flat",
-      "length": 12,
+      "length": 10,
       "rough": 0.9
     },
     {
       "kind": "bumps",
-      "length": 12,
+      "length": 10,
       "amp": 0.45,
       "freq": 2.5,
       "rough": 0.9
     },
     {
       "kind": "flat",
-      "length": 3,
+      "length": 4,
       "rough": 0.9
     },
     {
-      "kind": "ramp",
-      "length": 7,
-      "height": 3.5,
+      "kind": "wall",
+      "length": 1,
+      "height": 0.95,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 4,
       "rough": 0.9
     },
     {
       "kind": "ramp",
       "length": 6,
-      "height": -4,
+      "height": 3,
+      "rough": 0.9
+    },
+    {
+      "kind": "ramp",
+      "length": 6,
+      "height": -3,
       "rough": 0.9
     },
     {
@@ -41,7 +52,120 @@
     },
     {
       "kind": "flat",
+      "length": 6,
+      "rough": 0.9
+    },
+    {
+      "kind": "tunnel",
+      "length": 8,
+      "clearance": 0.95,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 6,
+      "rough": 0.9
+    },
+    {
+      "kind": "bumps",
+      "length": 10,
+      "amp": 0.5,
+      "freq": 3,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
       "length": 4,
+      "rough": 0.9
+    },
+    {
+      "kind": "stairs",
+      "length": 7,
+      "height": 2.2,
+      "steps": 4,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 4,
+      "rough": 0.9
+    },
+    {
+      "kind": "wall",
+      "length": 1,
+      "height": 1.0,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 5,
+      "rough": 0.9
+    },
+    {
+      "kind": "ramp",
+      "length": 6,
+      "height": -3.5,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 5,
+      "rough": 0.9
+    },
+    {
+      "kind": "tunnel",
+      "length": 9,
+      "clearance": 0.85,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 6,
+      "rough": 0.9
+    },
+    {
+      "kind": "gap",
+      "width": 9,
+      "depth": 4.5,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 5,
+      "rough": 0.9
+    },
+    {
+      "kind": "bumps",
+      "length": 10,
+      "amp": 0.5,
+      "freq": 3,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 4,
+      "rough": 0.9
+    },
+    {
+      "kind": "wall",
+      "length": 1,
+      "height": 0.95,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 5,
+      "rough": 0.9
+    },
+    {
+      "kind": "tunnel",
+      "length": 8,
+      "clearance": 0.95,
+      "rough": 0.9
+    },
+    {
+      "kind": "flat",
+      "length": 6,
       "rough": 0.9
     },
     {
@@ -53,170 +177,13 @@
     },
     {
       "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "ramp",
-      "length": 5,
-      "height": -3.6,
-      "rough": 0.9
-    },
-    {
-      "kind": "bumps",
-      "length": 13,
-      "amp": 0.55,
-      "freq": 3,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "wall",
-      "length": 1,
-      "height": 1.1,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "ramp",
-      "length": 6,
-      "height": 4.5,
-      "rough": 0.9
-    },
-    {
-      "kind": "ramp",
-      "length": 7,
-      "height": -5.5,
-      "rough": 0.9
-    },
-    {
-      "kind": "gap",
-      "width": 11,
-      "depth": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "stairs",
-      "length": 8,
-      "height": 2.6,
-      "steps": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "wall",
-      "length": 1,
-      "height": 1.35,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "bumps",
-      "length": 14,
-      "amp": 0.6,
-      "freq": 3.5,
-      "rough": 0.9
-    },
-    {
-      "kind": "ramp",
-      "length": 6,
-      "height": -4.2,
-      "rough": 0.9
-    },
-    {
-      "kind": "gap",
-      "width": 9,
-      "depth": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "stairs",
-      "length": 6,
-      "height": 2,
-      "steps": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "ramp",
-      "length": 8,
-      "height": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "ramp",
-      "length": 9,
-      "height": -6.2,
-      "rough": 0.9
-    },
-    {
-      "kind": "gap",
-      "width": 12,
-      "depth": 5.5,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "wall",
-      "length": 1,
-      "height": 1.3,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "bumps",
-      "length": 12,
-      "amp": 0.55,
-      "freq": 3,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
       "length": 14,
       "rough": 0.9
     }
   ],
   "rival": {
     "legPreset": "limb_long",
-    "pace": 0.93,
+    "pace": 0.95,
     "laneOffset": 4.5,
     "name": "BOLT"
   }

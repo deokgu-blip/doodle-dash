@@ -31,7 +31,7 @@ export class Game {
     this.renderer = this.headless ? null : new Renderer(this.canvas);
 
     this.state = {
-      phase: 'ready',     // ready | countdown | running | win | lose
+      phase: 'ready',     // ready | idle | countdown | running | win | lose
       trackId: '',
       bodyX: 0,
       progress: 0,
@@ -77,7 +77,10 @@ export class Game {
       if (this.renderer) this.renderer.rebuildLegs(this.physics);
     }
     this.state.legDrawn = this.physics.legDrawn;
-    this._enterPhase('countdown');
+    // REFERENCE START: enter the PRE-RACE IDLE FLOAT — the cube (and rival) hover above
+    // the track and bob gently. NO countdown yet (it starts when the player begins their
+    // first stroke), NO forward. The "DRAW A LEG" hint shows.
+    this._enterPhase('idle');
     return this.track;
   }
 
@@ -187,9 +190,23 @@ export class Game {
   }
 
   // ── SLOW-MOTION signals from the draw input (§A) ──
-  /** The user STARTED a stroke → enter bullet-time (whole game slows to 10%). It
-   * stays in 'running' (no restart, no countdown) so the cube keeps moving slowly. */
-  beginDraw() { this._timeScale = this.SLOWMO_SCALE; }
+  /** The user STARTED a stroke.
+   *   • From the PRE-RACE IDLE FLOAT (phase 'idle'): this is the FIRST draw → kick off
+   *     the 3-2-1 COUNTDOWN (the cube keeps floating + bobbing while the player draws
+   *     their first leg; the race starts at GO). This is the reference start: the
+   *     countdown is tied to the player's first stroke, NOT to track entry.
+   *   • Mid-run (phase 'running'): enter bullet-time (whole game slows to 10%) so the
+   *     redraw feels good — the cube keeps creeping forward while you redraw.
+   * forceStart()/headless paths skip 'idle', so this never fires there (tests start
+   * immediately in 'running'). */
+  beginDraw() {
+    if (this.state.phase === 'idle') {
+      // first stroke ⇒ start the countdown (still floating; no slow-mo needed at v=0).
+      this._enterPhase('countdown');
+      return;
+    }
+    this._timeScale = this.SLOWMO_SCALE;
+  }
   /** The stroke ENDED (a new leg was applied, or the gesture cancelled) → full speed. */
   endDraw() { this._timeScale = 1.0; }
   get timeScale() { return this._timeScale; }
@@ -208,12 +225,23 @@ export class Game {
     this.state.legDrawn = this.physics.legDrawn;
     this.state.timeMs = 0;
     this.state.progress = 0;
-    this._enterPhase('countdown');
+    // back to the PRE-RACE IDLE FLOAT (same as a fresh load) — float + bob, no countdown
+    // until the player draws again.
+    this._enterPhase('idle');
   }
 
   // ── phase machine ──
+  // START FLOW (reference): idle-float → (player's first draw) → 3s countdown (still
+  // floating, player draws their leg) → GO → running (cube eases from float to ground).
+  //   • idle      : PRE-RACE float + bob ON, no countdown, no forward.
+  //   • countdown : float still ON (the player draws while the 3-2-1 ticks), no forward.
+  //   • running   : float OFF — both walkers ease to the grounded pose and the race runs.
+  // The float toggle is set on BOTH walkers (player + rival) so they hover together.
   _enterPhase(phase) {
     this.state.phase = phase;
+    const float = (phase === 'idle' || phase === 'countdown');
+    if (this.physics.setIdleFloat) this.physics.setIdleFloat(float);
+    if (this.rivalSpec && this.rival.setIdleFloat) this.rival.setIdleFloat(float);
     if (phase === 'countdown') this.state.countdownMs = COUNTDOWN_MS;
     this._renderHud();
   }
@@ -269,9 +297,15 @@ export class Game {
   _tick(dt) {
     const s = this.state;
     const hasRival = !!this.rivalSpec;
-    if (s.phase === 'countdown') {
+    if (s.phase === 'idle') {
+      // PRE-RACE: float + bob both bodies (walker.update handles the idle-float pose).
+      // No countdown, no forward — we wait for the player's first stroke (beginDraw).
+      this.physics.update(dt, false);
+      if (hasRival) this.rival.update(dt, false);
+    } else if (s.phase === 'countdown') {
       s.countdownMs -= dt;
-      // hold both bodies during countdown (legs locked, no advance)
+      // hold both bodies during countdown — they keep FLOATING + bobbing (idle-float is
+      // still on) while the player draws their first leg; no advance. At GO ⇒ running.
       this.physics.update(dt, false);
       if (hasRival) this.rival.update(dt, false);
       if (s.countdownMs <= 0) this._enterPhase('running');
@@ -406,8 +440,16 @@ export class Game {
     };
   }
 
-  /** Force phase to running immediately (skip countdown) — headless helper. */
-  forceStart() { this._enterPhase('running'); }
+  /** Force phase to running immediately (skip the idle-float + countdown) — headless
+   * helper used by the verifier/diag. Goes straight to 'running' so EVERY existing test
+   * gate (no-pen / no-slip / redraw / race / tunnel …) still starts the race instantly.
+   * _enterPhase('running') clears the idle-float on both walkers, so the cube is on the
+   * ground from frame 0 (no float→ground settle in the headless path). */
+  forceStart() {
+    if (this.physics.setIdleFloat) this.physics.setIdleFloat(false);
+    if (this.rivalSpec && this.rival.setIdleFloat) this.rival.setIdleFloat(false);
+    this._enterPhase('running');
+  }
 
   /** Headless helper: disable the rival (used by the isolated player-walker
    * sub-tests that build their own custom track directly on `game.physics` and

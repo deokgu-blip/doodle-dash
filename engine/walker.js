@@ -189,6 +189,17 @@ const TUNE = {
   landMergeLerp: 14.0,   // 1/s — residual touchdown re-settle ease (kept for cosmetic continuity)
   // reach factor floor: even the shortest leg still runs and lofts a little (never 0).
   loftReachFloor: 0.55,  // min reach-factor (so short legs hop less, but are not frozen-grounded)
+
+  // ── PRE-RACE IDLE FLOAT (reference start look) ──
+  // Before the race starts (the player has not yet started drawing a leg, OR is drawing
+  // the very first leg during the 3-2-1 countdown) the cube does NOT sit on the track.
+  // It HOVERS a little ABOVE the surface and bobs gently up/down on a slow sine — a
+  // "ready, floating" pose. No forward, no rotation, no penetration. The float is driven
+  // by a phase clock (engine-time) so the renderer sees the body rise/fall every frame.
+  idleFloatLift: 0.85,   // world-u — how far ABOVE the surface the cube CENTRE's float anchor sits (cube bottom = anchor + CUBE_SIZE/2, always above surface)
+  idleBobAmp: 0.22,      // world-u — peak-to-base amplitude of the idle bob (gentle "둥실")
+  idleBobHz: 0.55,       // Hz — idle bob frequency (slow, calm)
+  idleLerp: 8.0,         // 1/s — how fast the body eases into / out of the float pose (smooth float→ground settle, no snap)
 };
 
 export class Physics {
@@ -251,6 +262,15 @@ export class Physics {
     // segment height model
     this._segs = [];                 // [{ x0,x1, kind, surfFn(x), topY0, topY1, ... }]
     this._maxSurfaceTopY = 0;
+
+    // ── PRE-RACE IDLE FLOAT (reference start look) ──
+    // When `_idleFloat` is on, update() ignores the locomotion body-height path and
+    // instead HOVERS the cube above the surface with a gentle sine bob (no forward,
+    // no spin, no penetration). Turned on by the game while phase ∈ {idle, countdown}
+    // and off at GO (then the body eases back to the grounded pose). The phase clock
+    // advances with engine dt so the bob is deterministic + refresh-rate independent.
+    this._idleFloat = false;
+    this._idlePhase = 0;             // rad — idle bob sine phase (engine-time driven)
   }
 
   reset() {
@@ -276,6 +296,17 @@ export class Physics {
     this._loft = 0;
     this._loftAmpLive = 0;
     this._prevLoft = 0;
+    this._idleFloat = false;
+    this._idlePhase = 0;
+  }
+
+  /** Pre-race idle float toggle (reference start look). While ON the cube hovers
+   * above the surface and bobs gently (no forward, no spin); update() handles it. */
+  setIdleFloat(on) {
+    this._idleFloat = !!on;
+    if (!on) return;
+    // entering the float: reset the bob phase so the start pose is the float midline.
+    this._idlePhase = 0;
   }
 
   // ── TERRAIN: build floor slabs (for the renderer) + a height model. ──
@@ -501,6 +532,10 @@ export class Physics {
     const startSurf0 = this.surfaceYAt(track.startX);
     this._footBaseY = (startSurf0 == null) ? groundY : startSurf0;
     this._prevFootBaseY = this._footBaseY;
+    // a rebuild clears any prior idle-float (the game re-arms it via setIdleFloat for
+    // the interactive start; headless/forceStart paths build + start immediately).
+    this._idleFloat = false;
+    this._idlePhase = 0;
   }
 
   /**
@@ -999,6 +1034,53 @@ export class Physics {
   update(dtMs, running) {
     if (!this.cube) return;
     const dt = dtMs / 1000; // seconds
+
+    // ── PRE-RACE IDLE FLOAT (reference start look) ──
+    // Before the race begins the cube does NOT rest on the track: it HOVERS above the
+    // surface and bobs gently on a slow sine. No forward motion, no leg spin, no
+    // penetration. We compute a float-anchor a fixed lift ABOVE the surface under the
+    // body, add a sine bob, and EASE the body toward it (so the very first frame and the
+    // GO transition are smooth — no snap). The legs (if any are drawn during the
+    // countdown) ride with the body but DO NOT roll (θ frozen) — the run starts at GO.
+    if (this._idleFloat) {
+      this._idlePhase += 2 * Math.PI * TUNE.idleBobHz * dt;
+      // ORIENT THE LEGS HORIZONTAL while floating: rotate the leg phase so the drawn
+      // chain's FARTHEST point points sideways (≈0°), not down — so neither leg tip dips
+      // through the track under the hovering body. (The two legs are 180° apart, so one
+      // points fwd-horizontal and the other back-horizontal: a tidy "arms out" ready
+      // pose.) The run's spin starts at GO (θ then advances from this idle orientation).
+      if (this._chain && this._chain.length) {
+        let fx = 0, fy = 0, fd = -1;
+        for (const c of this._chain) { const d = c.x * c.x + c.y * c.y; if (d > fd) { fd = d; fx = c.x; fy = c.y; } }
+        this._theta = -Math.atan2(fy, fx); // farthest sample → angle 0 (horizontal fwd)
+      } else {
+        this._theta = 0;
+      }
+      const surf0 = this.surfaceYAt(this._x);
+      const surf = (surf0 == null) ? this._footBaseY : surf0;
+      // physics +down: subtract to float ABOVE the surface; bob oscillates around it.
+      const bob = TUNE.idleBobAmp * Math.sin(this._idlePhase);
+      const targetY = surf - TUNE.idleFloatLift - bob;
+      const a = 1 - Math.exp(-TUNE.idleLerp * dt);
+      this._bodyY += (targetY - this._bodyY) * a;
+      // camera base eases to the float MIDLINE (bob-free) so the screen sits still while
+      // the cube bobs in-frame.
+      const baseTarget = surf - TUNE.idleFloatLift;
+      this._bodyBaseY += (baseTarget - this._bodyBaseY) * a;
+      this._angle = 0;
+      this._bob = Math.abs(bob);
+      this._vx = 0; this._vTip = 0; this._omega = 0; this._vy = 0;
+      this._air = false; this._airFrames = 0; this._loft = 0;
+      this._footBaseY = surf; this._prevFootBaseY = surf;
+      this.cube.position.x = this._x;
+      this.cube.position.y = this._bodyY;
+      this.cube.velocity.x = 0; this.cube.velocity.y = 0;
+      this.cube.angle = 0;
+      // keep the (frozen) legs glued under the floating body so they hover too.
+      this._syncLegs();
+      return;
+    }
+
     const drive = running && this.legDrawn && this.motorEnabled;
 
     let v = 0;
@@ -1310,8 +1392,10 @@ export class Physics {
     // NOT the surface at the body centre, which is wrong on a slope and would falsely
     // LIFT the body when a leg sample trails over lower ground, re-introducing the
     // "floating on slopes" gap). While AIRBORNE the body is meant to be above the
-    // surface (positive clearance), so the clamp is skipped entirely.
-    if (this._air) return;
+    // surface (positive clearance), so the clamp is skipped entirely. During the PRE-RACE
+    // IDLE FLOAT the body is DELIBERATELY hovering above the surface (a drawn first leg
+    // points down past the surface), so the clamp must NOT yank it down to ground.
+    if (this._air || this._idleFloat) return;
     let below = 0; // worst penetration of any foot point below ITS local surface
     for (const l of this.legs) {
       for (let i = 1; i < l.body.parts.length; i++) {

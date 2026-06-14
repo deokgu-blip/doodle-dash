@@ -190,7 +190,7 @@ const TUNE = {
   // foot-plant (hop=0) ω == v/r EXACTLY (no-slip preserved); mid-float ω is divided by
   // (1 + strideStretch·hop). The stretch scales with the SAME steep×speed factor as the
   // loft, so flat ground keeps the normal cadence.
-  strideStretch: 1.6,    // max extra rolling-radius factor at full loft (1.6 ⇒ ~2.6× radius mid-float ⇒ ~0.38× cadence there)
+  strideStretch: 0.4,    // max extra rolling-radius factor at full loft. LOWERED 1.6→0.4: at 1.6 the legs rolled only ~0.38× mid-float, so on low lofts (body barely up, looks grounded) the leg looked FROZEN while sliding forward. 0.4 ⇒ ω stays ≥~0.71× of v/r everywhere ⇒ legs always VISIBLY roll (no frozen-slide). no-slip is unaffected (at a foot-plant hop=0 ⇒ stretch=1 ⇒ ω=v/r regardless).
   loftLerp: 16.0,        // 1/s — how fast the live loft eases toward its phase target (smooth, no pop at slope onset)
   airTiltLerp: 7.0,      // 1/s — body eases its lean a touch faster during the hovering float (nose follows the gentle arc)
   landMergeLerp: 14.0,   // 1/s — residual touchdown re-settle ease (kept for cosmetic continuity)

@@ -35,8 +35,9 @@
     {
       "kind": "ramp",
       "length": 6,
-      "height": 3,
-      "rough": 0.9
+      "height": 4.4,
+      "rough": 0.9,
+      "_note": "STEEP uphill (slope 0.733) — hook-gated: only a hook leg grips over it"
     },
     {
       "kind": "ramp",

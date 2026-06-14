@@ -118,6 +118,25 @@ const TUNE = {
   // clears them all. maxClimb(0.6)=0.30, maxClimb(1.05)=0.75, maxClimb(1.7)=1.40.
   climbBase: 0.30,       // a reach of 0.30+ clears an infinitesimal lip
   climbK: 1.0,           // each +1 unit of step height needs +1.0 reach
+  // ── HOOK (shape) RULE — the STEEP-RAMP gate is by SHAPE, not length ──
+  // A gated STEEP UPHILL ramp can only be grip-and-stepped-over by a leg whose drawn
+  // shape is a HOOK / ㄱ / L / claw — i.e. it has a SHARP BEND. We measure "hookiness"
+  // as the MAX TURN ANGLE between consecutive direction vectors along the normalized
+  // leg chain (sampled with a small lookahead window so the resampling micro-jitter on
+  // a smooth arc/circle does not accumulate to a false corner). A hook/L/zigzag has a
+  // ~75°+ bend; a straight stick / bar / smooth arc / circle / wheel / blobby limb is
+  // < ~53°. So a threshold in the gap [53°,74°] cleanly classifies. reach is IRRELEVANT
+  // here — a long straight leg is NOT a hook, a short ㄱ IS a hook.
+  //   isHook = (maxTurnAngle >= hookAngleDeg)
+  hookAngleDeg: 62,      // degrees — bend above this ⇒ the leg is a HOOK (tuned: hooks≈75°+, non-hooks≤53°)
+  hookTurnWindow: 2,     // chain-sample lookahead each side for the turn-angle measure (smooths arc jitter, keeps sharp corners)
+  // STEEP-RAMP GATE: an UPHILL ramp (physics slope<0) is "steep" (hook-gated) iff its
+  // |slope| >= steepThresh. Gentle/medium uphills (|slope| < this) are NOT gated — any
+  // leg climbs them (unchanged). GAP ramps are EXEMPT (a short leg must escape the
+  // V-trench — never gated, no soft-lock). The downhill ramps in T01 are |slope|≈0.5–0.58
+  // and are NEVER gated (downhill is not a climb); only steep UPHILLs gate.
+  steepThresh: 0.6,      // |physics-slope| at/above which an UPHILL ramp is hook-gated
+  steepEnterGap: 0.0,    // world-u — stop a non-hook leg this far before the steep ramp foot (0 = right at the foot)
   // ── TUNNEL RULE (the INVERSE of the climb/wall rule) ──
   // A LOW CEILING segment blocks a leg whose REACH is too long: the rotating leg
   // (radius ≈ reach about the axle) sweeps UP and strikes the ceiling. So a tunnel
@@ -235,6 +254,9 @@ export class Physics {
     this._reach = 0;                 // current leg reach (world units)
     this._shape = null;              // shape descriptor (chain etc.)
     this._chain = null;              // axle-local chain (for both legs' visual)
+    this._isHook = false;            // SHAPE gate: true ⇒ the drawn leg is a HOOK (sharp bend) — can grip-climb a steep ramp
+    this._maxTurnDeg = 0;            // measured max turn angle (deg) of the current chain (hookiness metric)
+    this._blockedBySteep = false;    // blocked specifically by a steep ramp (non-hook leg) — legs keep trying (struggle in place)
     this._legPhaseOffset = Math.PI;  // second leg is 180° out of phase
     this._blocked = false;           // true when stopped at an unclimbable step
     this._blockedByRiser = false;    // §C: blocked specifically by a riser (climb) — legs keep trying
@@ -302,6 +324,7 @@ export class Physics {
     // (callers read the fields the same step ⇒ no aliasing). Byte-identical results.
     this._riserHit = { found: false, x: 0, h: 0 };
     this._tunnelHit = { found: false, x: 0, clearance: 0 };
+    this._steepHit = { found: false, x: 0, slope: 0 };
 
     // ── RENDER INTERPOLATION (mobile micro-stutter fix) ──
     // The SIM ticks on a FIXED timestep (FIXED_DT) with an accumulator that carries the
@@ -353,6 +376,9 @@ export class Physics {
     this._blocked = false;
     this._blockedByRiser = false;
     this._blockedByTunnel = false;
+    this._blockedBySteep = false;
+    this._isHook = false;
+    this._maxTurnDeg = 0;
     this._trying = false;
     this._vx = 0;
     this._vTip = 0;
@@ -464,7 +490,14 @@ export class Physics {
         // model below carries the same true sloped surface for the walker.
         addRampSlab(x0, x1, topY0, topY1, thick);
         const slope = dy / len;
-        this._segs.push({ x0, x1, kind: 'ramp', topYa: topY0, topYb: topY1, slope,
+        // STEEP-RAMP GATE (hook by SHAPE): a regular (non-gap) UPHILL ramp (physics
+        // slope<0 ⇒ going up) is "steep" iff |slope| >= steepThresh. A steep ramp can
+        // only be grip-and-stepped over by a HOOK-shaped leg; a non-hook leg STRUGGLES
+        // in place at its foot (struggle, no advance — redraw a hook to climb). Gentle
+        // uphills and ALL downhills are NEVER gated. GAP ramps (built below) never set
+        // this flag (a short leg must escape the V-trench — no soft-lock).
+        const steepGate = (slope < 0) && (Math.abs(slope) >= TUNE.steepThresh);
+        this._segs.push({ x0, x1, kind: 'ramp', topYa: topY0, topYb: topY1, slope, steepGate,
           surfFn: (px) => topY0 + slope * (px - x0) });
         if (topY1 < this._maxSurfaceTopY) this._maxSurfaceTopY = topY1;
         surfaceY += dy;
@@ -845,6 +878,8 @@ export class Physics {
     const fresh = spec.fresh === true || !hadLegs;
 
     this.legs = [];
+    // a fresh stroke replaces any prior hook classification (recomputed at step 4b below).
+    this._isHook = false; this._maxTurnDeg = 0;
     if (!points || points.length < 2) { this.legDrawn = false; return; }
 
     // 1. map normalized stroke → world (length preserved, no re-fit)
@@ -870,6 +905,15 @@ export class Physics {
 
     this._reach = reach;
     this._chain = chain;
+
+    // 4b. HOOK CLASSIFICATION (shape, NOT length). Measure the MAX TURN ANGLE between
+    //     consecutive direction vectors along the chain (with a small lookahead window
+    //     so resampling micro-jitter on a smooth arc/circle does not fake a corner). A
+    //     hook / ㄱ / L / claw has a sharp (~75°+) bend; a straight stick / bar / smooth
+    //     arc / circle / wheel / blobby limb is < ~53°. isHook = bend >= hookAngleDeg.
+    //     This is fully independent of reach — used ONLY by the STEEP-RAMP gate.
+    this._maxTurnDeg = maxTurnAngleDeg(chain, TUNE.hookTurnWindow);
+    this._isHook = this._maxTurnDeg >= TUNE.hookAngleDeg;
 
     // 5. place / re-float the cube.
     //    • FRESH (first leg of a track): anchor at startX, level, phase reset — the
@@ -1075,6 +1119,23 @@ export class Physics {
     return h;
   }
 
+  /** Find the next STEEP UPHILL ramp (steepGate=true, not a gap) whose foot (x0) lies
+   * in (fromX, toX]. Returns { x, slope } or null. The foot is where a NON-HOOK leg is
+   * stopped (struggle-in-place). REUSEs a scratch object (no per-frame allocation). */
+  _nextSteepRamp(fromX, toX) {
+    let bestX = Infinity, bestSlope = 0, any = false;
+    for (const s of this._segs) {
+      if (s.kind !== 'ramp' || !s.steepGate || s.gap) continue;
+      if (s.x0 > fromX && s.x0 <= toX) {
+        if (!any || s.x0 < bestX) { bestX = s.x0; bestSlope = s.slope; any = true; }
+      }
+    }
+    if (!any) { this._steepHit.found = false; return null; }
+    const h = this._steepHit;
+    h.found = true; h.x = bestX; h.slope = bestSlope;
+    return h;
+  }
+
   /** Effective rolling radius for ω = v/r. This is the CONTACT foot's lever arm
    * (== the body clearance == the distance from the axle/centre down to the foot
    * at the bottom of the sweep). Using exactly this makes the planted foot's world
@@ -1275,6 +1336,7 @@ export class Physics {
       this._blocked = false;
       this._blockedByRiser = false;  // §C: a CLIMB block (vs a gap) ⇒ legs keep trying
       this._blockedByTunnel = false; // a LOW-CEILING block (too-long leg) ⇒ legs keep trying
+      this._blockedBySteep = false;  // a STEEP-RAMP block (non-hook leg) ⇒ legs keep trying
 
       // climb rule: if a stairs/wall step lies just ahead, gate on reach (LONG leg needed).
       const riser = this._nextRiser(this._x, lookX + 0.5);
@@ -1283,11 +1345,26 @@ export class Physics {
       // stop it at the mouth (struggle-in-place), the user must redraw shorter.
       const tunnel = this._nextTunnel(this._x, lookX + 0.5);
       const tunnelBlocks = tunnel && !this.canPassTunnel(reach, tunnel.clearance);
+      // STEEP-RAMP rule (by SHAPE, not length): if a steep UPHILL ramp foot lies just
+      // ahead, gate on HOOK-NESS. A HOOK leg grips-and-steps over (climbs); a NON-HOOK
+      // leg (straight / arc / circle / wheel) slips and STRUGGLES in place at the foot
+      // (no advance) until a hook is drawn. NO reach involvement.
+      const steep = this._nextSteepRamp(this._x, lookX + 0.5);
+      const steepBlocks = steep && !this._isHook;
       // whichever gate's stop-point comes FIRST along x wins (so a wall just before a
-      // tunnel, or vice-versa, blocks at the nearer obstacle).
+      // tunnel, or a steep ramp before a wall, blocks at the nearer obstacle).
       const riserStopX = (riser && !this.canClimb(reach, riser.h)) ? (riser.x - CUBE_SIZE * 0.5) : Infinity;
       const tunnelStopX = tunnelBlocks ? (tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap) : Infinity;
-      if (tunnelBlocks && tunnelStopX <= riserStopX) {
+      const steepStopX = steepBlocks ? (steep.x - CUBE_SIZE * 0.5 - TUNE.steepEnterGap) : Infinity;
+      if (steepBlocks && steepStopX <= riserStopX && steepStopX <= tunnelStopX) {
+        // BLOCKED by the steep ramp: the leg is not a hook — it can't grip the slope, so
+        // it slips and churns in place at the ramp foot (struggle, NO net advance) until
+        // a HOOK leg is drawn. Not a soft-lock: redraw a hook ⇒ immediately climbs.
+        v = 0;
+        this._blocked = true;
+        this._blockedBySteep = true;
+        if (this._x > steepStopX) this._x = steepStopX;
+      } else if (tunnelBlocks && tunnelStopX <= riserStopX) {
         // BLOCKED by the low ceiling: stop just before the tunnel mouth. The leg is too
         // long — it churns in place (struggle) and makes NO net forward progress until a
         // SHORTER leg is drawn (canPassTunnel). No artificial advance, not a soft-lock.
@@ -1304,7 +1381,10 @@ export class Physics {
           this._x = riser.x - CUBE_SIZE * 0.5;
         }
       } else if (seg) {
-        if (seg.kind === 'ramp' || seg.kind === 'bumps') {
+        if (seg.kind === 'ramp' && seg.steepGate && !seg.gap && this._isHook) {
+          // climbing a STEEP ramp WITH a hook leg — grip-and-step pace (like stairs).
+          terrain = TUNE.stairClimbSlow;
+        } else if (seg.kind === 'ramp' || seg.kind === 'bumps') {
           // slope > 0 means descending (topY increases downhill since y is +down…
           // careful: y +down so going UP is slope<0). Use sign of slope. The GAP's
           // descent/ascent ramps and the BUMPS sub-ramps ride this same blend, so a
@@ -1420,11 +1500,12 @@ export class Physics {
       this._theta += omega * dt;
       this._vTip = omega * ryContact; // == v_surface at a plant (planted foot stationary)
       this._trying = false;
-    } else if (drive && (this._blockedByRiser || this._blockedByTunnel) && this._reach > CUBE_SIZE * 0.5) {
-      // §C: struggle in place (riser climb OR low-ceiling tunnel). Spin at the cadence
-      // the leg would have if walking on the flat (vNatural/effR) so the churn looks like
-      // a real walking effort. The body x does NOT advance (v stays 0) — the foot slips
-      // against the wall (riser) or the leg keeps spinning into the low ceiling (tunnel).
+    } else if (drive && (this._blockedByRiser || this._blockedByTunnel || this._blockedBySteep) && this._reach > CUBE_SIZE * 0.5) {
+      // §C: struggle in place (riser climb OR low-ceiling tunnel OR steep ramp). Spin at
+      // the cadence the leg would have if walking on the flat (vNatural/effR) so the churn
+      // looks like a real walking effort. The body x does NOT advance (v stays 0) — the
+      // foot slips against the wall (riser) / spins into the low ceiling (tunnel) / slips
+      // back down the steep ramp (a non-hook leg can't grip).
       const vNat = TUNE.baseSpeed * this.legSpeedFactor(this._reach) * this.paceFactor;
       const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
       omega = vNat / ryContact;
@@ -1680,6 +1761,32 @@ export class Physics {
   get blockedByTunnel() { return !!this._blockedByTunnel; }
   /** True while blocked specifically by a riser (a too-short leg at a wall/stairs step). */
   get blockedByRiser() { return !!this._blockedByRiser; }
+  /** True while blocked specifically by a STEEP ramp (a NON-HOOK leg can't grip-climb it). */
+  get blockedBySteep() { return !!this._blockedBySteep; }
+  /** Is the CURRENT drawn leg a HOOK (sharp bend ⇒ can grip-and-step over a steep ramp)?
+   * SHAPE gate — independent of reach. False for straight bars / smooth arcs / circles. */
+  get isHook() { return !!this._isHook; }
+  /** Measured max turn angle (deg) of the current chain — the hookiness metric (diagnostic). */
+  get maxTurnDeg() { return this._maxTurnDeg || 0; }
+  /** Hook classification of an ARBITRARY normalized stroke (box [-1,1]) WITHOUT mutating
+   * the live leg — used by the verifier's preset-classification table. Runs the same
+   * resample+recenter+reach-clamp pipeline as setLegStroke, then measures the bend. */
+  classifyHook(points, scale = 1.0) {
+    if (!points || points.length < 2) return { isHook: false, maxTurnDeg: 0, reach: 0, n: 0 };
+    const s = (scale || 1) * LEG_WORLD_SCALE;
+    const stroke = points.map((p) => ({ x: p.x * s, y: p.y * s }));
+    let chain = resamplePolyline(stroke, LEG_CIRCLE_SPACING, LEG_MAX_CIRCLES);
+    if (chain.length < 2) return { isHook: false, maxTurnDeg: 0, reach: 0, n: chain.length };
+    const anchor = { x: chain[0].x, y: chain[0].y };
+    chain = chain.map((c) => ({ x: c.x - anchor.x, y: c.y - anchor.y }));
+    let rawReach = 0; for (const c of chain) rawReach = Math.max(rawReach, Math.hypot(c.x, c.y));
+    const reach = Math.max(LEG_REACH_MIN, Math.min(LEG_REACH_MAX, rawReach));
+    if (rawReach > 1e-6 && Math.abs(reach - rawReach) > 1e-6) {
+      const k = reach / rawReach; chain = chain.map((c) => ({ x: c.x * k, y: c.y * k }));
+    }
+    const mt = maxTurnAngleDeg(chain, TUNE.hookTurnWindow);
+    return { isHook: mt >= TUNE.hookAngleDeg, maxTurnDeg: +mt.toFixed(2), reach: +reach.toFixed(3), n: chain.length };
+  }
   /** True while the walker is in a ballistic flight (off the ground at a crest). */
   get airborne() { return !!this._air; }
   /** Vertical velocity (physics +down; up = negative) — non-zero only while airborne. */
@@ -1777,6 +1884,30 @@ function lerpSlow(slope, slowFactor) {
 function lerpFast(slope, fastFactor) {
   const s = Math.min(1, Math.abs(slope) * 2);
   return 1 + (fastFactor - 1) * s;
+}
+
+/** MAX TURN ANGLE (degrees) along a polyline chain — the "hookiness" metric.
+ * For each interior sample i we form two direction vectors: in = chain[i]−chain[i−w]
+ * and out = chain[i+w]−chain[i] (a lookahead window `w` each side so the dense
+ * resampling jitter on a smooth arc does not accumulate into a false corner). The
+ * turn at i is the angle between in and out (0 = straight, 180 = a fold-back). We
+ * return the MAX over all interior samples. A hook / ㄱ / L / claw has one sharp
+ * (~75°+) corner; a straight bar / smooth arc / circle / wheel stays low (< ~53°).
+ * Chains too short to have an interior sample (n <= 2w) return 0 (cannot be a hook). */
+function maxTurnAngleDeg(chain, w) {
+  const win = Math.max(1, w | 0);
+  let mx = 0;
+  for (let i = win; i < chain.length - win; i++) {
+    const ax = chain[i].x - chain[i - win].x, ay = chain[i].y - chain[i - win].y;
+    const bx = chain[i + win].x - chain[i].x, by = chain[i + win].y - chain[i].y;
+    const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+    if (la < 1e-6 || lb < 1e-6) continue;
+    let cos = (ax * bx + ay * by) / (la * lb);
+    if (cos > 1) cos = 1; else if (cos < -1) cos = -1;
+    const ang = Math.acos(cos);
+    if (ang > mx) mx = ang;
+  }
+  return mx * 180 / Math.PI;
 }
 
 function convexHullArea(pts) {

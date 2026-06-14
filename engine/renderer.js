@@ -23,7 +23,7 @@ const COL = {
 const RIVAL_LANE_SIGN = -1;
 
 const RIBBON_DEPTH = 1.5;     // z-extrusion of the track — a THIN WINDING RIBBON like the reference (was 2.6, too wide; the cube now nearly fills the band width). lane offset / leg straddle / camera z are scaled to this below.
-const RIBBON_DOWN = 0.45;     // how far below the surface the side face drops — a THIN dark strip under the bright checker top (scaled with the narrower band: 0.6→0.45)
+const RIBBON_DOWN = 1.2;      // SLAB DEPTH below the surface — a THICK, DOTOOM slab like the reference (was 0.45, too thin). The width (z-depth RIBBON_DEPTH) stays NARROW; only this vertical slab thickness grew so the path reads as a chunky board. The ceiling ROOF track reuses the SAME value (consistent thickness).
 
 // ── SERPENTINE CURVE (render-only, §C) ──────────────────────────────────────
 // The original track snakes left/right as it recedes. We bend the WHOLE render
@@ -145,10 +145,12 @@ export class Renderer {
     this._buildRibbon(physics, 0, topMat, sideMat);
     if (rivalSpec) this._buildRibbon(physics, this.rivalLaneZ, topMat, sideMat);
 
-    // TUNNEL low ceilings — a visible bar/slab hanging over the floor so the player
-    // reads it as a "low passage" only short legs fit through. One per lane.
-    this._buildCeilings(physics, 0);
-    if (rivalSpec) this._buildCeilings(physics, this.rivalLaneZ);
+    // TUNNEL low ceilings — a ROOF made of the SAME track ribbon (same purple checker,
+    // same narrow width, same thick slab) laid OVER the tunnel at the head-room line.
+    // The cube passes through the GAP between the floor track and this ceiling track;
+    // the gap height reads "how low" at a glance (WYSIWYG). One per lane.
+    this._buildCeilings(physics, 0, topMat, sideMat);
+    if (rivalSpec) this._buildCeilings(physics, this.rivalLaneZ, topMat, sideMat);
     this.scene.add(this.trackGroup);
 
     // ── player cube ──
@@ -291,68 +293,82 @@ export class Renderer {
     this.trackGroup.add(sideMesh);
   }
 
-  /** Build the TUNNEL as a LOW LIMBO BAR you DUCK UNDER (reference look) — NOT a thick
-   * wall that climbs up. Each tunnel renders as:
-   *   • a THIN horizontal BEAM (a lintel) hanging at the physics ceilingY level
-   *     (render y = -ceilingY). This is the WYSIWYG gate: a too-LONG leg's rotating
-   *     sweep strikes this beam at the mouth (BLOCKED), a SHORT/low leg ducks under it.
-   *   • two SLIM vertical POSTS at the two ends going from the beam DOWN to the floor —
-   *     a clear DOORWAY FRAME. The whole interior BELOW the beam is left WIDE OPEN
-   *     (no slab, no fill) so the eye reads "trimmed head-room, open passage beneath"
-   *     instead of "a block rising out of the path."
-   * The beam + posts are slim and clearly DISTINCT from the path (warm orange accent,
-   * palette-consistent with the HUD/jump arrows) so the gimmick reads at a glance:
-   * "go under here, keep your legs low." Render-only — ceilingY is the physics gate. */
-  _buildCeilings(physics, laneZ) {
+  /** Build the TUNNEL as a ROOF made of the SAME TRACK RIBBON laid OVERHEAD (the
+   * reference's "low route on top" look) — NOT a front-facing box/bar you crash into.
+   * Each tunnel renders as one extra ribbon segment, identical in appearance to the
+   * floor track (same purple checker top, same narrow width RIBBON_DEPTH, same thick
+   * slab RIBBON_DOWN), but flipped so its UNDERSIDE sits exactly at the physics
+   * ceilingY (the head-room gate, WYSIWYG). It rides the SAME lane centre + serpentine
+   * curve as the floor track, so it sits DIRECTLY ABOVE the floor track (same z) and
+   * never covers the cube's front: the cube + low legs pass through the GAP between
+   * the floor track below and this ceiling track above, and that gap height reads
+   * "how low this passage is" at a glance. A too-LONG leg's rotating sweep strikes
+   * this overhead track's underside (BLOCKED); a SHORT leg ducks through the gap.
+   * Render-only — ceilingY is the physics gate; the gate logic is untouched.
+   *
+   * Geometry: I sample x across [x0,x1] (densified for the serpentine bend), put the
+   * checker TOP face at the slab's TOP (ceilingY − RIBBON_DOWN, i.e. render y =
+   * -ceilingY + RIBBON_DOWN) and the slab walls/underside dropping down to the
+   * head-room line (render y = -ceilingY). So the bright checker is the visible top
+   * of the overhead board and the underside is the surface a long leg hits. */
+  _buildCeilings(physics, laneZ, topMat, sideMat) {
     const ceils = physics.ceilingBodies;
     if (!ceils || !ceils.length) return;
     const half = RIBBON_DEPTH / 2;
-    // a slim BEAM + POSTS in a warm accent so the bar reads as "duck under" furniture,
-    // clearly NOT the purple path. Flat-ish standard material so it still catches light.
-    const beamMat = new THREE.MeshStandardMaterial({ color: 0xF2A93B, roughness: 0.55, metalness: 0.0 });
-    const beamEdgeMat = new THREE.MeshStandardMaterial({ color: 0xC77F1E, roughness: 0.6 });
-    const postMat = new THREE.MeshStandardMaterial({ color: 0xC77F1E, roughness: 0.7 });
-    const BEAM_H = 0.22;                  // SLIM beam (a lintel, not a slab — was 0.55)
-    const BEAM_Z = RIBBON_DEPTH + 0.5;    // beam spans a touch past the thin band so it clearly bridges the lane
-    const POST_W = 0.20;                  // slim doorway posts
+    const uScale = 0.42, vRepeat = 0.85;   // SAME checker mapping as the floor ribbon
     for (const c of ceils) {
-      const len = c.x1 - c.x0;
-      const cx = (c.x0 + c.x1) / 2;
-      const cz = laneZ + laneCurveZ(cx);
-      const ry = -c.ceilingY;             // render y of the limbo beam (the head-room line)
-      const floorRy = -c.floorY;
-      // the limbo BEAM — a thin horizontal bar at the head-room line. Its BOTTOM sits at
-      // ceilingY (the gate), so the visible open space is everything from the floor up to
-      // this bar's underside.
-      const beam = new THREE.Mesh(
-        new THREE.BoxGeometry(len, BEAM_H, BEAM_Z),
-        beamMat
-      );
-      beam.position.set(cx, ry + BEAM_H / 2, cz);
-      this.trackGroup.add(beam);
-      // a thin DARKER cap strip ON TOP of the beam (front-edge read) so the lintel has a
-      // crisp silhouette against the lime sky (depth cue, no big mass).
-      const capH = 0.05;
-      const cap = new THREE.Mesh(
-        new THREE.BoxGeometry(len * 1.02, capH, BEAM_Z * 1.02),
-        beamEdgeMat
-      );
-      cap.position.set(cx, ry + BEAM_H + capH / 2, cz);
-      this.trackGroup.add(cap);
-      // DOORWAY POSTS: slim pillars at the two MOUTH ends running the FULL height from the
-      // floor up to the beam — a clear gate frame. They are THIN (POST_W) so they read as
-      // a doorway frame, never as a wall; the WHOLE span between them, below the beam, is
-      // left open (the cube + low legs pass straight through).
-      const postH = Math.max(0.2, ry - floorRy);
-      for (const px of [c.x0, c.x1]) {
-        const pz = laneZ + laneCurveZ(px);
-        const post = new THREE.Mesh(
-          new THREE.BoxGeometry(POST_W, postH, BEAM_Z),
-          postMat
+      // densify x across the tunnel span so the overhead board snakes with the lane.
+      const xs = [];
+      const span = c.x1 - c.x0;
+      const n = Math.max(1, Math.floor(span / RIBBON_DX));
+      for (let k = 0; k <= n; k++) xs.push(c.x0 + span * (k / n));
+
+      // The board's UNDERSIDE sits at the head-room line (render y = -ceilingY); its
+      // checker TOP is RIBBON_DOWN above that (same slab thickness as the floor track).
+      const underRy = -c.ceilingY;          // underside (the surface a too-long leg hits)
+      const topRy = underRy + RIBBON_DOWN;   // bright checker top of the overhead board
+
+      const topPos = [], topUV = [], topIdx = [];
+      const sidePos = [], sideIdx = [];
+      const N = xs.length;
+      for (let i = 0; i < N; i++) {
+        const x = xs[i];
+        const cz = laneZ + laneCurveZ(x);    // SAME lane centre + serpentine as the floor
+        const zN = cz - half, zF = cz + half;
+        // TOP strip (checker) at the board's top face.
+        topPos.push(x, topRy, zN, x, topRy, zF);
+        topUV.push(x * uScale, 0, x * uScale, vRepeat);
+        // SIDE/underside strip: top edges (= board top) + bottom edges (= underside).
+        sidePos.push(
+          x, topRy, zN,  x, underRy, zN,    // near wall top, bottom
+          x, topRy, zF,  x, underRy, zF     // far wall top, bottom
         );
-        post.position.set(px, floorRy + postH / 2, pz);
-        this.trackGroup.add(post);
+        if (i > 0) {
+          const a = (i - 1) * 2, b = a + 1, cc = i * 2, d = cc + 1;
+          topIdx.push(a, cc, b, b, cc, d);
+          const p = (i - 1) * 4, q = i * 4;
+          // near wall
+          sideIdx.push(p + 0, p + 1, q + 0, q + 0, p + 1, q + 1);
+          // far wall
+          sideIdx.push(p + 2, q + 2, p + 3, p + 3, q + 2, q + 3);
+          // UNDERSIDE (faces down — the head-room surface a long leg strikes)
+          sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);
+        }
       }
+      const topGeo = new THREE.BufferGeometry();
+      topGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(topPos), 3));
+      topGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(topUV), 2));
+      topGeo.setIndex(topIdx);
+      topGeo.computeVertexNormals();
+      const topMesh = new THREE.Mesh(topGeo, topMat);
+      this.trackGroup.add(topMesh);
+
+      const sideGeo = new THREE.BufferGeometry();
+      sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
+      sideGeo.setIndex(sideIdx);
+      sideGeo.computeVertexNormals();
+      const sideMesh = new THREE.Mesh(sideGeo, sideMat);
+      this.trackGroup.add(sideMesh);
     }
   }
 

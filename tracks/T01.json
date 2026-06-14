@@ -2,7 +2,7 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 272.4,
+  "finishX": 281.5,
   "segments": [
     {
       "kind": "flat",
@@ -34,11 +34,11 @@
     },
     {
       "kind": "stairs",
-      "length": 6,
+      "length": 3.7,
       "height": 4.4,
-      "steps": 6,
+      "steps": 5,
       "rough": 0.9,
-      "_note": "STEEP CLIMB = hook-gated STAIRCASE (overall slope 0.733 >= 0.6 => auto hook-gate). Visible tall step edges are the grip points: only a HOOK leg grips & climbs; straight/round legs slip => struggle-in-place at the foot => redraw a hook to pass (no soft-lock). Reach-irrelevant. 6 steps over 6u => each ~0.73u rise (clearly stepped, not micro-serrations)."
+      "_note": "STEEP CLIMB = hook-gated STAIRCASE, ~50deg (overall slope 4.4/3.7=1.189 >= 0.6 => auto hook-gate). Matches the reference: TALL step edges (each step rise 0.88u > its run 0.74u) are the grip points. HEIGHT kept at 4.4 (course vertical profile preserved); the steeper angle comes from a SHORTER run, not a taller top. Only a HOOK leg grips & climbs; straight/round legs slip => struggle-in-place at the foot => redraw a hook to pass (no soft-lock). Reach-irrelevant. 5 steps over 3.7u => each 0.74u run / 0.88u rise (clearly stepped grip points, not micro-serrations)."
     },
     {
       "kind": "ramp",
@@ -109,6 +109,16 @@
       "kind": "flat",
       "length": 4,
       "rough": 0.9
+    },
+    {
+      "kind": "fork",
+      "length": 11.4,
+      "highRise": 4.4,
+      "highSteps": 5,
+      "flatTop": 4,
+      "lowDip": 2.2,
+      "rough": 0.9,
+      "_note": "SPLIT-PATH FORK — the LEG SHAPE routes the cube (commit-at-entrance). HOOK leg => HIGH route: a hook-gated STEEP STAIRCASE up, ~50deg to MATCH the standalone steep climb (each up/down staircase run = (length-flatTop)/2 = (11.4-4)/2 = 3.7u; overall slope 4.4/3.7=1.189 >= 0.6 => auto hook-gate, the steep-staircase mechanic) -> flat top on the arch -> staircase back down -> rejoin. 5 steps over 3.7u => each 0.88u rise > 0.74u run (TALL grip-point edges). NON-HOOK leg => LOW route: dips UNDER the arch (a shallow underpass valley, lowDip 2.2) -> back up -> rejoin (UNCHANGED). Both routes REJOIN at the same x and base y; this is a BRANCH not a gate (no soft-lock — every leg progresses). Route is committed once at the fork mouth and ridden out (mid-fork redraw does NOT switch roads => no teleport). BOTH routes are always rendered (high arch + low underpass) so it reads as a split that merges."
     },
     {
       "kind": "bumps",

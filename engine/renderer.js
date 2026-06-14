@@ -260,6 +260,15 @@ export class Renderer {
     // the gap height reads "how low" at a glance (WYSIWYG). One per lane.
     this._buildCeilings(physics, 0, topMat, sideMat);
     if (rivalSpec) this._buildCeilings(physics, this.rivalLaneZ, topMat, sideMat);
+
+    // SPLIT-PATH FORK — the HIGH ARCH (a hook-gated steep staircase up → flat top → staircase
+    // down) rendered as its OWN ribbon ABOVE the lane. The LOW underpass route is part of the
+    // floor ribbon (the dip valley is in physics._segs, so _surfaceProfile already drew it). We
+    // draw BOTH so the fork visibly SPLITS at the mouth and MERGES at the rejoin in side view.
+    // The non-committed road is purely visual (physics is the single committed height function),
+    // so a LOW-route cube simply passes UNDER this high arch with no collision. One per lane.
+    this._buildForks(physics, 0, topMat, sideMat);
+    if (rivalSpec) this._buildForks(physics, this.rivalLaneZ, topMat, sideMat);
     this.scene.add(this.trackGroup);
 
     // ── player cube ──
@@ -494,10 +503,11 @@ export class Renderer {
     // so the bumps span between two kept points stays a single straight render segment.
     // `breakAfter[i]` ⇒ a void follows ring i (close this box, start a new one at i+1).
     const xs = [];
+    const yHints = [];            // exact profile y for a profile point; null for a densified point
     const breakAfter = [];
     for (let i = 0; i < thinned.length - 1; i++) {
       const a = thinned[i], b = thinned[i + 1];
-      xs.push(a.x); breakAfter.push(false);
+      xs.push(a.x); yHints.push(a.y); breakAfter.push(false);
       const span = b.x - a.x;
       const mid = (a.x + b.x) / 2;
       // a void (plank gap) span: mark a break, do NOT densify or bridge across it.
@@ -507,15 +517,24 @@ export class Renderer {
         const n = Math.floor(span / RIBBON_DX);
         for (let k = 1; k < n; k++) {
           const t = k / n;
-          xs.push(a.x + span * t); breakAfter.push(false);
+          xs.push(a.x + span * t); yHints.push(null); breakAfter.push(false);
         }
       }
     }
-    xs.push(thinned[thinned.length - 1].x); breakAfter.push(false);
-    // surfaceY at an arbitrary x via the physics sampler (highest surface), with a
-    // hold-last fallback so a momentary null (segment seam round-off) never gaps.
+    {
+      const last = thinned[thinned.length - 1];
+      xs.push(last.x); yHints.push(last.y); breakAfter.push(false);
+    }
+    // surfaceY at a ring: PREFER the exact PROFILE y (yHint) when this ring is a profile point.
+    // This is essential for STAIR RISERS — a riser is two profile points at the SAME x with the
+    // lower-tread y and the upper-tread y; re-sampling physics.surfaceYAt(x) returns only the
+    // HIGHEST surface at that x, collapsing the two into one ⇒ the riser would smear into a smooth
+    // diagonal (no visible step edges). Using the stored profile y keeps each tread's own height,
+    // so the riser stays a SHARP vertical step (the grip-point edges). Densified points (flats /
+    // ramps / thinned bumps) carry yHint=null ⇒ they sample the true physics surface as before.
     let lastY = prof[0].y;
-    const surfY = (x) => {
+    const surfY = (x, yHint) => {
+      if (yHint != null) { lastY = yHint; return yHint; }
       const y = physics.surfaceYAt(x);
       if (y != null) { lastY = y; return y; }
       return lastY;
@@ -539,7 +558,7 @@ export class Renderer {
     const vRepeat = 1;
     for (let i = 0; i < N; i++) {
       const x = xs[i];
-      const ry = -surfY(x);                 // render y (up)
+      const ry = -surfY(x, yHints[i]);      // render y (up) — exact profile y at risers (sharp steps)
       const cz = laneZ + laneCurveZ(x);     // serpentine z centre
       const zN = cz - half, zF = cz + half; // near / far edges
       // TOP strip: 2 verts (near, far) at the surface.
@@ -687,6 +706,101 @@ export class Renderer {
       sideGeo.setIndex(sideIdx);
       sideGeo.computeVertexNormals();
       const sideMesh = new THREE.Mesh(sideGeo, sideMat);
+      this.trackGroup.add(sideMesh);
+    }
+  }
+
+  /** Build the SPLIT-PATH FORK's HIGH ARCH as its own track ribbon, ALWAYS (both routes are
+   * always shown so the fork reads as a split that rejoins). Each fork's HIGH route is a
+   * hook-gated steep staircase up → flat top → staircase down, given as physics seg tops
+   * (forks[i].highSegs). We trace that profile into one ribbon (SAME purple stripe top, SAME
+   * narrow width, SAME thin slab as the floor track), with the staircase RISERS drawn as sharp
+   * vertical steps (visible step edges = the grip points), riding the same lane centre +
+   * serpentine curve so the arch sits DIRECTLY over the lane. The LOW underpass route is part of
+   * the floor ribbon (the dip valley is in physics._segs). The arch is purely VISUAL — physics is
+   * the single committed height function, so a LOW-route cube passes UNDER it with no collision.
+   * Static geometry built ONCE (no per-frame cost). Models on _buildRibbon's strip builder. */
+  _buildForks(physics, laneZ, topMat, sideMat) {
+    const forks = physics.forks;
+    if (!forks || !forks.length) return;
+    const half = RIBBON_DEPTH / 2;
+    const uScale = RIBBON_USCALE, vRepeat = 1;     // SAME stripe mapping as the floor ribbon
+    for (const f of forks) {
+      // Build the HIGH route's surface PROFILE as [{x,y}] (physics y +down), emitting each
+      // seg's two endpoints so the staircase risers become sharp vertical steps (a riser is two
+      // samples at the same x). Sorted by x (the high segs are already in x order).
+      const prof = [];
+      const push = (x, y) => {
+        const last = prof[prof.length - 1];
+        if (last && Math.abs(last.x - x) < 1e-6 && Math.abs(last.y - y) < 1e-6) return;
+        prof.push({ x, y });
+      };
+      for (const s of f.highSegs) { push(s.x0, s.topYa); push(s.x1, s.topYb); }
+      if (prof.length < 2) continue;
+      // densify long flat/ramp spans so the arch snakes with the lane (keep the exact profile
+      // points — incl. risers — so the steps stay sharp). Same RIBBON_DX as the floor.
+      const xs = [];
+      for (let i = 0; i < prof.length - 1; i++) {
+        const a = prof[i], b = prof[i + 1];
+        xs.push(a.x);
+        const span = b.x - a.x;
+        if (span > RIBBON_DX * 1.5) {
+          const n = Math.floor(span / RIBBON_DX);
+          for (let k = 1; k < n; k++) xs.push(a.x + span * (k / n));
+        }
+      }
+      xs.push(prof[prof.length - 1].x);
+      // surfaceY along the HIGH route at an arbitrary x: linear-interp the profile (the high
+      // route is not in physics.surfaceYAt unless committed, so sample the profile directly).
+      let pi = 0;
+      const profY = (x) => {
+        while (pi < prof.length - 2 && prof[pi + 1].x < x) pi++;
+        while (pi > 0 && prof[pi].x > x) pi--;
+        const a = prof[pi], b = prof[pi + 1] || a;
+        const dx = b.x - a.x;
+        return dx > 1e-9 ? a.y + (b.y - a.y) * ((x - a.x) / dx) : a.y;
+      };
+      const topPos = [], topUV = [], topIdx = [];
+      const sidePos = [], sideIdx = [];
+      const N = xs.length;
+      for (let i = 0; i < N; i++) {
+        const x = xs[i];
+        const ry = -profY(x);                      // render y (up) of the arch surface
+        const cz = laneZ + laneCurveZ(x);          // SAME lane centre + serpentine as the floor
+        const zN = cz - half, zF = cz + half;
+        topPos.push(x, ry, zN, x, ry, zF);
+        topUV.push(x * uScale, 0, x * uScale, vRepeat);
+        const by = ry - RIBBON_DOWN;               // slab bottom (dropped)
+        sidePos.push(x, ry, zN, x, by, zN, x, ry, zF, x, by, zF);
+        if (i > 0) {
+          const a = (i - 1) * 2, b = a + 1, cc = i * 2, d = cc + 1;
+          topIdx.push(a, cc, b, b, cc, d);
+          const p = (i - 1) * 4, q = i * 4;
+          sideIdx.push(p + 0, p + 1, q + 0, q + 0, p + 1, q + 1);     // near wall
+          sideIdx.push(p + 2, q + 2, p + 3, p + 3, q + 2, q + 3);     // far wall
+          sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);     // bottom
+        }
+        if (i === 0 || i === N - 1) {              // END CAPS (ㅁ closure)
+          const b4 = i * 4;
+          sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
+          sideIdx.push(b4 + 0, b4 + 3, b4 + 2, b4 + 0, b4 + 1, b4 + 3);
+        }
+      }
+      const topGeo = new THREE.BufferGeometry();
+      topGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(topPos), 3));
+      topGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(topUV), 2));
+      topGeo.setIndex(topIdx);
+      topGeo.computeVertexNormals();
+      const topMesh = new THREE.Mesh(topGeo, topMat);
+      topMesh.userData.ribbon = true;             // counts as a track ribbon mesh
+      this.trackGroup.add(topMesh);
+
+      const sideGeo = new THREE.BufferGeometry();
+      sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
+      sideGeo.setIndex(sideIdx);
+      sideGeo.computeVertexNormals();
+      const sideMesh = new THREE.Mesh(sideGeo, sideMat);
+      sideMesh.userData.ribbon = true;
       this.trackGroup.add(sideMesh);
     }
   }

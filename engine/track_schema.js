@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'|'blocks'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'|'blocks'|'fork'} SegmentKind
  */
 
 /**
@@ -46,6 +46,16 @@
  * @property {number} [blockH]         BLOCKS only: each standing block's height (world units). Default SEGMENT_DEFAULTS.blockH.
  * @property {number} [debrisPerBlock] BLOCKS only: how many debris fragments a broken block becomes (default
  *                                     SEGMENT_DEFAULTS.debrisPerBlock). Total debris is capped at debrisCapTotal.
+ * @property {number} [highRise]       FORK only: the high route's staircase CLIMB height (total rise of the
+ *                                     hook-gated steep staircase up onto the arch). Default SEGMENT_DEFAULTS.forkHighRise.
+ *                                     The staircase auto-hook-gates (overall slope >= steepThresh) so ONLY a HOOK
+ *                                     leg takes the high road — exactly the steep-staircase mechanic.
+ * @property {number} [highSteps]      FORK only: number of treads on EACH of the high route's up + down staircases.
+ *                                     Default SEGMENT_DEFAULTS.forkHighSteps.
+ * @property {number} [flatTop]        FORK only: x-length of the flat high path on top of the arch (between the up
+ *                                     and down staircases). Default SEGMENT_DEFAULTS.forkFlatTop.
+ * @property {number} [lowDip]         FORK only: how far the LOW route dips DOWN under the arch (a shallow valley /
+ *                                     underpass — always passable by any leg). Default SEGMENT_DEFAULTS.forkLowDip.
  * @property {number} [rough]          0..1 friction (rough floor), default 0.6
  * @property {number} [bouncy]         0..1 restitution (rubber), default 0
  */
@@ -116,10 +126,24 @@ export const SEGMENT_DEFAULTS = Object.freeze({
   debrisPerBlock: 5,    // fragments a broken block becomes
   debrisCapTotal: 24,   // PERF hard cap on total debris (O(N²) separation stays cheap)
   debrisRfrac: 0.26,    // debris fragment half-size as a fraction of blockW (small chips)
+  // FORK (SPLIT-PATH): the track splits into a HIGH route (hook-gated steep staircase up → flat
+  // top → staircase down) and a LOW route (a shallow valley / underpass under the arch) that
+  // REJOIN at the fork end. The LEG SHAPE decides the route, committed at the fork ENTRANCE:
+  // a HOOK takes the high road (a hook is exactly what climbs the steep staircase); any other
+  // leg takes the always-passable low road (no soft-lock — both routes always reach the rejoin).
+  forkHighRise: 4.4,    // high route staircase climb height (overall slope >= steepThresh ⇒ auto hook-gate)
+  forkHighSteps: 5,     // treads on EACH of the up + down staircases (TALL grip-point edges: with the
+                        // default ~50° geometry below, each step rise 0.88u > its run ⇒ clearly stepped)
+  forkFlatTop: 4.0,     // x-length of the flat high path on top of the arch
+  // The high route's per-staircase RUN = (fork length − flatTop) / 2; the climb slope = forkHighRise/run.
+  // To match the standalone steep climb at ~50° (slope ≈ 1.19) with forkHighRise 4.4, author the fork
+  // `length` ≈ 2·(4.4/1.19) + flatTop ≈ 11.4 (run ≈ 3.7 per staircase). The slope is DATA-derived from
+  // the authored length (not a fixed default), and auto-hook-gates whenever it is >= steepThresh.
+  forkLowDip: 2.2,      // how far the low route dips DOWN under the arch (a shallow underpass valley)
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls', 'blocks'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls', 'blocks', 'fork'];
 
 /** @type {LegPreset[]} */
 export const LEG_PRESETS = ['wheel', 'stick', 'hook'];
@@ -207,6 +231,19 @@ export function validateTrack(t) {
         throw new Error(`segment[${i}] blocks blockH must be > 0`);
       if (s.debrisPerBlock != null && !(s.debrisPerBlock > 0))
         throw new Error(`segment[${i}] blocks debrisPerBlock must be > 0`);
+    }
+    if (s.kind === 'fork') {
+      // a FORK is a SPLIT-PATH over `length` (the total span to the rejoin). All shaping
+      // fields are optional (fall back to SEGMENT_DEFAULTS); if present they must be positive.
+      // `length` is already validated as positive above (the generic length check).
+      if (s.highRise != null && !(s.highRise > 0))
+        throw new Error(`segment[${i}] fork highRise must be > 0`);
+      if (s.highSteps != null && !(s.highSteps > 0))
+        throw new Error(`segment[${i}] fork highSteps must be > 0`);
+      if (s.flatTop != null && !(s.flatTop > 0))
+        throw new Error(`segment[${i}] fork flatTop must be > 0`);
+      if (s.lowDip != null && !(s.lowDip > 0))
+        throw new Error(`segment[${i}] fork lowDip must be > 0`);
     }
   });
   if (t.rival != null) {

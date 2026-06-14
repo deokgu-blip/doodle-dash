@@ -420,6 +420,23 @@ export class Physics {
     this._steepHit = { found: false, x: 0, slope: 0 };
     this._steepStairRuns = [];   // build-time list of steep-gated stairs run feet/windows
 
+    // ── SPLIT-PATH FORK (a BRANCH the LEG SHAPE routes — commit-at-entrance) ──
+    // At a `fork` the track splits into a HIGH route (hook-gated steep staircase up → flat top
+    // → staircase down) and a LOW route (a shallow underpass valley) that REJOIN at the same x
+    // and base y. Because x is forward-only and the terrain is a SINGLE-VALUED height function,
+    // we do NOT carry two simultaneous physics surfaces: we COMMIT the route ONCE when the cube
+    // first crosses the fork's x0 (HOOK ⇒ high, anything else ⇒ low), then the active surface for
+    // the whole fork == the committed route until the rejoin. This is a BRANCH, NOT a gate — both
+    // routes always reach the rejoin (no soft-lock). Each fork's geometry is built ONCE in
+    // buildTrack: the LOW route lives in the MAIN _segs (so the default O(log n) lookup +
+    // lookahead probe is always valid and always the always-passable road), and the HIGH route
+    // lives in its own indexed seg list inside the fork record. surfaceYAt/_segAt/etc. swap to the
+    // HIGH segs ONLY for x inside a fork that is COMMITTED high. Before commit (lookahead probes)
+    // the LOW route is sampled, so the steep gate is never falsely tripped before the cube enters.
+    this._forks = [];            // [{ id, x0, x1, baseY, highSegs:[…], highX0:Float64Array, highRuns:[…] }]
+    this._forkRoute = null;      // Map forkId → 'high' | 'low' (committed at entrance; null until built)
+    this._activeForkHint = -1;   // last fork index the body x fell inside (O(1) commit/lookup cache)
+
     // ── RENDER INTERPOLATION (mobile micro-stutter fix) ──
     // The SIM ticks on a FIXED timestep (FIXED_DT) with an accumulator that carries the
     // sub-tick remainder. On a real-device rAF the inter-frame interval jitters around
@@ -498,6 +515,11 @@ export class Physics {
     this._debX = null; this._debY = null; this._debVX = null; this._debVY = null; this._debR = null;
     this._debActive = null; this._debResist = 1; this._debContacts = 0; this._debRenderList = null;
     this._blockSpecs = null;
+    // SPLIT-PATH FORK: cleared here and rebuilt in buildTrack. _forkRoute (the committed
+    // route per fork) is reset to a fresh Map so a restart re-chooses the road at the entrance.
+    this._forks = [];
+    this._forkRoute = new Map();
+    this._activeForkHint = -1;
   }
 
   /** Pre-race idle float toggle (reference start look). While ON the cube hovers
@@ -819,6 +841,128 @@ export class Physics {
           x0: bx0, x1: bx1, count: blkCount, w: blkW, h: blkH, debrisPer: debPer, surfaceY });
         cursorX += len;
         // surfaceY unchanged (flat run under the wall).
+      } else if (seg.kind === 'fork') {
+        // FORK = a SPLIT-PATH the LEG SHAPE routes (commit-at-entrance). The track splits into:
+        //   • HIGH route: a HOOK-GATED STEEP STAIRCASE up (overall slope >= steepThresh ⇒ auto
+        //     hook-gated, EXACTLY the steep-staircase mechanic) → a flat top on the arch → a
+        //     staircase back DOWN → rejoin at the base.  A HOOK commits here (a hook is exactly
+        //     what climbs the steep staircase — fully consistent).
+        //   • LOW route: base → a shallow DIP under the arch (a valley / underpass) → back up to
+        //     the base → rejoin. The always-passable "anyone" road (any leg).
+        // Both rejoin at the SAME x1 and SAME base y; normal segments continue after.
+        //
+        // SINGLE-HEIGHT-FUNCTION MODEL: x is forward-only and the surface is single-valued, so we
+        // do NOT keep two live physics surfaces. The LOW route is built into the MAIN _segs (so the
+        // default O(log n) lookup + the lookahead probe ALWAYS see the always-passable road and the
+        // steep gate is never falsely tripped before the cube enters). The HIGH route is built into
+        // its OWN indexed seg list stored in the fork record; surfaceYAt/_segAt swap to it ONLY for
+        // x inside a fork COMMITTED high (the commit happens in update() at the entrance). Both
+        // routes are also RENDERED (see renderer) so the fork visibly splits then merges.
+        const fx0 = cursorX, fx1 = cursorX + len;
+        const baseY = surfaceY;                                   // the rejoin base level (physics +down)
+        const highRise = (seg.highRise != null) ? seg.highRise : SEGMENT_DEFAULTS.forkHighRise;
+        const highSteps = Math.max(1, (seg.highSteps != null ? seg.highSteps : SEGMENT_DEFAULTS.forkHighSteps) | 0);
+        const flatTop = (seg.flatTop != null) ? seg.flatTop : SEGMENT_DEFAULTS.forkFlatTop;
+        const lowDip = (seg.lowDip != null) ? seg.lowDip : SEGMENT_DEFAULTS.forkLowDip;
+        const forkId = this._forks.length;
+
+        // ── LOW ROUTE (into the MAIN _segs): base flat lead-in → dip-down ramp → dip-up ramp →
+        //    base flat lead-out, spanning the whole fork [fx0,fx1] and rejoining at baseY. The
+        //    dip is a SHALLOW symmetric valley (a V with a floor) — a short flat lead-in/out so the
+        //    mouth + rejoin read cleanly, the dip in the middle. NEVER steep-gated (always passable).
+        const lowLead = Math.min(1.6, Math.max(0.8, len * 0.12));     // flat at the mouth + at the rejoin
+        const dipSpan = Math.max(1e-3, len - 2 * lowLead);            // the valley span (descent + ascent)
+        const dipHalf = dipSpan / 2;
+        // mouth flat
+        addSlab(fx0 + lowLead / 2, baseY, lowLead, thick);
+        this._segs.push({ x0: fx0, x1: fx0 + lowLead, kind: 'fork', forkId, route: 'low',
+          topYa: baseY, topYb: baseY, surfFn: () => baseY });
+        // descent into the valley (down = +y)
+        {
+          const dx0 = fx0 + lowLead, dx1 = dx0 + dipHalf;
+          const dTopY0 = baseY, dTopY1 = baseY + lowDip;
+          addRampSlab(dx0, dx1, dTopY0, dTopY1, thick);
+          const dSlope = lowDip / dipHalf;
+          this._segs.push({ x0: dx0, x1: dx1, kind: 'fork', forkId, route: 'low', gap: true,
+            topYa: dTopY0, topYb: dTopY1, slope: dSlope, surfFn: (px) => dTopY0 + dSlope * (px - dx0) });
+          if (dTopY1 < this._maxSurfaceTopY) this._maxSurfaceTopY = dTopY1;
+        }
+        // ascent back out of the valley
+        {
+          const ax0 = fx0 + lowLead + dipHalf, ax1 = fx0 + lowLead + dipSpan;
+          const aTopY0 = baseY + lowDip, aTopY1 = baseY;
+          addRampSlab(ax0, ax1, aTopY0, aTopY1, thick);
+          const aSlope = -lowDip / dipHalf;
+          this._segs.push({ x0: ax0, x1: ax1, kind: 'fork', forkId, route: 'low', gap: true,
+            topYa: aTopY0, topYb: aTopY1, slope: aSlope, surfFn: (px) => aTopY0 + aSlope * (px - ax0) });
+        }
+        // rejoin flat lead-out (the LAST low seg ends exactly at fx1 at baseY ⇒ continuous rejoin)
+        addSlab(fx1 - lowLead / 2, baseY, lowLead, thick);
+        this._segs.push({ x0: fx1 - lowLead, x1: fx1, kind: 'fork', forkId, route: 'low',
+          topYa: baseY, topYb: baseY, surfFn: () => baseY });
+
+        // ── HIGH ROUTE (into its OWN list `highSegs`, NOT the main _segs): hook-gated steep
+        //    staircase UP → flat top → staircase DOWN → rejoin at baseY. Built with the SAME
+        //    staircase/ramp math (steepGate set when the overall up-slope >= steepThresh) so a
+        //    committed-high cube is hook-gated EXACTLY like the standalone steep staircase. The
+        //    up + down staircases SYMMETRICALLY frame a flat top so the arch reads as an over-pass.
+        const highSegs = [];
+        const highRuns = [];                                          // steep-gated staircase runs on the high route
+        const climbSpan = (len - flatTop) / 2;                        // x-length of EACH staircase (up + down)
+        const stairSlope = highRise / Math.max(1e-3, climbSpan);      // overall up-slope (rise/run)
+        const highSteep = stairSlope >= TUNE.steepThresh;             // hook-gate the high climb if steep enough
+        let hcx = fx0;
+        let hy = baseY;
+        // UP staircase (rises by highRise over climbSpan): each tread is a steep-gated stairs seg.
+        {
+          const stepLen = climbSpan / highSteps;
+          const stepH = highRise / highSteps;
+          const upX0 = hcx;
+          for (let i = 0; i < highSteps; i++) {
+            hy -= stepH;                                              // up = negative y
+            const treadY = hy;
+            highSegs.push({ x0: hcx, x1: hcx + stepLen, kind: 'stairs', forkId, route: 'high',
+              topYa: treadY, topYb: treadY, stepH, steepGate: highSteep, surfFn: () => treadY });
+            if (treadY < this._maxSurfaceTopY) this._maxSurfaceTopY = treadY;
+            hcx += stepLen;
+          }
+          if (highSteep) highRuns.push({ x0: upX0, x1: hcx, slope: -stairSlope });
+        }
+        const topY = hy;                                              // arch top level (most negative y)
+        // FLAT TOP on the arch.
+        highSegs.push({ x0: hcx, x1: hcx + flatTop, kind: 'flat', forkId, route: 'high',
+          topYa: topY, topYb: topY, surfFn: () => topY });
+        hcx += flatTop;
+        // DOWN staircase (descends back to baseY over climbSpan) — descent is NOT hook-gated.
+        {
+          const stepLen = climbSpan / highSteps;
+          const stepH = highRise / highSteps;
+          for (let i = 0; i < highSteps; i++) {
+            hy += stepH;                                              // down = positive y
+            const treadY = hy;
+            highSegs.push({ x0: hcx, x1: hcx + stepLen, kind: 'stairs', forkId, route: 'high',
+              topYa: treadY, topYb: treadY, stepH, steepGate: false, surfFn: () => treadY });
+            hcx += stepLen;
+          }
+        }
+        // clamp the final high seg to end EXACTLY at fx1 at baseY (continuous rejoin; absorb any
+        // rounding from the per-step division).
+        if (highSegs.length) {
+          const lastSeg = highSegs[highSegs.length - 1];
+          lastSeg.x1 = fx1;
+          const endY = baseY;
+          const a = lastSeg.topYa, run = Math.max(1e-3, lastSeg.x1 - lastSeg.x0);
+          const sl = (endY - a) / run;
+          lastSeg.topYb = endY;
+          lastSeg.surfFn = (px) => a + sl * (px - lastSeg.x0);       // tiny linear correction tread
+        }
+        // build the high route's O(log n) x0 index (ascending — the high segs are pushed in x order).
+        const hxs = new Float64Array(highSegs.length);
+        for (let i = 0; i < highSegs.length; i++) hxs[i] = highSegs[i].x0;
+        this._forks.push({ id: forkId, x0: fx0, x1: fx1, baseY, highSegs, highX0: hxs, highRuns });
+
+        cursorX += len;
+        surfaceY = baseY;                                            // both routes rejoin at the base
       }
     }
 
@@ -1066,13 +1210,87 @@ export class Physics {
     return res;
   }
 
+  /** Index of the fork whose [x0,x1] contains px, or -1. Bounded #forks scan (forks are
+   * a handful) with an O(1) hint for the monotone-forward hot path. No allocation. */
+  _forkIdxAt(px) {
+    const F = this._forks;
+    if (!F || !F.length) return -1;
+    const h = this._activeForkHint;
+    if (h >= 0 && h < F.length && px >= F[h].x0 && px <= F[h].x1) return h;
+    for (let i = 0; i < F.length; i++) {
+      if (px >= F[i].x0 && px <= F[i].x1) { this._activeForkHint = i; return i; }
+    }
+    return -1;
+  }
+
+  /** The COMMITTED route ('high' | 'low') of fork `id`, or null if not yet committed.
+   * Before commit (lookahead probes from outside the fork) callers DEFAULT to the LOW
+   * route (always-passable) so the steep gate is never falsely tripped before entry. */
+  _committedRoute(id) {
+    return (this._forkRoute && this._forkRoute.has(id)) ? this._forkRoute.get(id) : null;
+  }
+
+  /** COMMIT the fork route at the ENTRANCE. Called each step with the cube's forward x:
+   * for the fork the cube is currently inside, if it has NOT been committed yet, commit it
+   * NOW from the CURRENT leg shape — a HOOK takes the HIGH road (a hook is exactly what
+   * climbs the steep staircase), anything else takes the always-passable LOW road. Once
+   * committed the route is FIXED for the whole fork (the rejoin is close), so REDRAWING the
+   * leg MID-fork does NOT switch roads (no surface teleport). Idempotent + O(1) (forks are a
+   * handful, the fork-index hint makes the common case O(1)); zero allocation (the Map is
+   * built once). Returns the committed route, or null when not inside a fork. */
+  _commitForkAt(px) {
+    const fi = this._forkIdxAt(px);
+    if (fi < 0) return null;
+    const f = this._forks[fi];
+    if (this._forkRoute.has(f.id)) return this._forkRoute.get(f.id);
+    const route = this._isHook ? 'high' : 'low';
+    this._forkRoute.set(f.id, route);
+    return route;
+  }
+
+  /** If px lies inside a fork that is COMMITTED to the HIGH route, return that fork's
+   * record (so surfaceYAt/_segAt sample the high segs). Otherwise null (⇒ the main _segs,
+   * which hold the LOW route over the fork, are used — the always-passable default). */
+  _highForkAt(px) {
+    const fi = this._forkIdxAt(px);
+    if (fi < 0) return null;
+    const f = this._forks[fi];
+    return this._committedRoute(f.id) === 'high' ? f : null;
+  }
+
+  /** Binary-search the HIGH route's own ascending x0 index for the seg covering px.
+   * Mirrors _segIdxAt but over the fork's private highX0 (no shared hint — high forks are
+   * short, the linear-then-binary cost is trivial). Returns the seg or null. */
+  _highSegAt(f, px) {
+    const xs = f.highX0, segs = f.highSegs, n = xs.length;
+    if (!n) return null;
+    let lo = 0, hi = n - 1, res = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (xs[mid] <= px) { res = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (res < 0) return null;
+    // check the matched seg + seam neighbours (treads abut; px can equal a seam x).
+    let found = null, foundY = null;
+    for (let j = res - 1; j <= res + 1; j++) {
+      if (j < 0 || j >= n) continue;
+      const s = segs[j];
+      if (px < s.x0 || px > s.x1) continue;
+      const y = s.surfFn(px);
+      if (y == null) { if (!found) found = s; continue; }
+      if (!found || foundY == null || y < foundY) { found = s; foundY = y; }
+    }
+    return found;
+  }
+
   /**
    * Expected track surface y (physics, +down) at any x. Returns the HIGHEST (most
    * negative) surface covering px, or null over a gap. O(log n) via _segIdxAt; the
    * "highest covering surface" semantics are preserved by also testing the seam
    * neighbours of the matched segment (the only place two segments can share an x).
+   * FORK: for x inside a fork COMMITTED to the HIGH route, the high profile is returned
+   * instead (the main _segs hold the LOW route — the always-passable default).
    */
   surfaceYAt(px) {
+    const hf = this._highForkAt(px);
+    if (hf) { const s = this._highSegAt(hf, px); return s ? s.surfFn(px) : null; }
     const segs = this._segs;
     const i = this._segIdxAt(px);
     if (i < 0) return null;
@@ -1097,6 +1315,9 @@ export class Physics {
     const s = this._segAt(px);
     // ramp / wall (steep riser face) / bumps (wavy surface) all carry an analytic slope.
     if (s && (s.kind === 'ramp' || s.kind === 'wall' || s.kind === 'bumps') && typeof s.slope === 'number') return s.slope; // downhill > 0 (y +down)
+    // FORK low-route ramps (the dip/underpass) carry an analytic slope too; high-route segs
+    // are stairs/flat (slope 0, handled below). A fork flat lead-in/out has no slope ⇒ 0.
+    if (s && s.kind === 'fork') return (typeof s.slope === 'number') ? s.slope : 0;
     if (s && (s.kind === 'flat' || s.kind === 'stairs')) return 0;
     if (s && s.kind === 'planks' && s.plank) return 0; // a plank board is level
     const dx = 0.35;
@@ -1111,12 +1332,23 @@ export class Physics {
    * (reference look). The diagonal is ALWAYS at or ABOVE the stepped treads (a
    * staircase's hypotenuse sits above its steps), so floating to it keeps the foot
    * ON/above every tread — zero penetration is preserved. Elsewhere == surfaceYAt. */
+  /** The seg list a stairs seg's RUN lives in: a HIGH-route fork stair scans its fork's
+   * own highSegs (the high staircases are NOT in the main _segs); any other stairs scans
+   * the main _segs. Keeps the contiguous-run lean/float scan correct for fork stairs. */
+  _stairScanList(seg) {
+    if (seg && seg.route === 'high' && seg.forkId != null) {
+      const f = this._forks[seg.forkId];
+      if (f) return f.highSegs;
+    }
+    return this._segs;
+  }
+
   bodySurfaceYAt(px) {
     const seg = this._segAt(px);
     if (seg && seg.kind === 'stairs') {
       // find the contiguous stair RUN containing px (abutting stair treads).
       let x0 = seg.x0, x1 = seg.x1, ya = seg.surfFn(seg.x0), yb = seg.surfFn(seg.x1);
-      for (const s of this._segs) {
+      for (const s of this._stairScanList(seg)) {
         if (s.kind !== 'stairs') continue;
         if (s.x1 > x0 - 1e-6 && s.x0 < x1 + 1e-6) {
           if (s.x0 < x0) { x0 = s.x0; ya = s.surfFn(s.x0); }
@@ -1158,7 +1390,7 @@ export class Physics {
     // On a stair run, lean to the whole run's diagonal (first→last tread).
     if (seg && seg.kind === 'stairs') {
       let x0 = seg.x0, x1 = seg.x1, ya = seg.surfFn(seg.x0), yb = seg.surfFn(seg.x1);
-      for (const s of this._segs) {
+      for (const s of this._stairScanList(seg)) {
         if (s.kind !== 'stairs') continue;
         // contiguous stair treads share the same run if they abut.
         if (s.x1 > x0 - 1e-6 && s.x0 < x1 + 1e-6) {
@@ -1180,6 +1412,11 @@ export class Physics {
     // body climbs the ledge nose-up rather than staying flat against a vertical face.
     if (seg && (seg.kind === 'ramp' || seg.kind === 'bumps' || seg.kind === 'wall') && typeof seg.slope === 'number') {
       return clampMag(Math.atan(seg.slope) * TUNE.tiltGain, TUNE.tiltMax);
+    }
+    // FORK low-route ramp (the dip/underpass) leans to its analytic slope; a fork flat
+    // lead-in/out (no slope) is level. High-route segs are stairs/flat (handled above/here).
+    if (seg && seg.kind === 'fork') {
+      return (typeof seg.slope === 'number') ? clampMag(Math.atan(seg.slope) * TUNE.tiltGain, TUNE.tiltMax) : 0;
     }
     if (seg && seg.kind === 'flat') return 0;
     if (seg && seg.kind === 'planks' && seg.plank) return 0; // a plank board is level
@@ -1226,8 +1463,12 @@ export class Physics {
 
   /** Local segment under px (for terrain / climb decisions). O(log n) via _segIdxAt;
    * preserves the "prefer the highest surface" semantics by testing the matched
-   * segment plus its seam neighbours (the only place two segments can share an x). */
+   * segment plus its seam neighbours (the only place two segments can share an x).
+   * FORK: for x inside a COMMITTED-HIGH fork, the committed high seg is returned (the
+   * main _segs hold the LOW route — the always-passable default before/without commit). */
   _segAt(px) {
+    const hf = this._highForkAt(px);
+    if (hf) return this._highSegAt(hf, px);
     const segs = this._segs;
     const i = this._segIdxAt(px);
     if (i < 0) return null;
@@ -1524,6 +1765,21 @@ export class Physics {
         if (!any || r.x0 < bestX) { bestX = r.x0; bestSlope = r.slope; any = true; }
       }
     }
+    // (c) FORK HIGH-route steep staircase runs — ONLY for a fork COMMITTED to the HIGH route.
+    //     Before commit the high road isn't the active surface (the LOW road is), so its steep
+    //     gate must NOT fire on a lookahead probe (invariant: lookahead never trips the gate
+    //     before entry). A non-hook never commits HIGH, so in practice this gate only confirms
+    //     consistency; a hook on the high road passes it. Bounded #forks × #runs scan.
+    for (let i = 0; i < this._forks.length; i++) {
+      const f = this._forks[i];
+      if (this._committedRoute(f.id) !== 'high') continue;
+      for (let k = 0; k < f.highRuns.length; k++) {
+        const r = f.highRuns[k];
+        if (r.x0 > fromX && r.x0 <= toX) {
+          if (!any || r.x0 < bestX) { bestX = r.x0; bestSlope = r.slope; any = true; }
+        }
+      }
+    }
     if (!any) { this._steepHit.found = false; return null; }
     const h = this._steepHit;
     h.found = true; h.x = bestX; h.slope = bestSlope;
@@ -1532,11 +1788,21 @@ export class Physics {
 
   /** Is px inside a steep-gated STAIRCASE run (foot..top)? Bounded #runs scan (no per-frame
    * alloc). Used by the per-frame gate so the per-RISER length gate is SUPPRESSED on a steep
-   * staircase (the hook gate is the only thing that matters there — reach is irrelevant). */
+   * staircase (the hook gate is the only thing that matters there — reach is irrelevant).
+   * FORK: also true on a COMMITTED-HIGH fork's steep staircase run (so its risers are
+   * hook-gated, not length-gated, exactly like the standalone steep staircase). */
   _onSteepStairRun(px) {
     for (let i = 0; i < this._steepStairRuns.length; i++) {
       const r = this._steepStairRuns[i];
       if (px >= r.x0 - 1e-6 && px <= r.x1 + 1e-6) return true;
+    }
+    for (let i = 0; i < this._forks.length; i++) {
+      const f = this._forks[i];
+      if (this._committedRoute(f.id) !== 'high') continue;
+      for (let k = 0; k < f.highRuns.length; k++) {
+        const r = f.highRuns[k];
+        if (px >= r.x0 - 1e-6 && px <= r.x1 + 1e-6) return true;
+      }
     }
     return false;
   }
@@ -2044,6 +2310,16 @@ export class Physics {
 
     const drive = running && this.legDrawn && this.motorEnabled;
 
+    // SPLIT-PATH FORK: COMMIT the route at the ENTRANCE. The instant the cube's forward x is
+    // inside a fork (it just crossed x0), commit the road from the CURRENT leg shape (HOOK ⇒
+    // high, else low) if not already committed. From then on the committed route IS the active
+    // surface for the whole fork (surfaceYAt/_segAt/steep-gate swap to it), and a mid-fork
+    // redraw can NOT switch roads (the road is ridden out — the rejoin is close ⇒ no teleport).
+    // Done every step (cheap, O(1) hint) so the commit also lands on the headless/forceStart
+    // path and on a leg drawn mid-fork. Only commits while DRIVING (a leg exists + running) so a
+    // pre-race/idle probe never pre-commits the road before the player actually enters.
+    if (drive && this._forks.length) this._commitForkAt(this._x);
+
     let v = 0;
     if (drive) {
       const reach = this._reach;
@@ -2116,12 +2392,13 @@ export class Physics {
         if (seg.kind === 'ramp' && seg.steepGate && !seg.gap && this._isHook) {
           // climbing a STEEP ramp WITH a hook leg — grip-and-step pace (like stairs).
           terrain = TUNE.stairClimbSlow;
-        } else if (seg.kind === 'ramp' || seg.kind === 'bumps') {
+        } else if (seg.kind === 'ramp' || seg.kind === 'bumps'
+                   || (seg.kind === 'fork' && typeof seg.slope === 'number')) {
           // slope > 0 means descending (topY increases downhill since y is +down…
           // careful: y +down so going UP is slope<0). Use sign of slope. The GAP's
-          // descent/ascent ramps and the BUMPS sub-ramps ride this same blend, so a
-          // short leg crawls UP the V-trench exit / bump fronts (uphill = slow) while
-          // a long leg either launches over (gap) or rolls across faster.
+          // descent/ascent ramps, the BUMPS sub-ramps AND the FORK low-route dip ramps
+          // (underpass valley) ride this same blend, so a leg slows up the dip exit and
+          // speeds down into it (a short leg crawls, a long leg rolls) — no soft-lock.
           terrain = seg.slope < 0 ? lerpSlow(seg.slope, TUNE.uphillSlow) : lerpFast(seg.slope, TUNE.downhillFast);
         } else if (seg.kind === 'wall') {
           // climbing the steep wall face (a climbable long leg) — slow, like stairs.
@@ -2562,6 +2839,32 @@ export class Physics {
   /** Is the CURRENT drawn leg a HOOK (sharp bend ⇒ can grip-and-step over a steep ramp)?
    * SHAPE gate — independent of reach. False for straight bars / smooth arcs / circles. */
   get isHook() { return !!this._isHook; }
+
+  // ── SPLIT-PATH FORK getters (renderer + verifier read these) ──
+  /** Number of forks on the track (0 ⇒ none). */
+  get forkCount() { return this._forks ? this._forks.length : 0; }
+  /** The COMMITTED route ('high'|'low') of fork `id`, or null if not committed yet (the cube
+   * hasn't entered). The verifier reads this to confirm the entrance commit + no mid-fork switch. */
+  forkRoute(id) { return this._committedRoute(id); }
+  /** Read-only fork records for the renderer (it draws BOTH routes always) + the verifier.
+   * Each entry: { id, x0, x1, baseY, highSegs:[{x0,x1,kind,topYa,topYb}], lowSegs:[…], route }.
+   * Built once; this getter assembles the light view list lazily (NOT on the per-frame hot path —
+   * the renderer calls it once at buildTrack). */
+  get forks() {
+    if (!this._forks || !this._forks.length) return null;
+    const out = new Array(this._forks.length);
+    for (let i = 0; i < this._forks.length; i++) {
+      const f = this._forks[i];
+      // the LOW route segs for this fork live in the main _segs tagged forkId+route='low'.
+      const lowSegs = this._segs.filter((s) => s.kind === 'fork' && s.forkId === f.id)
+        .map((s) => ({ x0: s.x0, x1: s.x1, topYa: s.surfFn(s.x0), topYb: s.surfFn(s.x1) }));
+      const highSegs = f.highSegs.map((s) => ({ x0: s.x0, x1: s.x1, kind: s.kind,
+        topYa: s.surfFn(s.x0), topYb: s.surfFn(s.x1), stepH: s.stepH || 0 }));
+      out[i] = { id: f.id, x0: f.x0, x1: f.x1, baseY: f.baseY, lowSegs, highSegs,
+        route: this._committedRoute(f.id) };
+    }
+    return out;
+  }
   /** Measured max turn angle (deg) of the current chain — the hookiness metric (diagnostic). */
   get maxTurnDeg() { return this._maxTurnDeg || 0; }
   /** Hook classification of an ARBITRARY normalized stroke (box [-1,1]) WITHOUT mutating

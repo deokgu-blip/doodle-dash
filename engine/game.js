@@ -186,10 +186,21 @@ export class Game {
     //   • STEEP uphill ramp (steepGate) → 'hook' (legacy: same hook-grip rule)
     gates.length = 0;
     let prevStairX1 = -Infinity;
+    let prevForkX1 = -Infinity;
     for (const s of segs) {
       if (s.kind === 'tunnel') gates.push({ x: s.x0, need: 'short' });
       else if (s.kind === 'wall' || s.kind === 'gap') gates.push({ x: s.x0, need: 'long' });
       else if (s.kind === 'ramp' && s.steepGate && !s.gap) gates.push({ x: s.x0, need: 'hook' });
+      else if (s.kind === 'fork') {
+        // SPLIT-PATH FORK: the LEG SHAPE routes the rival exactly like the player (commit-at-
+        // entrance in walker.update from _isHook). We schedule a HOOK at the fork so BOLT takes
+        // the HIGH road (the hook-gated steep staircase arch) — consistent with the player taking
+        // the high road with a hook. (Both routes always reach the rejoin, so even if a non-hook
+        // leg were scheduled the rival would just take the always-passable LOW underpass — NO
+        // soft-lock either way.) The fork low segs share forkId; gate once per fork on its x0.
+        if (s.x0 > prevForkX1 + 0.05) gates.push({ x: s.x0, need: 'hook' });
+        prevForkX1 = s.x1;
+      }
       else if (s.kind === 'stairs') {
         // gate once per RUN (treads abut). A STEEP-gated staircase needs a HOOK; a gentle
         // (ungated) staircase needs a LONG leg (the per-riser length gate).

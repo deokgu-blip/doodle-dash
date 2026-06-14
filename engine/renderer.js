@@ -132,9 +132,13 @@ export class Renderer {
     // meant a full per-pixel PBR lighting eval (ambient + 2 dir lights, normal-based) on
     // the LARGEST fill area in the frame — on a 120Hz high-DPI panel that dominated GPU.
     // The art is flat single-colour, so an UNLIT MeshBasicMaterial renders the IDENTICAL
-    // solid trackEdge colour at zero lighting cost. FrontSide kept (closed box ⇒ back-face
-    // cull halves the side fill; computeVertexNormals stays harmless, just unused now).
-    this._sideMat = new THREE.MeshBasicMaterial({ color: COL.trackEdge, side: THREE.FrontSide });
+    // solid trackEdge colour at zero lighting cost (the big PBR→unlit win is unchanged).
+    // SIDE: DoubleSide — FrontSide back-face-culled the cross-section END-CAPS from the
+    // camera, so the box read as an OPEN ㄷ (user: "단면이 아직 ㄷ자, ㅁ으로 채워줘"). With the
+    // sides/caps DoubleSide every face shows from any angle ⇒ a FILLED solid ㅁ. The fill
+    // cost is minor (unlit shader, thin ribbon, DPR≤1.5) and the real frame-drop causes
+    // (render-cap beat-skip + fixed-timestep judder) were fixed separately, not by this cull.
+    this._sideMat = new THREE.MeshBasicMaterial({ color: COL.trackEdge, side: THREE.DoubleSide });
   }
 
   _buildBackground() {
@@ -387,6 +391,11 @@ export class Renderer {
       if (i === 0 || i === N - 1) {
         const b4 = i * 4;
         sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
+        // ...AND the reverse winding so the cap is solid from EITHER face. The side
+        // material is FrontSide (perf): a single-winding cap got back-face-culled from
+        // the camera ⇒ the cross-section read as an OPEN ㄷ. Both windings ⇒ filled ㅁ.
+        // (Only the 2 end-cap quads are double-wound — negligible fill; walls stay culled.)
+        sideIdx.push(b4 + 0, b4 + 3, b4 + 2, b4 + 0, b4 + 1, b4 + 3);
       }
       prevX = x;
     }
@@ -474,6 +483,8 @@ export class Renderer {
         if (i === 0 || i === N - 1) {
           const b4 = i * 4;
           sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
+          // reverse winding too ⇒ cap solid from either face (FrontSide side material).
+          sideIdx.push(b4 + 0, b4 + 3, b4 + 2, b4 + 0, b4 + 1, b4 + 3);
         }
       }
       const topGeo = new THREE.BufferGeometry();

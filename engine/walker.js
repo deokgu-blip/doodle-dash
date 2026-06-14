@@ -89,6 +89,13 @@ const TUNE = {
   uphillSlow: 0.55,      // multiplier on a ramp going up (per unit slope, blended)
   downhillFast: 1.25,    // multiplier on a ramp going down
   stairClimbSlow: 0.7,   // climbing stairs is a bit slower than flat
+  // TERRAIN-FACTOR LOW-PASS: rate k (1/s) at which the applied terrain multiplier eases
+  // toward the instantaneous slope target. τ = 1/k ≈ 0.5s. Fast slope reversals (bumps,
+  // ~12 sign flips/s) average to ≈1 (a steady pace over a net-flat sine field); a long
+  // sustained ramp (slope held > a few hundred ms) still reaches its uphillSlow /
+  // downhillFast target, so hills are still slow-up / fast-down. ω uses the smoothed v so
+  // no-slip is preserved; only the SPEED is eased, never the height / contact / physics.
+  terrainLerp: 2.0,      // 1/s — terrain-factor low-pass rate (τ ≈ 0.5s)
   // BODY TILT (reference look): the cube leans to match the LOCAL surface tangent
   // — nose up on an ascent, nose down on a descent, level on the flat. We measure
   // the slope by sampling the surface a small dx either side of the body and take
@@ -236,6 +243,16 @@ export class Physics {
     this._vx = 0;                    // last realized forward speed (u/s)
     this._vTip = 0;                  // last foot tip linear speed (u/s)
     this._omega = 0;                 // last leg angular speed (rad/s)
+    // ── TERRAIN-FACTOR LOW-PASS (anti-bumps-ripple) ──
+    // The instantaneous terrain multiplier (uphillSlow ↔ downhillFast) flips many times a
+    // second on `bumps` (each ~½u sub-ramp reverses slope sign), which made v output ±2-4×
+    // ripple → the cube lurched forward in stutters on hills (a SPEED ripple, NOT a frame
+    // drop). We LOW-PASS the factor with a ~0.5s time-constant: fast slope reversals
+    // (bumps) average to ≈1 (a steady pace, since a sine hill is net-flat), while a long
+    // SUSTAINED ramp (low frequency) still drives the factor all the way to its target
+    // (uphill slow / downhill fast preserved). ω is derived from the SMOOTHED v, so
+    // no-slip holds; body height/contact uses the real surfaceY (unsmoothed).
+    this._terrainF = 1;              // eased terrain multiplier applied to v
 
     // ── GAIT-LOFT state (a run, not a forced flight) ──
     this._air = false;               // true while the current stride's hop has lifted the foot clear of the surface (legs STILL roll)
@@ -291,6 +308,7 @@ export class Physics {
     this._trying = false;
     this._vx = 0;
     this._vTip = 0;
+    this._terrainF = 1;
     this._theta = 0;
     this._angle = 0;
     this._air = false;
@@ -831,6 +849,7 @@ export class Physics {
       this._blocked = false;
       this._vx = 0;
       this._vTip = 0;
+      this._terrainF = 1;
       this._air = false;
       this._vy = 0;
       this._airFrames = 0;
@@ -1224,7 +1243,21 @@ export class Physics {
           terrain = TUNE.stairClimbSlow;
         }
       }
-      v *= terrain;
+      // LOW-PASS the terrain multiplier (anti-bumps-ripple). `terrain` is the INSTANTANEOUS
+      // slope target; we ease `_terrainF` toward it with a ~0.5s time-constant so the fast
+      // sign-flips of a `bumps` field (each sub-ramp reverses uphill↔downhill ~12×/s)
+      // average to ≈1 (a steady pace — a sine hill is net-flat), while a SUSTAINED ramp
+      // (slope held) still pulls `_terrainF` to its uphillSlow / downhillFast target. We
+      // apply the SMOOTHED factor, never the raw one. ω below is derived from this realized
+      // v, so no-slip is preserved; the body height / contact use the real (unsmoothed)
+      // surfaceY, so no-penetration / grounding are untouched. (On a blocked frame v was
+      // set to 0 above; 0·_terrainF stays 0, and `terrain`=1 there eases _terrainF back to
+      // neutral so the resume pace is correct.)
+      {
+        const a = 1 - Math.exp(-TUNE.terrainLerp * dt);
+        this._terrainF += (terrain - this._terrainF) * a;
+      }
+      v *= this._terrainF;
 
       // RIVAL pace scaling: applied to the realized speed so ω = v/r still gives
       // exact no-slip and the foot still grazes (never penetrates) the surface.

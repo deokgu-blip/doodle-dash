@@ -104,9 +104,16 @@ export class Renderer {
     // always renders at the texture's full vivid colour at ANY camera angle.
     // DoubleSide so the top face shows regardless of triangle winding.
     this._topMat = new THREE.MeshBasicMaterial({ map: this._checkerTex, side: THREE.DoubleSide });
-    // The side/under/end faces of the CLOSED box. DoubleSide so the cross-section is
-    // solid from any angle — the path reads as a filled ㅁ box (no hollow see-through).
-    this._sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.85, side: THREE.DoubleSide });
+    // The side/under/end faces of the CLOSED box. PERF (§B.2): FrontSide (default
+    // back-face culling) — the box is FULLY CLOSED (near+far walls, bottom, AND first/
+    // last end-caps), so every visible face has its outward winding and the back faces
+    // (the hidden interior) need never be rasterised. DoubleSide rasterised BOTH faces
+    // of every wall/bottom/cap (≈98% of the scene's triangles), doubling the fragment
+    // fill in exactly the bumps/serpentine region the user reports choppy. Back-face
+    // culling halves that fragment work with NO visual change as long as the box is
+    // closed (verified by the closed-section screenshot — no see-through). The ribbon
+    // builder winds near-wall / far-wall / bottom / end-caps consistently outward.
+    this._sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.85, side: THREE.FrontSide });
   }
 
   _buildBackground() {
@@ -231,15 +238,58 @@ export class Renderer {
   _buildRibbon(physics, laneZ, topMat, sideMat) {
     const prof = this._surfaceProfile(physics);
     if (prof.length < 2) return;
+    // ── PERF (render-tessellation ↔ physics DECOUPLE, §B.1) ──────────────────────
+    // The PHYSICS bumps fields are sampled into MANY short sub-ramps (~0.45u apart,
+    // ~8/period) so the collision surface is analytic with zero penetration. But the
+    // RENDER only needs enough rings to look like a smooth rolling wave — the bumps
+    // amplitude is small (≈0.5), so the band reads smooth at HALF that ring density.
+    // The bumps fields are ~65% of the course, so their dense profile points dominate
+    // the ribbon vert/tri count AND the per-frame fragment fill in exactly the region
+    // the user reports choppy ("구불구불한 길"). We therefore DECIMATE the profile
+    // points that fall inside a bumps x-window (keep every BUMP_STRIDE-th), sampling
+    // the TRUE physics surfaceYAt(x) only at the kept x's. Physics _segs / surfaceYAt /
+    // every gate are UNTOUCHED — this is purely how densely we tessellate the render
+    // surface. Stair risers / ramp / flat / gap / tunnel points are ALL kept (only the
+    // gentle bumps wave is thinned). Endpoints of each bumps run are always kept so the
+    // wave start/end aligns with the neighbouring segment exactly (no seam gap).
+    const segs = physics._segs || [];
+    const bumpWins = [];
+    for (const s of segs) if (s.kind === 'bumps') {
+      const last = bumpWins[bumpWins.length - 1];
+      if (last && Math.abs(s.x0 - last.x1) < 1e-3) last.x1 = s.x1;       // merge contiguous
+      else bumpWins.push({ x0: s.x0, x1: s.x1 });
+    }
+    const inBumps = (x) => {
+      for (const w of bumpWins) if (x >= w.x0 - 1e-6 && x <= w.x1 + 1e-6) return w;
+      return null;
+    };
+    const BUMP_STRIDE = 2;   // keep 1 of every 2 bumps-region profile points (≈half the rings)
+    // Thin the PROFILE points first (drop interior bumps points), keeping run ends.
+    const thinned = [];
+    let bumpKeepCount = 0; let curWin = null;
+    for (let i = 0; i < prof.length; i++) {
+      const p = prof[i];
+      const w = inBumps(p.x);
+      if (!w) { thinned.push(p); curWin = null; continue; }
+      // bumps point: always keep the window's first/last; otherwise keep every Nth.
+      const isEnd = Math.abs(p.x - w.x0) < 1e-6 || Math.abs(p.x - w.x1) < 1e-6;
+      if (w !== curWin) { curWin = w; bumpKeepCount = 0; }
+      if (isEnd || (bumpKeepCount % BUMP_STRIDE) === 0) thinned.push(p);
+      bumpKeepCount++;
+    }
     // Densify: insert intermediate x samples (RIBBON_DX) between profile points so
     // the z-curve bends smoothly over long flats/ramps; keep the exact profile pts
-    // (incl. stair risers) so steps stay sharp.
+    // (incl. stair risers) so steps stay sharp. Bumps gaps are now ~2× wider after the
+    // decimation; we DON'T re-densify inside a bumps window (that would undo the cut),
+    // so the bumps span between two kept points stays a single straight render segment.
     const xs = [];
-    for (let i = 0; i < prof.length - 1; i++) {
-      const a = prof[i], b = prof[i + 1];
+    for (let i = 0; i < thinned.length - 1; i++) {
+      const a = thinned[i], b = thinned[i + 1];
       xs.push(a.x);
       const span = b.x - a.x;
-      if (span > RIBBON_DX * 1.5) {
+      // skip re-densification when this span lies inside a bumps window (keep it coarse).
+      const mid = (a.x + b.x) / 2;
+      if (span > RIBBON_DX * 1.5 && !inBumps(mid)) {
         const n = Math.floor(span / RIBBON_DX);
         for (let k = 1; k < n; k++) {
           const t = k / n;
@@ -247,7 +297,7 @@ export class Renderer {
         }
       }
     }
-    xs.push(prof[prof.length - 1].x);
+    xs.push(thinned[thinned.length - 1].x);
     // surfaceY at an arbitrary x via the physics sampler (highest surface), with a
     // hold-last fallback so a momentary null (segment seam round-off) never gaps.
     let lastY = prof[0].y;

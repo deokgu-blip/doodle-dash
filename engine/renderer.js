@@ -171,6 +171,10 @@ export class Renderer {
     if (this.trackGroup) { this.scene.remove(this.trackGroup); this._disposeGroup(this.trackGroup); }
     if (this.cubeMesh) { this.scene.remove(this.cubeMesh); this._disposeGroup(this.cubeMesh); }
     if (this.rivalCubeMesh) { this.scene.remove(this.rivalCubeMesh); this._disposeGroup(this.rivalCubeMesh); }
+    // PERF (SPIKE FIX): a track (re)build invalidates the prebuilt rival leg variant
+    // geometry (lane z / chain can change), so free the cache here. The game re-arms it
+    // via prebuildRivalLegVariants() right after this build, before the run starts.
+    this._disposeRivalLegVariants();
     this.trackGroup = new THREE.Group();
 
     // Shared track materials/texture (built once in the constructor, reused here).
@@ -587,18 +591,100 @@ export class Renderer {
     this.legGroups = this._buildLegGroups(physics, this.legGroups, 0);
   }
 
-  /** Rebuild the RIVAL's leg meshes (same builder, centred on the rival lane z). */
+  /** Rebuild the RIVAL's leg meshes (same builder, centred on the rival lane z).
+   *
+   * PERF (SPIKE FIX): the rival (BOLT) only ever alternates between TWO fixed leg
+   * presets ('long' for wall/gap/stairs, 'short' for tunnel) as it crosses each gate.
+   * The old per-swap path called this on every gate, and _buildLegGroups disposed the
+   * old leg meshes and built TWO new BufferGeometries (+ computeVertexNormals + GPU
+   * upload + scene add/remove) PER SWAP — a periodic per-gate geometry-rebuild that
+   * showed up as the running (not-drawing) ms-max spike. We instead PRE-BUILD both
+   * variants' leg-groups ONCE (prebuildRivalLegVariants) and, on a swap, just TOGGLE
+   * which variant is visible (zero new geometry). This rebuild path is now only used
+   * when no prebuilt variant matches (defensive fallback / non-preset rival). */
   rebuildRivalLegs(rival) {
+    // If a prebuilt variant cache exists, prefer the visibility-toggle path so a swap
+    // never creates geometry. The caller (game.swapRivalLegVariant) normally uses the
+    // cache directly; this guards any legacy rebuildRivalLegs call.
+    if (this._rivalLegVariants) {
+      const v = this._rivalLegVariants.get(rival._lastPreset);
+      if (v) { this._activateRivalVariant(rival._lastPreset, rival); return; }
+    }
     this.rivalLegGroups = this._buildLegGroups(rival, this.rivalLegGroups, this.rivalLaneZ);
   }
 
-  /** Shared leg-group builder for both racers. `laneZ` is the lane centre; each
-   * leg is straddled ±LEG_Z_OFFSET about it. Disposes the old groups, returns
-   * the new array. */
+  /** PRE-BUILD the rival's leg-group geometry for EACH leg preset it will ever use,
+   * ONCE, so a mid-run gate swap is a pure visibility toggle (no new BufferGeometry,
+   * no computeVertexNormals, no scene add/remove — the periodic spike's root cause).
+   *
+   * `variants` is [{ preset, legs }] where `legs` is the physics legs array a fresh
+   * walker produces for that preset (built by the game from a throwaway Physics so the
+   * live rival is untouched). Each variant's two leg meshes are built here and added to
+   * the scene HIDDEN; activating a variant flips visible=true on it and false on the
+   * others, and (re)binds its groups' `body` refs to the LIVE rival legs so
+   * _syncLegGroups drives the visible variant from the live physics each frame. */
+  prebuildRivalLegVariants(variants) {
+    // tear down any previous cache (track reload / restart) so we don't leak.
+    this._disposeRivalLegVariants();
+    // also remove any legacy per-build rival leg groups (we now drive via the cache).
+    for (const lg of this.rivalLegGroups) { this.scene.remove(lg.mesh); this._disposeMesh(lg.mesh); }
+    this.rivalLegGroups = [];
+
+    this._rivalLegVariants = new Map();
+    for (const { preset, legs } of variants) {
+      // build the leg-group meshes for THIS preset's legs (geometry built ONCE here).
+      const groups = this._buildLegGroupsFromLegs(legs, this.rivalLaneZ, /*hidden*/ true);
+      this._rivalLegVariants.set(preset, groups);
+    }
+    this._activeRivalPreset = null;
+  }
+
+  /** Activate (make visible) the rival leg variant for `preset`, hide the rest, and
+   * rebind that variant's groups to the LIVE rival legs (by matching side) so the
+   * per-frame _syncLegGroups reads the live physics body. ZERO geometry work. */
+  _activateRivalVariant(preset, rival) {
+    if (!this._rivalLegVariants) return false;
+    const target = this._rivalLegVariants.get(preset);
+    if (!target) return false;
+    // hide every variant, show the target.
+    for (const [p, groups] of this._rivalLegVariants) {
+      const show = (p === preset);
+      for (const lg of groups) lg.mesh.visible = show;
+    }
+    // bind the visible variant's groups to the live rival leg bodies (match by side),
+    // so _syncLegGroups(this.rivalLegGroups) drives the shown meshes from live physics.
+    for (const lg of target) {
+      const live = rival.legs.find((l) => l.side === lg.side);
+      if (live) lg.body = live.body;
+    }
+    this.rivalLegGroups = target;
+    this._activeRivalPreset = preset;
+    return true;
+  }
+
+  _disposeRivalLegVariants() {
+    if (!this._rivalLegVariants) return;
+    for (const [, groups] of this._rivalLegVariants) {
+      for (const lg of groups) { this.scene.remove(lg.mesh); this._disposeMesh(lg.mesh); }
+    }
+    this._rivalLegVariants = null;
+    this._activeRivalPreset = null;
+  }
+
+  /** Shared leg-group builder for both racers (the PLAYER path: redraw rebuilds).
+   * `laneZ` is the lane centre; each leg is straddled ±LEG_Z_OFFSET about it.
+   * Disposes the old groups, returns the new array. */
   _buildLegGroups(physics, oldGroups, laneZ) {
     for (const lg of oldGroups) { this.scene.remove(lg.mesh); this._disposeMesh(lg.mesh); }
+    return this._buildLegGroupsFromLegs(physics.legs, laneZ, false);
+  }
+
+  /** Build leg-group meshes from an explicit `legs` array (no disposal of anything).
+   * `hidden` adds them to the scene with visible=false (used to pre-build the rival's
+   * preset variants). Geometry is built here ONCE per leg. */
+  _buildLegGroupsFromLegs(legs, laneZ, hidden) {
     const groups = [];
-    for (const l of physics.legs) {
+    for (const l of legs) {
       const body = l.body;
       const grp = new THREE.Group();
       // WYSIWYG, RIGID: the leg visual is the user's ORIGINAL stroke polyline,
@@ -614,6 +700,7 @@ export class Renderer {
       const halfW = (l.lineRadius || 0.13) * 0.95;
       const mesh = this._buildStrokeRibbon(pts, halfW);
       if (mesh) grp.add(mesh);
+      if (hidden) grp.visible = false;
       this.scene.add(grp);
       // z offset by side (straddle) PLUS the lane centre offset. The serpentine
       // curve z (laneCurveZ(x)) is ADDED per-frame in _syncLegGroups (it depends

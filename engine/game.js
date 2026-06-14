@@ -78,7 +78,14 @@ export class Game {
     this._setupRival();
     if (this.renderer) {
       this.renderer.buildTrack(this.physics, this.track, this.rivalSpec);
-      if (this.rivalSpec) this.renderer.rebuildRivalLegs(this.rival);
+      // PERF (SPIKE FIX): AFTER buildTrack (rivalLaneZ set, old variant cache freed),
+      // pre-build the rival leg-group geometry for each scheduled preset ONCE, then make
+      // the rival's CURRENT preset visible. Every later gate swap is then a pure
+      // visibility toggle — no geometry rebuild.
+      if (this.rivalSpec) {
+        this._prebuildRivalLegVariants();
+        this.renderer._activateRivalVariant(this.rival._lastPreset, this.rival);
+      }
     }
     // restore a previously drawn stroke (or default) so the body is ready
     if (this._lastStroke) {
@@ -118,8 +125,32 @@ export class Game {
     this.rival.paceFactor = spec.pace;
     this._rivalSchedule = this._buildRivalSchedule();
     this._rivalLegIdx = -1;
-    this._applyRivalLegForX(this.rival.bodyX, true); // fresh first leg
+    // NOTE: the renderer leg-variant PRE-BUILD + initial activation happen in the caller
+    // (loadTrack/restart) AFTER renderer.buildTrack() — that call sets rivalLaneZ and
+    // disposes the old variant cache, so prebuilding before it would be wiped/mis-laned.
+    // Here we only set up the rival PHYSICS leg (the fresh first leg).
+    this._applyRivalLegForX(this.rival.bodyX, true); // fresh first leg (physics + activate-if-cached)
     this.state.rivalProgress = this.rival.progress;
+  }
+
+  /** PERF (SPIKE FIX): collect the DISTINCT leg presets the rival schedule will use and
+   * pre-build a renderer leg-group variant for each. We build each variant's leg
+   * geometry from a THROWAWAY Physics instance (so the LIVE rival walker is untouched):
+   * we only need the legs' chain/side/lineRadius (the shape) to build the meshes; the
+   * live rival's body refs are bound at activation time. No-op when headless. */
+  _prebuildRivalLegVariants() {
+    if (!this.renderer || !this._rivalSchedule) return;
+    const presets = [...new Set(this._rivalSchedule.map((e) => e.preset))];
+    const variants = [];
+    for (const preset of presets) {
+      // throwaway walker on the same track to produce the preset's leg shapes WITHOUT
+      // touching the live rival (its x / phase / progress must stay put).
+      const tmp = new Physics();
+      tmp.buildTrack(this.track);
+      tmp.setLegStroke(presetStroke(preset), { fresh: true });
+      variants.push({ preset, legs: tmp.legs });
+    }
+    this.renderer.prebuildRivalLegVariants(variants);
   }
 
   /** Build the rival's leg-swap-by-x schedule from the segment model. Each entry is
@@ -187,8 +218,18 @@ export class Game {
     if (idx === this._rivalLegIdx && !fresh) return; // no change
     this._rivalLegIdx = idx;
     const preset = this._rivalSchedule[idx].preset;
+    // PHYSICS stays as-is: setLegStroke updates the rival's reach/climb/tunnel judgement
+    // (a small array op — cheap). It is required so the rival passes the right gates.
     this.rival.setLegStroke(presetStroke(preset), fresh ? { fresh: true } : {});
-    if (this.renderer) this.renderer.rebuildRivalLegs(this.rival);
+    this.rival._lastPreset = preset;
+    // RENDER (SPIKE FIX): instead of rebuilding the leg geometry, TOGGLE to the prebuilt
+    // variant for this preset (zero new BufferGeometry / computeVertexNormals / scene
+    // add-remove). _activateRivalVariant also rebinds the variant's groups to the live
+    // rival leg bodies so _syncLegGroups drives the visible variant from live physics.
+    // When the variant cache is not yet built (this fires once during _setupRival, BEFORE
+    // renderer.buildTrack + the prebuild), the render activation is a no-op here — the
+    // caller (loadTrack/restart) activates the correct variant right after the prebuild.
+    if (this.renderer) this.renderer._activateRivalVariant(preset, this.rival);
   }
 
   // ── leg input ──
@@ -229,7 +270,12 @@ export class Game {
     this._setupRival();
     if (this.renderer) {
       this.renderer.buildTrack(this.physics, this.track, this.rivalSpec);
-      if (this.rivalSpec) this.renderer.rebuildRivalLegs(this.rival);
+      // PERF (SPIKE FIX): rebuild the prebuilt rival leg variants for the fresh track
+      // (buildTrack freed the old cache), then show the rival's current preset.
+      if (this.rivalSpec) {
+        this._prebuildRivalLegVariants();
+        this.renderer._activateRivalVariant(this.rival._lastPreset, this.rival);
+      }
     }
     if (this._lastStroke) {
       this.physics.setLegStroke(this._lastStroke);
@@ -525,6 +571,13 @@ export class Game {
     this._rivalSchedule = this._buildRivalSchedule();
     this._rivalLegIdx = -1;
     this._applyRivalLegForX(this.rival.bodyX, true);
+    // PERF (SPIKE FIX): if a renderer is present (non-headless enableRival), pre-build the
+    // rival leg variants now (this helper does not pass through loadTrack's renderer block)
+    // so swaps stay geometry-free. Headless (no renderer) skips this — physics-only.
+    if (this.renderer) {
+      this._prebuildRivalLegVariants();
+      this.renderer._activateRivalVariant(this.rival._lastPreset, this.rival);
+    }
     this.state.rivalProgress = this.rival.progress;
   }
 }

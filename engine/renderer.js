@@ -52,9 +52,21 @@ const LEG_Z_OFFSET = 0.50;
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-    // L1: keep backbuffer reasonable; input stays in CSS px.
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    // PERF: antialias OFF on high-DPR mobile. MSAA multiplies the per-pixel cost, and
+    // on a retina/phone panel (DPR ≥ 2) the supersampling from the high pixel ratio
+    // already hides aliasing — so MSAA is near-invisible there but still costs fill.
+    // On low-DPR (desktop) panels we KEEP antialias (edges would otherwise show).
+    const dpr = window.devicePixelRatio || 1;
+    const wantAA = dpr < 2;
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAA, alpha: false, powerPreference: 'high-performance' });
+    // L1 + PERF: the dominant mobile frame-drop cause is fill rate — backbuffer pixels
+    // scale with pixelRatio². A retina phone reports DPR 3 ⇒ 9× the CSS pixels, which a
+    // mobile GPU cannot fill at 60fps for a full-screen gradient + overdraw. We CAP the
+    // ratio: ≤1.5 on high-DPR mobile (DPR≥2.5 ⇒ a ~66% pixel cut vs native, ~44% vs the
+    // old cap of 2 with NO visible quality loss on this flat-shaded art), ≤2 otherwise.
+    // Input stays in CSS px (setSize uses CSS units), so this is purely a render-res cap.
+    const ratioCap = dpr >= 2.5 ? 1.5 : 2;
+    this.renderer.setPixelRatio(Math.min(dpr, ratioCap));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.enabled = false;
     // L13: don't sync-read shader logs in production.
@@ -82,6 +94,19 @@ export class Renderer {
     // keeps it reading as a single solid black stroke (no per-bump specular
     // highlights that made the old circle-chain look like a beaded wheel).
     this._legMat = new THREE.MeshBasicMaterial({ color: COL.leg, side: THREE.DoubleSide });
+
+    // ── SHARED TRACK MATERIALS / TEXTURE (built ONCE, reused on every buildTrack) ──
+    // The checker texture + the two track materials never change between rebuilds, so
+    // making them once (instead of per buildTrack) removes a per-restart GPU
+    // texture-upload + material-compile churn. The dispose paths skip these (kept).
+    this._checkerTex = this._makeChecker();
+    // TOP is UNLIT (MeshBasicMaterial): the checker top ignores scene lighting and
+    // always renders at the texture's full vivid colour at ANY camera angle.
+    // DoubleSide so the top face shows regardless of triangle winding.
+    this._topMat = new THREE.MeshBasicMaterial({ map: this._checkerTex, side: THREE.DoubleSide });
+    // The side/under/end faces of the CLOSED box. DoubleSide so the cross-section is
+    // solid from any angle — the path reads as a filled ㅁ box (no hollow see-through).
+    this._sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.85, side: THREE.DoubleSide });
   }
 
   _buildBackground() {
@@ -119,19 +144,9 @@ export class Renderer {
     if (this.rivalCubeMesh) { this.scene.remove(this.rivalCubeMesh); }
     this.trackGroup = new THREE.Group();
 
-    // checkerboard texture for the ribbon top (purple check, as in the reference).
-    // One material set, reused across both lanes (draw-call friendly).
-    const checker = this._makeChecker();
-    const sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.85 });
-    // TOP is UNLIT (MeshBasicMaterial): exactly like the drawn leg line, the
-    // checker top ignores scene lighting and always renders at the texture's full
-    // vivid colour. This guarantees the check is crisp at ANY camera angle /
-    // light direction — no grazing-light wash-out into a solid purple blob.
-    // DoubleSide so the top face shows regardless of the ribbon triangle winding
-    // (the previous StandardMaterial top was FrontSide; the top tris are wound
-    // facing DOWN, so from above the top was culled and we saw only the dark side
-    // walls — that was the "solid dark purple, no checker" bug).
-    const topMat = new THREE.MeshBasicMaterial({ map: checker, side: THREE.DoubleSide });
+    // Shared track materials/texture (built once in the constructor, reused here).
+    const topMat = this._topMat;
+    const sideMat = this._sideMat;
 
     // rival lane z-centre (parallel lane, one offset away on the -z side).
     this.rivalLaneZ = rivalSpec
@@ -273,6 +288,14 @@ export class Renderer {
         // bottom (facing down): nearBot/farBot
         sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);
       }
+      // ── END CAPS (ㅁ closure): the cross-section quad at the FIRST and LAST ring so
+      //    the box is fully closed — no hollow see-through at the path ends. Each ring's
+      //    4 side verts (nearTop +0, nearBot +1, farTop +2, farBot +3) form the cap quad
+      //    nearTop→farTop→farBot→nearBot. DoubleSide material ⇒ solid from either face. ──
+      if (i === 0 || i === N - 1) {
+        const b4 = i * 4;
+        sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
+      }
       prevX = x;
     }
     const topGeo = new THREE.BufferGeometry();
@@ -353,6 +376,12 @@ export class Renderer {
           sideIdx.push(p + 2, q + 2, p + 3, p + 3, q + 2, q + 3);
           // UNDERSIDE (faces down — the head-room surface a long leg strikes)
           sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);
+        }
+        // END CAPS (ㅁ closure): cross-section quad at the FIRST and LAST ring so the
+        // overhead board is a fully closed box too — no hollow see-through at the ends.
+        if (i === 0 || i === N - 1) {
+          const b4 = i * 4;
+          sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
         }
       }
       const topGeo = new THREE.BufferGeometry();
@@ -820,16 +849,23 @@ export class Renderer {
       return;
     }
     if (m.geometry) m.geometry.dispose();
-    if (Array.isArray(m.material)) m.material.forEach((mm) => mm.dispose && mm !== this._legMat && mm.dispose());
-    else if (m.material && m.material !== this._legMat) m.material.dispose();
+    if (Array.isArray(m.material)) m.material.forEach((mm) => mm.dispose && !this._isSharedMat(mm) && mm.dispose());
+    else if (m.material && !this._isSharedMat(m.material)) m.material.dispose();
+  }
+
+  /** True for the SHARED materials that live for the renderer's lifetime (built once
+   * in the constructor, reused on every rebuild). They must NEVER be disposed when a
+   * track/leg group is torn down, or the next build would render with a dead material. */
+  _isSharedMat(m) {
+    return m === this._legMat || m === this._topMat || m === this._sideMat;
   }
 
   _disposeGroup(g) {
     g.traverse((o) => {
       if (o.isMesh) {
         if (o.geometry) o.geometry.dispose();
-        if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose && m.dispose());
-        else if (o.material && o.material !== this._legMat) o.material.dispose();
+        if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose && !this._isSharedMat(m) && m.dispose());
+        else if (o.material && !this._isSharedMat(o.material)) o.material.dispose();
       }
     });
   }

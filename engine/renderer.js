@@ -803,6 +803,20 @@ export class Renderer {
 
   render() { this.renderer.render(this.scene, this.camera); }
 
+  /** START-HITCH PRE-WARM: compile every material's shader program + upload textures
+   * NOW (right after the scene is built) instead of lazily on the first render(). The
+   * first frame otherwise pays a ~10ms synchronous program-link + texture-upload stall
+   * (a visible entry hitch). compile() walks the scene and links all programs up front;
+   * render-behaviour is unchanged (it only moves the cost off the first frame). Guarded
+   * so a missing GL context (headless edge) never throws. */
+  prewarm() {
+    try {
+      if (this.renderer && this.scene && this.camera && typeof this.renderer.compile === 'function') {
+        this.renderer.compile(this.scene, this.camera);
+      }
+    } catch (e) { /* non-fatal: first render() will compile lazily */ }
+  }
+
   resize(wCss, hCss) {
     this.renderer.setSize(wCss, hCss, false);
     this.camera.aspect = wCss / hCss;

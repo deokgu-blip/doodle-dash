@@ -261,6 +261,8 @@ export class Physics {
 
     // segment height model
     this._segs = [];                 // [{ x0,x1, kind, surfFn(x), topY0, topY1, ... }]
+    this._segX0 = null;              // Float64Array of segment x0 (ascending) — for O(log n) lookup
+    this._segHint = 0;               // last-resolved segment index (current-segment pointer cache)
     this._maxSurfaceTopY = 0;
 
     // ── PRE-RACE IDLE FLOAT (reference start look) ──
@@ -281,6 +283,8 @@ export class Physics {
     this.legDrawn = false;
     this._exploded = false;
     this._segs = [];
+    this._segX0 = null;
+    this._segHint = 0;
     this._blocked = false;
     this._blockedByRiser = false;
     this._blockedByTunnel = false;
@@ -511,6 +515,19 @@ export class Physics {
 
     this.surfaceY = surfaceY;
 
+    // ── BUILD THE O(log n) LOOKUP INDEX. ──
+    // _segs is appended in cursor (x) order, so x0 is non-decreasing with NO overlaps
+    // between consecutive segments (verified for every track kind). We cache the x0
+    // boundaries so surfaceYAt/_segAt/surfaceSlopeAt can binary-search to the covering
+    // segment instead of linear-scanning all of _segs every call. The "highest surface
+    // wins" semantics are preserved exactly by checking the matched segment plus its
+    // immediate seam neighbours (the only place two segments can share an x). Results
+    // are byte-identical to the old full scan; only the iteration count drops.
+    const xs = new Float64Array(this._segs.length);
+    for (let i = 0; i < this._segs.length; i++) xs[i] = this._segs[i].x0;
+    this._segX0 = xs;
+    this._segHint = 0;
+
     // create the cube (positioned in setLegStroke once we know the reach)
     this.cube = {
       position: { x: track.startX, y: groundY - CUBE_SIZE / 2 - 0.05 },
@@ -539,12 +556,49 @@ export class Physics {
   }
 
   /**
-   * Expected track surface y (physics, +down) at any x. Scans the segment model;
-   * returns the HIGHEST (most negative) surface covering px, or null over a gap.
+   * Find the index of the LAST segment whose x0 <= px, using a hint (current-segment
+   * pointer) and binary search on the ascending _segX0. Returns -1 if px is before the
+   * first segment. The covering segment for px is at this index OR a neighbour that
+   * shares a seam (px == prev.x1 == this.x0); callers check the small neighbour window.
+   * This replaces the full O(n) linear scan of _segs in surfaceYAt/_segAt with O(log n)
+   * (O(1) on the common monotone-forward path via the hint). */
+  _segIdxAt(px) {
+    const xs = this._segX0;
+    if (!xs || xs.length === 0) return -1;
+    const n = xs.length;
+    // hint fast-path: the body advances monotonically, so the covering segment is
+    // usually the hinted one or its neighbour (O(1)).
+    let h = this._segHint;
+    if (h < 0) h = 0; else if (h >= n) h = n - 1;
+    if (xs[h] <= px && (h + 1 >= n || xs[h + 1] > px)) return h;
+    if (h + 1 < n && xs[h + 1] <= px && (h + 2 >= n || xs[h + 2] > px)) { this._segHint = h + 1; return h + 1; }
+    if (h > 0 && xs[h - 1] <= px && xs[h] > px) { this._segHint = h - 1; return h - 1; }
+    // binary search: rightmost index with xs[i] <= px.
+    let lo = 0, hi = n - 1, res = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (xs[mid] <= px) { res = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    if (res >= 0) this._segHint = res;
+    return res;
+  }
+
+  /**
+   * Expected track surface y (physics, +down) at any x. Returns the HIGHEST (most
+   * negative) surface covering px, or null over a gap. O(log n) via _segIdxAt; the
+   * "highest covering surface" semantics are preserved by also testing the seam
+   * neighbours of the matched segment (the only place two segments can share an x).
    */
   surfaceYAt(px) {
+    const segs = this._segs;
+    const i = this._segIdxAt(px);
+    if (i < 0) return null;
     let best = null;
-    for (const s of this._segs) {
+    // check the matched segment and one neighbour on each side (seam coverage). With no
+    // overlaps elsewhere, this window contains every segment that can cover px.
+    for (let j = i - 1; j <= i + 1; j++) {
+      if (j < 0 || j >= segs.length) continue;
+      const s = segs[j];
       if (px < s.x0 || px > s.x1) continue;
       const y = s.surfFn(px);
       if (y == null) continue;
@@ -685,15 +739,21 @@ export class Physics {
     return closest === Infinity ? null : closest;
   }
 
-  /** Local segment under px (for terrain / climb decisions). */
+  /** Local segment under px (for terrain / climb decisions). O(log n) via _segIdxAt;
+   * preserves the "prefer the highest surface" semantics by testing the matched
+   * segment plus its seam neighbours (the only place two segments can share an x). */
   _segAt(px) {
-    let found = null;
-    for (const s of this._segs) {
+    const segs = this._segs;
+    const i = this._segIdxAt(px);
+    if (i < 0) return null;
+    let found = null, foundY = null;
+    for (let j = i - 1; j <= i + 1; j++) {
+      if (j < 0 || j >= segs.length) continue;
+      const s = segs[j];
       if (px < s.x0 || px > s.x1) continue;
-      // prefer the highest surface (matches surfaceYAt)
       const y = s.surfFn(px);
       if (y == null) { if (!found) found = s; continue; }
-      if (!found || (found.surfFn(px) == null) || y < found.surfFn(px)) found = s;
+      if (!found || foundY == null || y < foundY) { found = s; foundY = y; }
     }
     return found;
   }

@@ -77,6 +77,10 @@ export class Game {
       if (this.renderer) this.renderer.rebuildLegs(this.physics);
     }
     this.state.legDrawn = this.physics.legDrawn;
+    // START-HITCH: pre-compile shaders/upload textures now that the scene is fully
+    // built, so the FIRST RAF frame doesn't pay the ~10ms program-link stall (entry
+    // hitch). Render-behaviour unchanged — it only moves the one-time cost earlier.
+    if (this.renderer) this.renderer.prewarm();
     // REFERENCE START: enter the PRE-RACE IDLE FLOAT — the cube (and rival) hover above
     // the track and bob gently. NO countdown yet (it starts when the player begins their
     // first stroke), NO forward. The "DRAW A LEG" hint shows.

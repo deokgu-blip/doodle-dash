@@ -56,7 +56,7 @@
 export const RIVAL_DEFAULTS = Object.freeze({
   legPreset: 'limb',
   pace: 1.0,
-  laneOffset: 7.0,
+  laneOffset: 2.8,
   name: 'BOLT',
 });
 

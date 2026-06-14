@@ -184,7 +184,7 @@
   "rival": {
     "legPreset": "limb_long",
     "pace": 0.95,
-    "laneOffset": 4.5,
+    "laneOffset": 2.8,
     "name": "BOLT"
   }
 }

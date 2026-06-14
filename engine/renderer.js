@@ -22,8 +22,8 @@ const COL = {
 // the parallel lane BEHIND the player and appears slightly smaller (perspective).
 const RIVAL_LANE_SIGN = -1;
 
-const RIBBON_DEPTH = 2.6;     // z-extrusion of the track — a slim WINDING PATH (was 3.6, too wide; reference shows a narrow band with field around it)
-const RIBBON_DOWN = 0.6;      // how far below the surface the side face drops — a THIN dark strip under the bright checker top (was 0.9; less dark side, more checker)
+const RIBBON_DEPTH = 1.5;     // z-extrusion of the track — a THIN WINDING RIBBON like the reference (was 2.6, too wide; the cube now nearly fills the band width). lane offset / leg straddle / camera z are scaled to this below.
+const RIBBON_DOWN = 0.45;     // how far below the surface the side face drops — a THIN dark strip under the bright checker top (scaled with the narrower band: 0.6→0.45)
 
 // ── SERPENTINE CURVE (render-only, §C) ──────────────────────────────────────
 // The original track snakes left/right as it recedes. We bend the WHOLE render
@@ -42,11 +42,12 @@ const RIBBON_DX = 0.5;
 // Two legs straddle the cube in DEPTH (z). The cube is ~1.08 deep; legs sit
 // just outside its faces so they clearly read as a left and a right leg.
 const LEG_THICK = 0.30;       // per-leg extrusion depth (slim — two legs, not 1 wheel)
-// z distance of each leg from the cube centre. Widened (was 0.62) so the two legs
-// sit CLEARLY to the LEFT (z<0) and RIGHT (z>0) of the cube instead of piling up in
-// the middle — the old close spacing + the 180° splay read as a tangle of "4 legs"
-// in the 3/4 view; this separates them into an unambiguous left foot + right foot.
-const LEG_Z_OFFSET = 0.82;
+// z distance of each leg from the cube centre. The two legs still sit CLEARLY to the
+// LEFT (z<0) and RIGHT (z>0) of the cube (an unambiguous left foot + right foot), but
+// scaled DOWN with the narrower ribbon (was 0.82 on a 2.6-wide band) so the pair
+// straddles the cube just outside its faces (cube z-depth ≈0.81 ⇒ legs at ±0.50 sit
+// just past it) and the whole walker fits the thin reference-width path.
+const LEG_Z_OFFSET = 0.50;
 
 export class Renderer {
   constructor(canvas) {
@@ -134,7 +135,7 @@ export class Renderer {
 
     // rival lane z-centre (parallel lane, one offset away on the -z side).
     this.rivalLaneZ = rivalSpec
-      ? RIVAL_LANE_SIGN * (rivalSpec.laneOffset ?? 7.0) : 0;
+      ? RIVAL_LANE_SIGN * (rivalSpec.laneOffset ?? 2.8) : 0;
 
     // §B+§C: each lane is ONE CONTINUOUS ribbon mesh (a constant-width band of
     // RIBBON_DEPTH) whose centre-line follows (x, surfaceY(x), laneZ+laneCurveZ(x)).
@@ -238,10 +239,10 @@ export class Renderer {
     let prevX = null;
     const N = xs.length;
     // checker repeat: bigger cells (reference look). ~0.5 cell/world-u along x and
-    // ~1.6 cells across the (now narrower) band width (v 0→vRepeat) so each square
-    // is large and clearly reads as a checker — not a fine speckle.
+    // ~0.85 cells across the (now THIN) band width (v 0→vRepeat) so each square stays
+    // roughly square on the narrower ribbon — not stretched into thin stripes.
     const uScale = 0.42;
-    const vRepeat = 1.4;
+    const vRepeat = 0.85;
     for (let i = 0; i < N; i++) {
       const x = xs[i];
       const ry = -surfY(x);                 // render y (up)
@@ -290,54 +291,66 @@ export class Renderer {
     this.trackGroup.add(sideMesh);
   }
 
-  /** Build the TUNNEL low ceilings for a lane: each tunnel's ceiling is a thick BAR
-   * hanging at physics ceilingY (render y = -ceilingY) over the floor span, plus two
-   * end POSTS dropping to the floor so it clearly reads as a "low passage / doorway"
-   * in the side camera (a leg that is too long strikes this bar at the mouth). The bar
-   * uses the purple checker top + dark edge sides (palette-consistent with the track),
-   * tinted a touch darker so it reads as an obstacle, not more path. Render-only. */
+  /** Build the TUNNEL as a LOW LIMBO BAR you DUCK UNDER (reference look) — NOT a thick
+   * wall that climbs up. Each tunnel renders as:
+   *   • a THIN horizontal BEAM (a lintel) hanging at the physics ceilingY level
+   *     (render y = -ceilingY). This is the WYSIWYG gate: a too-LONG leg's rotating
+   *     sweep strikes this beam at the mouth (BLOCKED), a SHORT/low leg ducks under it.
+   *   • two SLIM vertical POSTS at the two ends going from the beam DOWN to the floor —
+   *     a clear DOORWAY FRAME. The whole interior BELOW the beam is left WIDE OPEN
+   *     (no slab, no fill) so the eye reads "trimmed head-room, open passage beneath"
+   *     instead of "a block rising out of the path."
+   * The beam + posts are slim and clearly DISTINCT from the path (warm orange accent,
+   * palette-consistent with the HUD/jump arrows) so the gimmick reads at a glance:
+   * "go under here, keep your legs low." Render-only — ceilingY is the physics gate. */
   _buildCeilings(physics, laneZ) {
     const ceils = physics.ceilingBodies;
     if (!ceils || !ceils.length) return;
     const half = RIBBON_DEPTH / 2;
-    const barMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.7, metalness: 0.05 });
-    const faceMat = new THREE.MeshBasicMaterial({ color: 0xC24FD6 });   // bright lilac underside (visible, palette)
-    const postMat = new THREE.MeshStandardMaterial({ color: 0x5E2480, roughness: 0.8 });
+    // a slim BEAM + POSTS in a warm accent so the bar reads as "duck under" furniture,
+    // clearly NOT the purple path. Flat-ish standard material so it still catches light.
+    const beamMat = new THREE.MeshStandardMaterial({ color: 0xF2A93B, roughness: 0.55, metalness: 0.0 });
+    const beamEdgeMat = new THREE.MeshStandardMaterial({ color: 0xC77F1E, roughness: 0.6 });
+    const postMat = new THREE.MeshStandardMaterial({ color: 0xC77F1E, roughness: 0.7 });
+    const BEAM_H = 0.22;                  // SLIM beam (a lintel, not a slab — was 0.55)
+    const BEAM_Z = RIBBON_DEPTH + 0.5;    // beam spans a touch past the thin band so it clearly bridges the lane
+    const POST_W = 0.20;                  // slim doorway posts
     for (const c of ceils) {
       const len = c.x1 - c.x0;
       const cx = (c.x0 + c.x1) / 2;
       const cz = laneZ + laneCurveZ(cx);
-      const ry = -c.ceilingY;            // render y of the ceiling underside region
-      const BAR_H = 0.55;                // bar thickness (reads as a solid lintel)
-      // the ceiling BAR (a box spanning the tunnel, sitting at the ceiling level).
-      const bar = new THREE.Mesh(
-        new THREE.BoxGeometry(len, BAR_H, RIBBON_DEPTH * 1.05),
-        barMat
-      );
-      bar.position.set(cx, ry + BAR_H / 2, cz);
-      this.trackGroup.add(bar);
-      // a bright underside plane so the low ceiling reads clearly from the side cam.
-      const under = new THREE.Mesh(
-        new THREE.PlaneGeometry(len, RIBBON_DEPTH * 1.05),
-        faceMat
-      );
-      under.rotation.x = Math.PI / 2;    // face down
-      under.position.set(cx, ry - 0.001, cz);
-      this.trackGroup.add(under);
-      // end POSTS: thin pillars from the bar down toward the floor at each mouth, so the
-      // gimmick reads as a doorway. They stop short of the floor (the gap the cube walks
-      // through) so they don't look like a wall.
+      const ry = -c.ceilingY;             // render y of the limbo beam (the head-room line)
       const floorRy = -c.floorY;
-      const postTopRy = ry;
-      const postBottomRy = floorRy + (postTopRy - floorRy) * 0.32; // leave the lower ~1/3 open
-      const postH = Math.max(0.2, postTopRy - postBottomRy);
+      // the limbo BEAM — a thin horizontal bar at the head-room line. Its BOTTOM sits at
+      // ceilingY (the gate), so the visible open space is everything from the floor up to
+      // this bar's underside.
+      const beam = new THREE.Mesh(
+        new THREE.BoxGeometry(len, BEAM_H, BEAM_Z),
+        beamMat
+      );
+      beam.position.set(cx, ry + BEAM_H / 2, cz);
+      this.trackGroup.add(beam);
+      // a thin DARKER cap strip ON TOP of the beam (front-edge read) so the lintel has a
+      // crisp silhouette against the lime sky (depth cue, no big mass).
+      const capH = 0.05;
+      const cap = new THREE.Mesh(
+        new THREE.BoxGeometry(len * 1.02, capH, BEAM_Z * 1.02),
+        beamEdgeMat
+      );
+      cap.position.set(cx, ry + BEAM_H + capH / 2, cz);
+      this.trackGroup.add(cap);
+      // DOORWAY POSTS: slim pillars at the two MOUTH ends running the FULL height from the
+      // floor up to the beam — a clear gate frame. They are THIN (POST_W) so they read as
+      // a doorway frame, never as a wall; the WHOLE span between them, below the beam, is
+      // left open (the cube + low legs pass straight through).
+      const postH = Math.max(0.2, ry - floorRy);
       for (const px of [c.x0, c.x1]) {
         const pz = laneZ + laneCurveZ(px);
         const post = new THREE.Mesh(
-          new THREE.BoxGeometry(0.28, postH, RIBBON_DEPTH * 1.05),
+          new THREE.BoxGeometry(POST_W, postH, BEAM_Z),
           postMat
         );
-        post.position.set(px, postBottomRy + postH / 2, pz);
+        post.position.set(px, floorRy + postH / 2, pz);
         this.trackGroup.add(post);
       }
     }
@@ -703,9 +716,14 @@ export class Renderer {
     // SIDE-ON (옆면) like the reference: camera mostly to the +z SIDE with only a
     // little behind (-x), low height → we see the cube's side profile + both legs,
     // travel reads left→right, not "diagonal from behind." Far + low.
-    const camX = x - 3.5;
-    const camY = this._camY + (racing ? 5.8 : 5.2);
-    const camZ = (racing ? 13.5 : 13.0) + this._camCurveZ;
+    // The band is now THIN (RIBBON_DEPTH 1.5). We pull the side camera CLOSER in z
+    // (was 13.0/13.5 framed for a 2.6 band) so the narrow ribbon still reads as a clear
+    // checker path filling a meaningful slice of the frame — not a far-off hairline —
+    // while keeping the low, side-on, winding-track reference framing. camY is lowered a
+    // touch to keep the cube + its two (now closer) legs reading as a left/right pair.
+    const camX = x - 3.2;
+    const camY = this._camY + (racing ? 5.0 : 4.5);
+    const camZ = (racing ? 11.2 : 10.6) + this._camCurveZ;
     this.camera.position.set(camX, camY, camZ);
     const lookZ = (racing ? this.rivalLaneZ * 0.30 : 0) + this._camCurveZ;
     this.camera.lookAt(x + 1.5, this._camY + 0.2, lookZ);

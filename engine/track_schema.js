@@ -55,16 +55,20 @@
  * @property {number} [blockH]         BLOCKS only: each standing block's height (world units). Default SEGMENT_DEFAULTS.blockH.
  * @property {number} [debrisPerBlock] BLOCKS only: how many debris fragments a broken block becomes (default
  *                                     SEGMENT_DEFAULTS.debrisPerBlock). Total debris is capped at debrisCapTotal.
- * @property {number} [highRise]       FORK only: the high route's staircase CLIMB height (total rise of the
- *                                     hook-gated steep staircase up onto the arch). Default SEGMENT_DEFAULTS.forkHighRise.
- *                                     The staircase auto-hook-gates (overall slope >= steepThresh) so ONLY a HOOK
- *                                     leg takes the high road — exactly the steep-staircase mechanic.
+ * @property {number} [highRise]       FORK only: the high route's MODERATE staircase CLIMB height (total rise onto
+ *                                     the RAISED parallel path). Default SEGMENT_DEFAULTS.forkHighRise. FIX ㉠: the
+ *                                     fork is now a LENGTH branch (NOT hook-gated): the high route is a moderate
+ *                                     step-UP whose per-tread RISER a LONG reach mounts via canClimb but a SHORT
+ *                                     reach cannot. The route is committed by LEG LENGTH at the fork mouth, so a
+ *                                     long leg takes (and completes) the HIGH road, a short leg the LOW road.
  * @property {number} [highSteps]      FORK only: number of treads on EACH of the high route's up + down staircases.
  *                                     Default SEGMENT_DEFAULTS.forkHighSteps.
- * @property {number} [flatTop]        FORK only: x-length of the flat high path on top of the arch (between the up
- *                                     and down staircases). Default SEGMENT_DEFAULTS.forkFlatTop.
- * @property {number} [lowDip]         FORK only: how far the LOW route dips DOWN under the arch (a shallow valley /
- *                                     underpass — always passable by any leg). Default SEGMENT_DEFAULTS.forkLowDip.
+ * @property {number} [flatTop]        FORK only: x-length of the flat high path on top of the raised road (between the
+ *                                     up and down staircases). Default SEGMENT_DEFAULTS.forkFlatTop.
+ * @property {number} [lowDip]         FORK only: how far the LOW route dips DOWN below the base (a shallow valley) so
+ *                                     the two roads read as clearly SEPARATE up/down lanes. Default SEGMENT_DEFAULTS.forkLowDip.
+ * @property {number} [reachThresh]    FORK only: the LEG-LENGTH (reach) threshold that routes the cube at the mouth —
+ *                                     reach >= this ⇒ HIGH (a long leg), else LOW (a short leg). Default SEGMENT_DEFAULTS.forkReachThresh.
  * @property {number} [rough]          0..1 friction (rough floor), default 0.6
  * @property {number} [bouncy]         0..1 restitution (rubber), default 0
  */
@@ -139,20 +143,39 @@ export const SEGMENT_DEFAULTS = Object.freeze({
   debrisPerBlock: 5,    // fragments a broken block becomes
   debrisCapTotal: 24,   // PERF hard cap on total debris (O(N²) separation stays cheap)
   debrisRfrac: 0.26,    // debris fragment half-size as a fraction of blockW (small chips)
-  // FORK (SPLIT-PATH): the track splits into a HIGH route (hook-gated steep staircase up → flat
-  // top → staircase down) and a LOW route (a shallow valley / underpass under the arch) that
-  // REJOIN at the fork end. The LEG SHAPE decides the route, committed at the fork ENTRANCE:
-  // a HOOK takes the high road (a hook is exactly what climbs the steep staircase); any other
-  // leg takes the always-passable low road (no soft-lock — both routes always reach the rejoin).
-  forkHighRise: 4.4,    // high route staircase climb height (overall slope >= steepThresh ⇒ auto hook-gate)
-  forkHighSteps: 5,     // treads on EACH of the up + down staircases (TALL grip-point edges: with the
-                        // default ~50° geometry below, each step rise 0.88u > its run ⇒ clearly stepped)
-  forkFlatTop: 4.0,     // x-length of the flat high path on top of the arch
+  // FORK (SPLIT-PATH) — FIX ㉠: a LENGTH branch with CLEARLY SEPARATE up/down roads. The track
+  // splits into a HIGH route (a MODERATE step-UP onto a RAISED parallel road → flat top → step
+  // back down) and a LOW route (a shallow valley / ground road). The LEG LENGTH decides the route,
+  // committed at the fork ENTRANCE: reach >= forkReachThresh ⇒ HIGH (a long leg mounts the step-up
+  // via canClimb), else LOW (a short leg can't mount it, takes the ground road). Both roads RUN
+  // PARALLEL (the high road is held off the lane on the lateral z-split AND raised) and REJOIN at
+  // the end. NOT hook-gated (the high climb is a moderate length-gated staircase, not the steep
+  // staircase gimmick). No soft-lock — both routes always reach the rejoin.
+  forkReachThresh: 1.0, // reach >= this ⇒ HIGH road (a long leg); else LOW road (a short leg). ~middle of the
+                        // reach range [0.6,1.7]: long(1.10)/limb(1.05)/limb_long(1.49) ⇒ HIGH; short/limb_short(0.6)/
+                        // stick(0.9)/wheel(0.85) ⇒ LOW. A clearly-long leg goes up, a clearly-short leg goes down.
+  forkHighRise: 2.4,    // high route MODERATE step-up height onto the raised road. With forkHighSteps 5 ⇒ each riser
+                        // ≈0.48u: canClimb(longReach 1.10, 0.48)=true (maxClimb 0.80) but canClimb(short 0.6, 0.48)=false
+                        // ⇒ length-gated (a long leg mounts it, a short can't) WITHOUT being the steep hook gimmick.
+  forkHighSteps: 5,     // treads on EACH of the up + down staircases of the raised road
+  forkFlatTop: 4.0,     // x-length of the flat high path on top of the raised road
   // The high route's per-staircase RUN = (fork length − flatTop) / 2; the climb slope = forkHighRise/run.
-  // To match the standalone steep climb at ~50° (slope ≈ 1.19) with forkHighRise 4.4, author the fork
-  // `length` ≈ 2·(4.4/1.19) + flatTop ≈ 11.4 (run ≈ 3.7 per staircase). The slope is DATA-derived from
-  // the authored length (not a fixed default), and auto-hook-gates whenever it is >= steepThresh.
-  forkLowDip: 2.2,      // how far the low route dips DOWN under the arch (a shallow underpass valley)
+  // FIX ㉠: the high climb is FORCED non-hook-gated (it is a LENGTH branch, not the steep-staircase
+  // gimmick) regardless of the data-derived slope, and the moderate forkHighRise keeps each riser a
+  // length-gate a LONG leg clears (≈0.48u) — the raised parallel road, not a steep wall.
+  forkLowDip: 1.4,      // how far the LOW route dips DOWN below the base (a shallow ground valley so the two roads
+                        // read as clearly SEPARATE up/down lanes — the high road raised, the low road dipped)
+  // LATERAL SPLIT (z) of the HIGH road — FIX ㉠: the two roads must read as CLEARLY SEPARATE
+  // PARALLEL lanes (like the reference's up/down split), NOT an arch glued over the lane. So the
+  // high road veers OUT to forkHighLat right at the mouth and STAYS fully laterally offset for the
+  // WHOLE fork (held across the climb, the flat top AND the descent), only ramping back to the lane
+  // centre over the final exit so the two roads rejoin cleanly. Combined with the height difference
+  // (high road raised forkHighRise, low road dipped forkLowDip) the two lanes are separated in BOTH
+  // z and y the whole way ⇒ two distinct roads. The HIGH-committed cube + legs ride this same
+  // lateral (WYSIWYG); the low road stays on the lane centre. forkHighLat = the held lateral offset
+  // (>= RIBBON_DEPTH so the ribbons never overlap in z); forkLatHoldFrac is kept for back-compat.
+  forkHighLat: 2.8,
+  forkLatHoldFrac: 0.5,
 });
 
 /** @type {SegmentKind[]} */

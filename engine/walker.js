@@ -237,6 +237,24 @@ const TUNE = {
   // a steep-gated stair run with a hook actually driving the climb.
   gripLiftMax: 0.16,     // world-u — peak per-plant upward hitch on a steep-stair grip climb (small ⇒ no motion sickness)
   gripLerp: 12.0,        // 1/s — how fast the grip-lift eases in/out at the run boundaries (smooth, no pop)
+  // ── FIX ㉡ — STEPPED grip climb (계단을 한 칸씩 짚고 올라가기, NOT a smooth slide up the hypotenuse) ──
+  // On a HOOK-gated STEEP staircase the body must ascend in DISCRETE TREAD STEPS synchronized
+  // with the leg's PLANT, instead of riding the smooth stepped-grounded glide (which read as a
+  // slide). We hold the body at a tread level, then STEP it up to the NEXT tread the instant the
+  // hook PLANTS (the phase peak), then hold, step, hold — a visible stair-climbing cadence. The
+  // step-up is EASED over a short time (no harsh jitter) but the STEP rhythm stays clearly
+  // visible (it is NOT smoothed back into a continuous glide). It is anchored to the REAL tread
+  // tops (a discrete level the cube has reached), and clamped to the grounded pose, so the foot is
+  // ALWAYS on/above the current tread — never dips into a riser ⇒ structurally penetration-free.
+  stepClimbEnable: true, // turn the stepped (vs glide) climb on for steep-gated stair runs
+  stepRiseLerp: 22.0,    // 1/s — how fast the body/camera EASES up to the next committed tread after a plant (higher ⇒ a snappier, more visible step; τ≈0.045s ⇒ the rise completes in ~a few frames, then HOLDS until the next plant)
+  // The camera base is normally slew-limited (surfaceSlewMax 0.04/frame) so it GLIDES — that is
+  // exactly what made the steep climb read as a smooth slide. On a stepped steep climb we relax the
+  // camera slew so it can RISE a tread quickly right after a plant, then HOLD until the next plant
+  // (the visible "한 칸씩" cadence on screen). Still bounded (no instant snap ⇒ no nausea).
+  stepCamSlewMax: 0.3,   // world-u/frame cap on the camera base during a stepped climb (≈ a full tread over ~3 frames ⇒ a quick, eased, clearly-visible step UP, then a flat HOLD until the next plant — the cadence reads as "한 칸씩", not a glide)
+  stepCamLerp: 40.0,     // 1/s — the camera-base ease rate during a stepped climb (faster than surfaceLerp so the step REACHES the tread quickly, leaving a flat HOLD before the next plant; still eased ⇒ no instant snap)
+  stepPlantPhaseCos: 0.5,// the plant is detected when cos(2θ) rises above this (θ≈0,π ⇒ a foot straight down = a plant); a hysteresis edge advances the tread level once per plant
 
   // ── PRE-RACE IDLE FLOAT (reference start look) ──
   // Before the race starts (the player has not yet started drawing a leg, OR is drawing
@@ -262,16 +280,22 @@ const TUNE = {
   ballFriction: 5.0,     // 1/s linear velocity damping (rolling/ground friction) — settles balls
   ballRestitution: 0.18, // 0..1 bounce on ground / separation (a little lively, mostly damped)
   ballSepStiff: 22.0,    // 1/s ball-ball separation push rate (positional, impulse-like)
-  ballPushSpeed: 1.35,   // multiplier on the cube's forward speed imparted to a ball it shoves (ball accelerates ahead)
-  ballPushUp: 0.45,      // fraction of the push that also lifts the ball (so it pops up & rolls off, not just slides)
-  ballCubeHalf: 0.55,    // cube collision half-extent (radius of the cube's push circle) — a touch over CUBE_SIZE/2
+  // FIX ㉢ — STRONGER SHOVE so plowing the pile is CLEARLY felt: the cube flings the balls
+  // harder (bigger ballPushSpeed) and a WIDER push circle (ballCubeHalf) so more of the heap is
+  // in contact at once (the heap bunches AHEAD of the cube → more contacts → more drag, the
+  // "헤쳐나가야" plow feel). The displacement/scatter therefore reads clearly (balls fly off).
+  ballPushSpeed: 1.9,    // (was 1.35) multiplier on the cube's forward speed imparted to a ball it shoves — a harder shove (bigger scatter)
+  ballPushUp: 0.55,      // (was 0.45) more lift so shoved balls pop up & scatter (the interaction reads)
+  ballCubeHalf: 0.7,     // (was 0.55) WIDER push circle ⇒ the cube contacts MORE of the pile at once (more drag, more visible scatter)
   // RESISTANCE: each ball the cube is in contact with multiplies its speed DOWN. The
   // factor is (1 − ballSlowPerContact)^contacts, clamped at ballSlowMin so the cube
-  // NEVER fully stops (no soft-lock) — it always grinds through. Tuned so a dense pile
-  // roughly halves speed (clear "방해") but the cube keeps moving and recovers after.
-  ballSlowPerContact: 0.20, // each contacting ball costs 20% of speed (compounding) — a clear "방해"
-  ballSlowMin: 0.30,        // hard floor on the slow factor (cube keeps ≥30% pace ⇒ never soft-locks)
-  ballContactPad: 0.10,     // extra world-u so a ball "in contact" is counted a hair before exact touch
+  // NEVER fully stops (no soft-lock) — it always grinds through. FIX ㉢: STRENGTHENED so
+  // the thick of the pile drops the cube to ~0.4–0.55 of clear speed (obviously struggling),
+  // floored so it always breaks through and recovers after. More contacts ⇒ more drag
+  // (the slowdown ramps with the contact count, compounding per contact).
+  ballSlowPerContact: 0.42, // (was 0.20) each contacting ball costs 42% of speed (compounding) — a STRONG, obvious "방해"
+  ballSlowMin: 0.34,        // (was 0.30) hard floor on the slow factor (cube keeps ≥34% pace in the thick of it ⇒ obviously struggling but never soft-locks)
+  ballContactPad: 0.22,     // (was 0.10) extra world-u so a ball "in contact" is counted a hair earlier (more of the heap drags)
 
   // ── BREAKING BLOCKS (a wall of standing boxes the cube SMASHES into debris) ──
   // A `blocks` segment stands N boxes UPRIGHT on a flat run, barring the path. While INTACT
@@ -284,17 +308,21 @@ const TUNE = {
   // smashes through. These knobs mirror the ball knobs (debris IS a ball with box render).
   blockBreakSpeedMin: 0.6,  // min forward cube speed to register a "smash" (so a creeping touch still breaks but reads as effort)
   debrisGravity: 26.0,      // world u/s² downward (physics +down) — same as the balls
-  debrisFriction: 5.2,      // 1/s linear velocity damping — a touch higher (boxes tumble to rest fast)
+  debrisFriction: 5.6,      // (was 5.2) a touch higher linear damping so the chips tumble to rest near the wall (don't drift far downstream into the run-out, so the cube cleanly recovers speed after the window)
   debrisRestitution: 0.12,  // ground/separation bounce (boxy chips bounce less than balls)
-  debrisSepStiff: 22.0,     // 1/s fragment-fragment positional separation push
-  debrisBurstSpeed: 4.5,    // base outward speed (u/s) imparted to a fragment when its block breaks (the "흩날림")
-  debrisBurstUp: 0.55,      // fraction of the burst that lifts the fragment (so chips fly up, not just slide)
-  debrisPushSpeed: 1.25,    // multiplier on the cube's forward speed imparted to a fragment it later shoves
-  debrisPushUp: 0.40,       // fraction of that push that also lifts the fragment
-  debrisCubeHalf: 0.55,     // cube collision half-extent for the debris push (== ballCubeHalf)
-  debrisContactPad: 0.10,   // extra world-u so a fragment "in contact" counts a hair before touch
-  debrisSlowPerContact: 0.16, // each contacting fragment costs 16% of speed (compounding) — the rubble "방해"
-  debrisSlowMin: 0.34,      // hard floor on the rubble slow factor (cube keeps ≥34% pace ⇒ never soft-locks)
+  debrisSepStiff: 26.0,     // (was 22) stronger fragment-fragment separation so chips SPREAD OUT flat on the floor (litter), not pile up vertically (keeps the settled rubble bottom on the floor)
+  // FIX ㉢ — a more VIOLENT smash (bigger forward+spread burst) so the rubble visibly scatters,
+  // but kept LOW (small up-fraction) so chips fly OUT & litter FLAT on the floor, not pile up.
+  debrisBurstSpeed: 4.6,    // (was 4.5) base outward speed (u/s) when a block breaks — a clear "흩날림" (scatter on smash), but not flung far downstream
+  debrisBurstUp: 0.34,      // (was 0.55) LESS lift ⇒ chips fly OUTWARD and litter FLAT on the floor (not stacked) — keeps the settled rubble bottom ~on the floor
+  debrisPushSpeed: 0.9,     // (was 1.25) a GENTLE later shove: the cube does NOT carry the rubble far downstream (it plows through and leaves it behind near the wall), so the cube clearly RECOVERS speed once past the rubble. The drag comes from the CONTACT count (pad + per-contact), not from carrying the pile.
+  debrisPushUp: 0.3,        // (was 0.40) LESS up on the later shove (chips slide/spread along the floor, don't pile) ⇒ rubble stays littered flat near the wall, recovery after is clean
+  debrisCubeHalf: 0.7,      // (was 0.55) WIDER push circle ⇒ the cube contacts MORE rubble at once (more drag, more scatter)
+  debrisContactPad: 0.24,   // (was 0.10) count a fragment "in contact" a hair earlier (more of the rubble drags)
+  // FIX ㉢ — STRONGER rubble drag so plowing the debris is CLEARLY felt (~0.4–0.55 of clear),
+  // floored so it never soft-locks; ramps with the contact count (compounding per fragment).
+  debrisSlowPerContact: 0.34, // (was 0.16) each contacting fragment costs 34% of speed (compounding) — a strong "방해"
+  debrisSlowMin: 0.38,      // (was 0.34) hard floor on the rubble slow factor (cube keeps ≥38% pace ⇒ obviously struggling but never soft-locks)
   // BLOCK SMASH GATE: while a block is intact and the cube has not reached its face, the
   // cube is held at the face (struggle-in-place is NOT used — a block is broken on the very
   // frame the cube touches it, so the hold is a single sub-step before the break). The cube
@@ -363,6 +391,12 @@ export class Physics {
     this._prevLoft = 0;              // previous frame's loft (for the body vertical velocity)
     this._grip = 0;                  // live STEEP-STAIR grip-cadence lift (world u, upward-only) — the per-plant hitch on a hook climb (짚고)
     this._gripLiveAmp = 0;           // eased grip-lift amplitude (0 off steep stairs ⇒ a clean smooth ramp/flat; ramps in on a steep hook climb)
+    // ── FIX ㉡ — STEPPED grip-climb state (the body holds a tread, then steps up at each plant) ──
+    this._stepClimbActive = false;   // true while doing the stepped (vs glide) climb on a steep-gated stair run
+    this._stepCommitY = null;        // physics-y of the tread top the body is currently STANDING on (advances one tread per plant)
+    this._stepLevelY = null;         // eased body-stand level toward _stepCommitY (the visible hold-then-step-up motion)
+    this._stepPlantArmed = true;     // plant-edge hysteresis: armed between plants, fires once per plant to advance the tread
+    this._stepProfile = 0;           // last stepped-vs-grounded lift applied (diagnostic for the verifier)
 
     // gate used by the verifier's leg-driven assertion (motor-off ⇒ no motion).
     this.motorEnabled = true;
@@ -528,6 +562,11 @@ export class Physics {
     this._loft = 0;
     this._loftAmpLive = 0;
     this._prevLoft = 0;
+    this._stepClimbActive = false;
+    this._stepCommitY = null;
+    this._stepLevelY = null;
+    this._stepPlantArmed = true;
+    this._stepProfile = 0;
     this._idleFloat = false;
     this._idlePhase = 0;
     // BALL-FIELD: cleared here and rebuilt in buildTrack (the segment scan spawns them).
@@ -930,13 +969,19 @@ export class Physics {
         const highSteps = Math.max(1, (seg.highSteps != null ? seg.highSteps : SEGMENT_DEFAULTS.forkHighSteps) | 0);
         const flatTop = (seg.flatTop != null) ? seg.flatTop : SEGMENT_DEFAULTS.forkFlatTop;
         const lowDip = (seg.lowDip != null) ? seg.lowDip : SEGMENT_DEFAULTS.forkLowDip;
+        const highLat = (seg.highLat != null) ? seg.highLat : SEGMENT_DEFAULTS.forkHighLat;
+        const latHoldFrac = (seg.latHoldFrac != null) ? seg.latHoldFrac : SEGMENT_DEFAULTS.forkLatHoldFrac;
+        const reachThresh = (seg.reachThresh != null) ? seg.reachThresh : SEGMENT_DEFAULTS.forkReachThresh;
         const forkId = this._forks.length;
 
         // ── LOW ROUTE (into the MAIN _segs): base flat lead-in → dip-down ramp → dip-up ramp →
         //    base flat lead-out, spanning the whole fork [fx0,fx1] and rejoining at baseY. The
         //    dip is a SHALLOW symmetric valley (a V with a floor) — a short flat lead-in/out so the
         //    mouth + rejoin read cleanly, the dip in the middle. NEVER steep-gated (always passable).
-        const lowLead = Math.min(1.6, Math.max(0.8, len * 0.12));     // flat at the mouth + at the rejoin
+        // FIX ㉠: a SHORT flat lead-in so the LOW road starts DIPPING almost immediately at the
+        // mouth — combined with the high road rising + the lateral z-split, the two lanes separate in
+        // BOTH y and z within a fraction of a unit (no body-box overlap at the still-low mouth).
+        const lowLead = 0.4;      // a SHORT flat at the mouth/rejoin so the LOW road starts DIPPING quickly (drops below baseY soon ⇒ y-separates from the rising high road), while the Y-junction itself still reads cleanly
         const dipSpan = Math.max(1e-3, len - 2 * lowLead);            // the valley span (descent + ascent)
         const dipHalf = dipSpan / 2;
         // mouth flat
@@ -967,16 +1012,18 @@ export class Physics {
         this._segs.push({ x0: fx1 - lowLead, x1: fx1, kind: 'fork', forkId, route: 'low',
           topYa: baseY, topYb: baseY, surfFn: () => baseY });
 
-        // ── HIGH ROUTE (into its OWN list `highSegs`, NOT the main _segs): hook-gated steep
-        //    staircase UP → flat top → staircase DOWN → rejoin at baseY. Built with the SAME
-        //    staircase/ramp math (steepGate set when the overall up-slope >= steepThresh) so a
-        //    committed-high cube is hook-gated EXACTLY like the standalone steep staircase. The
-        //    up + down staircases SYMMETRICALLY frame a flat top so the arch reads as an over-pass.
+        // ── HIGH ROUTE (into its OWN list `highSegs`, NOT the main _segs): a MODERATE step-UP
+        //    staircase onto a RAISED parallel road → flat top → step DOWN → rejoin at baseY. FIX ㉠:
+        //    the fork is a LENGTH branch, NOT the steep-staircase gimmick, so the high climb is
+        //    FORCED non-hook-gated (highSteep=false) regardless of its data-derived slope; its
+        //    moderate per-tread risers are a LENGTH gate a LONG reach clears via canClimb (a short
+        //    reach can't, but a short leg already committed LOW at the mouth). The up + down
+        //    staircases symmetrically frame a flat top so the high road reads as a raised lane.
         const highSegs = [];
-        const highRuns = [];                                          // steep-gated staircase runs on the high route
+        const highRuns = [];                                          // (kept; empty — the high route is NOT steep-gated)
         const climbSpan = (len - flatTop) / 2;                        // x-length of EACH staircase (up + down)
-        const stairSlope = highRise / Math.max(1e-3, climbSpan);      // overall up-slope (rise/run)
-        const highSteep = stairSlope >= TUNE.steepThresh;             // hook-gate the high climb if steep enough
+        const stairSlope = highRise / Math.max(1e-3, climbSpan);      // overall up-slope (rise/run) — reported only
+        const highSteep = false;                                      // FIX ㉠: a LENGTH branch, never hook-gated (NOT the steep gimmick)
         let hcx = fx0;
         let hy = baseY;
         // UP staircase (rises by highRise over climbSpan): each tread is a steep-gated stairs seg.
@@ -1025,7 +1072,25 @@ export class Physics {
         // build the high route's O(log n) x0 index (ascending — the high segs are pushed in x order).
         const hxs = new Float64Array(highSegs.length);
         for (let i = 0; i < highSegs.length; i++) hxs[i] = highSegs[i].x0;
-        this._forks.push({ id: forkId, x0: fx0, x1: fx1, baseY, highSegs, highX0: hxs, highRuns });
+        // LATERAL SPLIT PROFILE (z) of the HIGH arch. Control x's: the lateral is 0 at the fork
+        // mouth (fx0) and rejoin (fx1) — the roads MEET on the lane centre there — ramps OUT to
+        // highLat across the entry up-staircase (so the two roads are fully z-separated at the
+        // still-low feet, where a vertical-only pass would overlap), HOLDS, then eases back to the
+        // lane CENTRE (0) by the flat top (where the arch is high enough to clear the low cube
+        // vertically), and MIRRORS for the descent. latUpEnd/latDownStart bracket the high (held)
+        // region; latRampX is the entry/exit ramp length. forkLateralAt() reads these (O(1)).
+        const climbSpanRec = (len - flatTop) / 2;
+        // FAST entry/exit lateral ramp: the routes must be FULLY z-separated within the first ~quarter
+        // of a unit of the fork (where both roads are still near baseY and a vertical-only pass would
+        // let a low cube clip the high road's first still-low step). A SHORT ramp scissors them apart
+        // at once (FIX ㉠: shortened 0.6→0.22 so the two lanes clear in z before the low cube's box can
+        // overlap the high road's mouth — the roads are SEPARATE lanes from the very first step). The
+        // ramp is eased (smoothstep) so the sideways move is smooth, just quick.
+        const latRampX = Math.min(climbSpanRec * 0.15, 0.18);
+        const topStartX = fx0 + climbSpanRec;          // x where the flat top begins (up-climb done)
+        const topEndX = topStartX + flatTop;           // x where the flat top ends (down-climb begins)
+        this._forks.push({ id: forkId, x0: fx0, x1: fx1, baseY, highSegs, highX0: hxs, highRuns,
+          highLat, latHoldFrac, latRampX, topStartX, topEndX, climbSpan: climbSpanRec, reachThresh });
 
         cursorX += len;
         surfaceY = baseY;                                            // both routes rejoin at the base
@@ -1303,20 +1368,22 @@ export class Physics {
     return (this._forkRoute && this._forkRoute.has(id)) ? this._forkRoute.get(id) : null;
   }
 
-  /** COMMIT the fork route at the ENTRANCE. Called each step with the cube's forward x:
-   * for the fork the cube is currently inside, if it has NOT been committed yet, commit it
-   * NOW from the CURRENT leg shape — a HOOK takes the HIGH road (a hook is exactly what
-   * climbs the steep staircase), anything else takes the always-passable LOW road. Once
-   * committed the route is FIXED for the whole fork (the rejoin is close), so REDRAWING the
-   * leg MID-fork does NOT switch roads (no surface teleport). Idempotent + O(1) (forks are a
-   * handful, the fork-index hint makes the common case O(1)); zero allocation (the Map is
-   * built once). Returns the committed route, or null when not inside a fork. */
+  /** COMMIT the fork route at the ENTRANCE. Called each step with the cube's forward x: for the
+   * fork the cube is currently inside, if it has NOT been committed yet, commit it NOW from the
+   * CURRENT leg LENGTH (FIX ㉠): reach >= the fork's reachThresh ⇒ the HIGH road (a LONG leg mounts
+   * the raised step-up via canClimb), else the LOW ground road (a SHORT leg can't mount it). Once
+   * committed the route is FIXED for the whole fork (the rejoin is close), so REDRAWING the leg
+   * MID-fork does NOT switch roads (no surface teleport). Idempotent + O(1) (forks are a handful,
+   * the fork-index hint makes the common case O(1)); zero allocation. Returns the committed route,
+   * or null when not inside a fork. */
   _commitForkAt(px) {
     const fi = this._forkIdxAt(px);
     if (fi < 0) return null;
     const f = this._forks[fi];
     if (this._forkRoute.has(f.id)) return this._forkRoute.get(f.id);
-    const route = this._isHook ? 'high' : 'low';
+    // LENGTH branch: a long leg (reach >= threshold) takes the HIGH raised road; a short leg the LOW.
+    const thresh = (f.reachThresh != null) ? f.reachThresh : SEGMENT_DEFAULTS.forkReachThresh;
+    const route = (this._reach >= thresh) ? 'high' : 'low';
     this._forkRoute.set(f.id, route);
     return route;
   }
@@ -1329,6 +1396,50 @@ export class Physics {
     if (fi < 0) return null;
     const f = this._forks[fi];
     return this._committedRoute(f.id) === 'high' ? f : null;
+  }
+
+  /** Smoothstep on [0,1] (C¹, zero-slope ends — no kink). */
+  _smoothstep01(t) { if (t <= 0) return 0; if (t >= 1) return 1; return t * t * (3 - 2 * t); }
+
+  /** The HIGH road's LATERAL z-offset profile at px FOR A GIVEN FORK record `f` — ALWAYS defined
+   * (the high road is always rendered). FIX ㉠: the high road is a SEPARATE PARALLEL LANE — it
+   * veers OUT to f.highLat right at the mouth and STAYS fully offset for the WHOLE fork (climb,
+   * flat top AND descent), ramping back to the lane centre only over the final exit so the two
+   * roads REJOIN cleanly. So the high lane runs alongside the low (centre) lane the entire way —
+   * two distinct roads, separated in z the whole length (and in y by the raise/dip). The
+   * HIGH-committed cube + legs ride this same lateral (WYSIWYG). O(1), alloc-free. 0 outside f. */
+  _forkHighLatRec(f, px) {
+    if (!f || px < f.x0 || px > f.x1) return 0;
+    const L = f.highLat || 0;
+    if (L === 0) return 0;
+    const ramp = f.latRampX;
+    // ENTRY: ramp 0→L over [x0, x0+ramp] (the roads split apart at the mouth). HOLD the full lateral
+    // L across the ENTIRE middle of the fork (climb + flat top + descent — the two roads run parallel
+    // and clearly apart the whole way). EXIT: ramp L→0 over [x1−ramp, x1] so they rejoin at the lane
+    // centre. No easing back to centre on the flat top (that was the old "arch over the lane" look —
+    // the user said the over/under being glued together is weird; now they stay SEPARATE roads).
+    if (px <= f.x0 + ramp) {                            // entry ramp 0 → L (roads split apart)
+      return L * this._smoothstep01((px - f.x0) / ramp);
+    }
+    if (px < f.x1 - ramp) return L;                    // HELD full lateral the whole way (parallel lanes)
+    return L * (1 - this._smoothstep01((px - (f.x1 - ramp)) / ramp)); // exit ramp L → 0 at the rejoin
+  }
+
+  /** The HIGH arch's lateral z-offset at px (for the RENDERER — the arch is always drawn). 0
+   * outside any fork. O(1), alloc-free. */
+  forkHighLatAt(px) {
+    const fi = this._forkIdxAt(px);
+    if (fi < 0) return 0;
+    return this._forkHighLatRec(this._forks[fi], px);
+  }
+
+  /** The lateral z-offset the CUBE (+ its legs) rides at px: the HIGH arch's lateral profile when
+   * px is inside a fork COMMITTED to the HIGH route, else 0 (the low road / normal track is on the
+   * lane centre). So a high-committed cube tracks the arch sideways (WYSIWYG) while a low cube and
+   * all normal segments stay centred. O(1), alloc-free — safe on the per-frame render hot path. */
+  forkLateralAt(px) {
+    const f = this._highForkAt(px);
+    return f ? this._forkHighLatRec(f, px) : 0;
   }
 
   /** Binary-search the HIGH route's own ascending x0 index for the seg covering px.
@@ -1658,6 +1769,11 @@ export class Physics {
       this._loftAmpLive = 0;
       this._grip = 0;
       this._gripLiveAmp = 0;
+      this._stepClimbActive = false;
+      this._stepCommitY = null;
+      this._stepLevelY = null;
+      this._stepPlantArmed = true;
+      this._stepProfile = 0;
       this._footBaseY = surf;
       this._prevFootBaseY = surf;
       // RENDER INTERPOLATION: a fresh leg teleports x to startX — drop any stale prev so
@@ -2705,8 +2821,8 @@ export class Physics {
     // jitter / motion-sickness). It is UPWARD-ONLY (RAISES the body), so it can never push the
     // body INTO a riser ⇒ zero penetration is structurally preserved. Active only when a HOOK
     // is actually driving a steep-stair climb (v>0, on a steep-gated run).
+    const gripping = drive && v > 1e-6 && this._isHook && this._onSteepStairRun(this._x);
     {
-      const gripping = drive && v > 1e-6 && this._isHook && this._onSteepStairRun(this._x);
       const gripTarget = gripping ? TUNE.gripLiftMax : 0;
       const ag = 1 - Math.exp(-TUNE.gripLerp * dt);
       this._gripLiveAmp += (gripTarget - this._gripLiveAmp) * ag;
@@ -2714,9 +2830,69 @@ export class Physics {
       const gripPulse = 0.5 * (1 + Math.cos(2 * this._theta)); // 1 at plant, 0 mid-float
       this._grip = this._gripLiveAmp * gripPulse;
     }
-    // body sits at the grounded pose RAISED by the loft AND the grip-cadence hitch (physics
-    // +down ⇒ subtract to raise). Both are upward-only ⇒ the body never dips below the
-    // grounded (foot-grazing) pose, so no-penetration is preserved by construction.
+    // ── FIX ㉡ — STEPPED body ascent (계단을 한 칸씩 짚고 올라가기) ──
+    // On a steep-gated stair run a HOOK is climbing tread-by-tread. The smooth grounded glide
+    // (_groundedCubeY) read as a SLIDE up the hypotenuse, so here we drive the body's STAND LEVEL
+    // in DISCRETE TREAD STEPS: the body HOLDS at the tread it stands on, then STEPS UP to the next
+    // tread the instant the hook PLANTS (the phase peak). The step-up is EASED over a short time
+    // (no jitter) but the rhythm stays clearly visible (hold→step→hold→step). It is anchored to the
+    // REAL tread tops (a discrete level the cube has reached) and CLAMPED never below the grounded
+    // pose, so the foot is ALWAYS on/above the current tread ⇒ structurally penetration-free.
+    // STEPPED-CLIMB COMMIT LEVEL (한 칸씩): on a steep-gated stair run a HOOK is climbing
+    // tread-by-tread. We track a DISCRETE committed tread level `_stepCommitY` that advances ONE
+    // tread at each foot-PLANT and HOLDS between plants. The camera base then RISES quickly to that
+    // level after a plant and HOLDS (the relaxed step-slew), so on screen the climb reads as "step
+    // up, hold, step up, hold" instead of a smooth glide. The committed level is a REAL discrete
+    // tread top the cube has reached (or one ahead), so the cube body (grounded pose) is always
+    // on/above it ⇒ penetration-free. `stepActive` gates the relaxed camera slew below.
+    let stepActive = false;
+    if (TUNE.stepClimbEnable && gripping) {
+      stepActive = true;
+      const realSurf = this.surfaceYAt(this._x);          // current tread top under the body (physics +down)
+      const treadTop = (realSurf != null) ? realSurf : groundSurf;
+      // the tread the cube will climb ONTO next ≈ the surface ~one cube ahead (a discrete level one
+      // step up, or the same near the top). The body steps ONTO this at a plant.
+      const aheadSurf = this.surfaceYAt(this._x + CUBE_SIZE * 0.8);
+      const nextTreadTop = (aheadSurf != null && aheadSurf < treadTop) ? aheadSurf : treadTop;
+      if (!this._stepClimbActive) {
+        this._stepClimbActive = true;
+        this._stepCommitY = treadTop;                      // seed at the current tread (no pop)
+        this._stepLevelY = treadTop;
+        this._stepPlantArmed = true;
+      }
+      // PLANT EDGE (cos(2θ) peaks ≈1 at θ≈0,π — a leg straight down catching a step edge): on the
+      // rising edge of a plant, COMMIT one tread UP (to nextTreadTop), then HOLD until the next
+      // plant (hysteresis arms between plants). This is the discrete "한 칸" advance.
+      const plantCos = 0.5 * (1 + Math.cos(2 * this._theta)); // 1 at plant
+      if (plantCos >= TUNE.stepPlantPhaseCos && this._stepPlantArmed) {
+        if (nextTreadTop < this._stepCommitY) this._stepCommitY = nextTreadTop; // step UP (more-negative y); never DOWN
+        this._stepPlantArmed = false;
+      } else if (plantCos < TUNE.stepPlantPhaseCos * 0.6) {
+        this._stepPlantArmed = true;                       // re-arm in the float between plants
+      }
+      // The commit changes ONLY at a plant (above) ⇒ it HOLDS perfectly flat between plants, so the
+      // camera reaches it and STOPS (a clean flat hold) until the next plant jumps it up — the crisp
+      // "한 칸씩" cadence. We only guard it from running AHEAD of the next reachable tread (so it never
+      // leads more than one step up) and never DROPS below the tread the cube has reached (no sag).
+      if (this._stepCommitY < nextTreadTop) this._stepCommitY = nextTreadTop; // never lead beyond one tread up
+      if (this._stepCommitY > treadTop) this._stepCommitY = treadTop;         // never sag below the reached tread (the cube already stands here)
+      // The stand level is the DISCRETE committed tread — it JUMPS at a plant and HOLDS flat between
+      // plants (it does NOT continuously ease, or the holds would smear back into a glide). The
+      // camera base (below) then provides the eased rise to it, so each step = a quick camera rise
+      // then a flat hold (한 칸씩), while the discrete commit keeps the rhythm crisp.
+      this._stepLevelY = this._stepCommitY;
+    } else if (this._stepClimbActive) {
+      this._stepClimbActive = false;
+      this._stepCommitY = null;
+      this._stepLevelY = null;
+      this._stepPlantArmed = true;
+    }
+    // body sits at the grounded (foot-grazing) pose RAISED by the loft AND the grip-cadence hitch
+    // (physics +down ⇒ subtract to raise). Both lifts are upward-only ⇒ the foot never dips below
+    // the surface (no-penetration by construction). The DISCRETE stepping is carried by the camera
+    // base (below) so the on-screen climb reads as steps; the cube body keeps grazing the real
+    // treads (so the foot stays planted, no float-bug).
+    this._stepProfile = stepActive ? (this._stepLevelY - reachR - this._bodyBaseY) : 0; // signed: how far the held tread leads the camera (>0 in physics-y = camera below the held tread)
     this._bodyY = groundedY - this._loft - this._grip;
     // vertical velocity of the body (for cube.velocity / render) — the loft's rate.
     this._vy = -(this._loft - (this._prevLoft || 0)) / Math.max(1e-4, dt);
@@ -2741,10 +2917,17 @@ export class Physics {
     // the terrain (the reference look: the world scrolls smoothly, the cube hops).
     // Target = the grounded vertical-plant height over the ground under the body.
     {
-      const baseTargetY = groundSurf - reachR;
-      const a = 1 - Math.exp(-TUNE.surfaceLerp * dt);
+      // FIX ㉡: on the stepped steep-stair climb the camera base FOLLOWS the DISCRETE committed
+      // tread level (so the whole cube visibly STEPS up tread-by-tread on screen, not just the
+      // in-frame body), with a RELAXED slew (stepCamSlewMax) so it can rise a tread quickly right
+      // after a plant and then HOLD until the next plant — the "한 칸씩" cadence. Off a stepped
+      // climb it tracks the smooth grounded trend with the normal tight slew (no behaviour change).
+      const baseTargetY = stepActive ? (this._stepLevelY - reachR) : (groundSurf - reachR);
+      const lerpRate = stepActive ? TUNE.stepCamLerp : TUNE.surfaceLerp;
+      const a = 1 - Math.exp(-lerpRate * dt);
       let step = (baseTargetY - this._bodyBaseY) * a;
-      step = clampMag(step, TUNE.surfaceSlewMax); // gentle slew on the camera → no snap
+      const slewCap = stepActive ? TUNE.stepCamSlewMax : TUNE.surfaceSlewMax;
+      step = clampMag(step, slewCap); // bounded slew → no harsh snap (relaxed during a stepped climb so the step shows)
       this._bodyBaseY += step;
     }
     // BOB (the walking juice, reported for the verifier (J)): the GEOMETRIC dip of the
@@ -3051,6 +3234,13 @@ export class Physics {
   /** Live STEEP-STAIR GRIP-cadence lift (world u, upward-only) — the per-plant hitch as the
    * hook bites each tread and pulls the body up (짚고). 0 off a steep-stair hook climb. */
   get gripLift() { return this._grip || 0; }
+  /** FIX ㉡: the STEPPED-vs-glide body lift on a steep-stair hook climb (world u, >0 ⇒ the body
+   * is RAISED above the smooth grounded glide because it is HOLDING on a tread between plant
+   * steps). 0 off a stepped climb. The verifier reads this + bodyCamY to assert the body
+   * ascends in discrete tread steps (hold-then-rise), not a straight diagonal slide. */
+  get stepProfile() { return this._stepProfile || 0; }
+  /** True while the body is doing the stepped (vs glide) steep-stair climb. */
+  get stepClimbActive() { return !!this._stepClimbActive; }
   /** Vertical velocity (physics +down; up = negative) — non-zero only while airborne. */
   get vy() { return this._vy || 0; }
   /** Clearance of the support foot's lowest point ABOVE the surface under the body

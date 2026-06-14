@@ -114,13 +114,14 @@
     },
     {
       "kind": "fork",
-      "length": 11.4,
-      "highRise": 4.4,
+      "length": 12.0,
+      "highRise": 2.4,
       "highSteps": 5,
       "flatTop": 4,
-      "lowDip": 2.2,
+      "lowDip": 1.4,
+      "reachThresh": 1.0,
       "rough": 0.9,
-      "_note": "SPLIT-PATH FORK — the LEG SHAPE routes the cube (commit-at-entrance). HOOK leg => HIGH route: a hook-gated STEEP STAIRCASE up, ~50deg to MATCH the standalone steep climb (each up/down staircase run = (length-flatTop)/2 = (11.4-4)/2 = 3.7u; overall slope 4.4/3.7=1.189 >= 0.6 => auto hook-gate, the steep-staircase mechanic) -> flat top on the arch -> staircase back down -> rejoin. 5 steps over 3.7u => each 0.88u rise > 0.74u run (TALL grip-point edges). NON-HOOK leg => LOW route: dips UNDER the arch (a shallow underpass valley, lowDip 2.2) -> back up -> rejoin (UNCHANGED). Both routes REJOIN at the same x and base y; this is a BRANCH not a gate (no soft-lock — every leg progresses). Route is committed once at the fork mouth and ridden out (mid-fork redraw does NOT switch roads => no teleport). BOTH routes are always rendered (high arch + low underpass) so it reads as a split that merges."
+      "_note": "SPLIT-PATH FORK (FIX 1) — the LEG LENGTH routes the cube (commit-at-entrance). LONG leg (reach >= reachThresh 1.0) => HIGH route: a MODERATE step-UP onto a RAISED parallel road (each up/down staircase run = (length-flatTop)/2 = (12-4)/2 = 4.0u; highRise 2.4 over 5 steps => each riser 0.48u, climbable by a long reach via canClimb but NOT a short one; NOT hook-gated — a length branch, not the steep-staircase gimmick) -> flat top on the raised road -> step back down -> rejoin. SHORT leg (reach < 1.0) => LOW route: a shallow ground valley (lowDip 1.4) -> back up -> rejoin. The two roads are CLEARLY SEPARATE PARALLEL lanes: the HIGH road is held off the lane centre on the lateral z-split (forkHighLat 2.6) AND raised, the LOW road stays on the centre lane AND dipped — separated in BOTH z and y the whole way, rejoining only at the ends. Both routes REJOIN at the same x and base y; this is a BRANCH not a gate (no soft-lock — every leg progresses). Route is committed once at the fork mouth by length and ridden out (mid-fork redraw does NOT switch roads => no teleport). BOTH routes are always rendered (high raised road + low ground road) so it reads as two parallel roads that merge."
     },
     {
       "kind": "bumps",

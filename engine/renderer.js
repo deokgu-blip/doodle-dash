@@ -843,14 +843,19 @@ export class Renderer {
         const x = xs[i];
         const sy = profY(x);                       // arch surface physics y (+down)
         const syB = sy + RIBBON_DOWN;              // slab bottom (dropped) physics y
-        // PATH TRANSFORM: same lane centre + heading as the floor, edges perpendicular.
-        const Nt = this.path.transform(x, laneZ - half, sy, this._tpL);
-        const Ft = this.path.transform(x, laneZ + half, sy, this._tpR);
+        // LATERAL z-SPLIT: the high arch veers off the lane centre at the still-low feet (so it
+        // clears a low-route cube in z where it cannot clear it in y), and eases back over the
+        // centre on the high flat top. The high-committed cube rides this SAME offset (renderer
+        // sync.forkLateralAt) ⇒ WYSIWYG. 0 outside the fork ⇒ identical to before for the rest.
+        const flat = physics.forkHighLatAt ? physics.forkHighLatAt(x) : 0;
+        // PATH TRANSFORM: same lane centre + heading as the floor (+ the lateral split), edges perpendicular.
+        const Nt = this.path.transform(x, laneZ + flat - half, sy, this._tpL);
+        const Ft = this.path.transform(x, laneZ + flat + half, sy, this._tpR);
         const ntX = Nt.x, ntY = Nt.y, ntZ = Nt.z, ftX = Ft.x, ftY = Ft.y, ftZ = Ft.z;
         topPos.push(ntX, ntY, ntZ, ftX, ftY, ftZ);
         topUV.push(x * uScale, 0, x * uScale, vRepeat);
-        const Nb = this.path.transform(x, laneZ - half, syB, this._tpL);
-        const Fb = this.path.transform(x, laneZ + half, syB, this._tpR);
+        const Nb = this.path.transform(x, laneZ + flat - half, syB, this._tpL);
+        const Fb = this.path.transform(x, laneZ + flat + half, syB, this._tpR);
         sidePos.push(ntX, ntY, ntZ, Nb.x, Nb.y, Nb.z, ftX, ftY, ftZ, Fb.x, Fb.y, Fb.z);
         if (i > 0) {
           const a = (i - 1) * 2, b = a + 1, cc = i * 2, d = cc + 1;
@@ -1285,9 +1290,12 @@ export class Renderer {
       // INTERPOLATED forward x + full body y + tilt (lerp prev→curr by alpha).
       const ix = physics.interpX(alpha);
       const iy = physics.interpBodyY(alpha);
-      // PATH TRANSFORM: cube on the lane centre (L=0). It yaws by the heading so it FACES
-      // along the (turning) path, plus its forward/back tilt about z (interpAngle).
-      const p = this.path.transform(ix, 0, iy, this._tp);
+      // PATH TRANSFORM: cube on the lane centre (L=0) EXCEPT inside a fork COMMITTED to the HIGH
+      // route, where it rides the arch's LATERAL z-split (forkLateralAt) so it stays WYSIWYG on the
+      // sideways-then-over arch (the low road + all normal track stay centred ⇒ L=0). It yaws by
+      // the heading so it FACES along the (turning) path, plus its fwd/back tilt about z (interpAngle).
+      const lat = physics.forkLateralAt ? physics.forkLateralAt(ix) : 0;
+      const p = this.path.transform(ix, lat, iy, this._tp);
       this.cubeMesh.position.set(p.x, p.y, p.z);
       this.cubeMesh.rotation.set(0, this.path.heading(ix), -physics.interpAngle(alpha));
     }
@@ -1341,10 +1349,13 @@ export class Renderer {
       const by = (ay != null) ? ay : body.position.y;
       // PATH TRANSFORM: both legs share the cube x/y; the stored `lateral` (lane centre +
       // the side straddle) is the perpendicular-to-heading offset, so the legs stay a
-      // clean left/right pair as the path turns. The drawn stroke spins about z in the
-      // path-local plane (interpLegAngle), and the WHOLE group additionally yaws by the
-      // heading so that local plane stays oriented along the (turning) path.
-      const p = this.path.transform(bx, lg.lateral, by, this._tp);
+      // clean left/right pair as the path turns. Inside a fork COMMITTED HIGH, add the arch's
+      // LATERAL z-split so the legs ride the sideways-then-over arch WITH the cube (same offset,
+      // 0 elsewhere). The drawn stroke spins about z in the path-local plane (interpLegAngle), and
+      // the WHOLE group additionally yaws by the heading so that local plane stays oriented along
+      // the (turning) path.
+      const flat = (physics && physics.forkLateralAt) ? physics.forkLateralAt(bx) : 0;
+      const p = this.path.transform(bx, lg.lateral + flat, by, this._tp);
       lg.mesh.position.set(p.x, p.y, p.z);
       // render y = -physY -> a CCW physics rotation appears CW on screen.
       const ang = physics ? physics.interpLegAngle(alpha, lg.phaseOffset) : body.angle;

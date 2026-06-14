@@ -28,21 +28,20 @@
 // caller-supplied {x,y,z} scratch (or a shared internal scratch) so the hot path is
 // alloc-free.
 
-// ── Folded serpentine (reproduces the old render-only laneCurveZ look EXACTLY) ───────
-// The old cosmetic winding was a pure z-offset:  laneCurveZ(x) = AMP·sin(FREQ·x).
-// We reproduce that SAME centre-line z purely through HEADING. Because x is the curve's
-// ARC-LENGTH, the centre-line obeys dZ/dx = sin(h). To make pathZ(x) = AMP·sin(FREQ·x)
-// (centred on 0, same amplitude/period as before — NO z-bias, NO secular drift) we set
-//   dZ/dx = d/dx[AMP·sin(FREQ·x)] = AMP·FREQ·cos(FREQ·x)  ⇒  h(x) = asin(AMP·FREQ·cos(FREQ·x)).
-// With AMP=2.5, FREQ=0.12 the peak |AMP·FREQ| = 0.30 < 1 (asin well-defined) and peak
-// heading ≈ 0.305 rad (~17.5°) — a GENTLE sway. The integrated pathZ then oscillates
-// EXACTLY between ±AMP, crossing 0 at x=0 just like the old sine, so straights read as
-// the same gently winding ribbon. (pathX contracts only ~0.3u per ~52u period — the
-// honest arc-length cost of winding — imperceptible and never z-drifts.)
+// ── COSMETIC serpentine (a pure LATERAL z-offset — does NOT affect heading/yaw) ──────
+// The old cosmetic winding was a pure z-offset:  laneCurveZ(x) = AMP·sin(FREQ·x), applied
+// to EVERY lane vertex (cube, legs, ribbon, objects) so the whole band swayed gently while
+// the cube stayed UPRIGHT and the camera stayed SIDE-ON. We keep it EXACTLY that — a
+// cosmetic lateral offset `serpZ(x)` the transform adds to the lateral L. It must NOT be
+// folded into the path HEADING: folding it into heading yaws the cube ±~17.5° and swings
+// the camera with the wiggle on every straight (the "diagonal course / self-rotating cube"
+// regression). ONLY the data-driven `curve`/`turn` regions may produce heading (real bends
+// where the cube + camera intentionally turn). On a straight `path.heading(x) == 0`, so the
+// transform reduces to (x, -y, L + serpZ(x)) — byte-identical to the old pre-curve game.
 export const SERP_AMP = 2.5;     // matches the old CURVE_AMP (peak z deflection)
 export const SERP_FREQ = 0.12;   // matches the old CURVE_FREQ (spatial frequency)
-const _SERP_K = SERP_AMP * SERP_FREQ;   // < 1 ⇒ asin defined for all x
-export function serpHeading(x) { return Math.asin(_SERP_K * Math.cos(SERP_FREQ * x)); }
+/** Cosmetic lateral z-offset of the centre-line at arc-length x (the old laneCurveZ). */
+export function serpZ(x) { return SERP_AMP * Math.sin(SERP_FREQ * x); }
 
 const TWO_PI = Math.PI * 2;
 
@@ -62,12 +61,19 @@ export class Path {
    *   pathZ(anchorX)=anchorZ. This makes STRAIGHT sections sit EXACTLY where the old world
    *   put them (no global lateral/forward shift from integrating across the lead-in margin).
    *   Default: x0 (so pathX(x0)=x0, pathZ(x0)=0 — back-compat).
-   * @param {number} [opts.anchorZ]  the centre-line z at anchorX (default 0). For the folded
-   *   serpentine this is the OLD laneCurveZ(anchorX) so the look is byte-faithful.
+   * @param {number} [opts.anchorZ]  the centre-line z at anchorX (default 0). The turn-only
+   *   heading centre-line carries NO serpentine, so for the decoupled serpentine this is 0.
+   * @param {(x:number)=>number} [opts.serpZFn]  COSMETIC lateral z-offset added to the lateral
+   *   L inside transform() (it does NOT affect heading/yaw). On a straight (heading 0) the
+   *   transform reduces to (x, -y, L + serpZFn(x)) — byte-identical to the old laneCurveZ band,
+   *   with the cube UPRIGHT and the camera SIDE-ON (no yaw, no camera swing). During a real
+   *   turn the small offset just rides along laterally. Omit (or null) ⇒ no serpentine.
    */
   constructor(x0, x1, step, headingFn, opts = {}) {
     this.x0 = x0;
     this.step = step;
+    // COSMETIC serpentine: a pure lateral z-offset (NOT a heading). Added to L in transform.
+    this._serpZ = (typeof opts.serpZFn === 'function') ? opts.serpZFn : null;
     const n = Math.max(1, Math.ceil((x1 - x0) / step));
     this.n = n;                       // number of intervals (samples = n+1)
     this.x1 = x0 + n * step;
@@ -155,10 +161,13 @@ export class Path {
   /**
    * World transform of a path-local point (forward x, lateral L, height y).
    * Writes into `out` (or a shared scratch) and returns it — ALLOC-FREE.
-   *   worldX = pathX(x) + L·(-sin h)
+   * The COSMETIC serpentine is added to the lateral offset (NOT the heading):
+   *   Le     = L + serpZ(x)              (serpZ ≡ 0 when no serpentine fn)
+   *   worldX = pathX(x) + Le·(-sin h)
    *   worldY = -y
-   *   worldZ = pathZ(x) + L·( cos h)
-   * At h ≡ 0 ⇒ (x, -y, L), identical to the old (x, -y, laneZ+laneCurveZ) at curve 0.
+   *   worldZ = pathZ(x) + Le·( cos h)
+   * At h ≡ 0 ⇒ (x, -y, L + serpZ(x)) — identical to the old (x, -y, laneZ+laneCurveZ),
+   * with the cube UPRIGHT and the camera SIDE-ON (heading 0 ⇒ no yaw, no camera swing).
    * @param {number} x forward arc-length
    * @param {number} L lateral offset (+ = toward-camera / +z side, matching old +z)
    * @param {number} y physics height (+down); worldY = -y
@@ -176,26 +185,38 @@ export class Path {
       pxc = this._px[i] + (this._px[i + 1] - this._px[i]) * t;
       pzc = this._pz[i] + (this._pz[i + 1] - this._pz[i]) * t;
     }
+    // COSMETIC serpentine: ride it as extra LATERAL offset (perpendicular to the turn-only
+    // heading). On straights (h=0) this is exactly worldZ = L + serpZ(x); during a turn the
+    // small offset rides along laterally. It NEVER yaws the cube or swings the camera.
+    const Le = this._serpZ ? (L + this._serpZ(x)) : L;
     const sh = Math.sin(h), ch = Math.cos(h);
-    o.x = pxc + L * (-sh);
+    o.x = pxc + Le * (-sh);
     o.y = -y;
-    o.z = pzc + L * ch;
+    o.z = pzc + Le * ch;
     return o;
   }
 
   /**
-   * The LATERAL world-z deflection of the centre-line at arc-length x, i.e. the value
-   * the old render code called `laneCurveZ(x)`. With the serpentine folded into the
-   * heading this is just `pathZ(x)` (the centre-line z relative to the z=0 anchor). It
-   * is a thin COMPATIBILITY accessor for callers/tests that still think in "curve z".
+   * The LATERAL world-z deflection of the lane centre-line at arc-length x, i.e. the value
+   * the old render code called `laneCurveZ(x)`. With the serpentine decoupled as a cosmetic
+   * lateral offset, the lane centre's world-z = pathZ(x) (the turn centre-line) PLUS the
+   * serpentine offset projected onto +z (cos h). On a straight this is exactly serpZ(x).
+   * A thin COMPATIBILITY accessor for callers/tests that still think in "curve z".
    */
-  laneCurveZ(x) { return this.pathZ(x); }
+  laneCurveZ(x) {
+    if (!this._serpZ) return this.pathZ(x);
+    return this.pathZ(x) + this._serpZ(x) * Math.cos(this.heading(x));
+  }
 }
 
 /**
- * Build the heading function for a track: the gentle serpentine sway folded in for the
- * whole track, PLUS any data-driven turn regions (segments carrying a `turn`/`turnDeg`).
- * The returned function is pure (no allocation) and is sampled once into the LUT.
+ * Build the heading function for a track from the data-driven turn regions ONLY (segments
+ * carrying a `turn`/`turnDeg`). The cosmetic serpentine sway is DELIBERATELY NOT part of
+ * the heading — it is a cosmetic lateral offset (see Path opts.serpZFn). Folding the
+ * serpentine into the heading yaws the cube and swings the camera on every straight (the
+ * "diagonal course / self-rotating cube" regression), so heading(x) is 0 EVERYWHERE except
+ * inside a real `curve`/`turn` region. The returned function is pure (no allocation) and is
+ * sampled once into the LUT.
  *
  * Turn regions: a segment may carry a heading change `turnDeg` (degrees, +left toward
  * +z) ramped SMOOTHLY (smoothstep) across its arc-length [x0,x1]. Heading accumulates,
@@ -203,19 +224,20 @@ export class Path {
  * the region the path continues straight at the new heading. Multiple turns compose.
  *
  * @param {{x0:number,x1:number,turnRad:number}[]} turns  arc-length turn regions
- * @param {boolean} serpentine  fold the gentle serpentine sway into the heading
+ * @param {boolean} [serpentine=false]  DEPRECATED no-op (the serpentine is a lateral offset
+ *   now, never a heading). Kept only so old callers don't break; passing true does NOTHING.
  * @returns {(x:number)=>number}
  */
-export function makeHeadingFn(turns, serpentine = true) {
-  // Sort + precompute the cumulative heading BEFORE each region so heading(x) is the
-  // serpentine sway + the sum of all completed turns + the partial (smoothstep) ramp of
-  // the region currently containing x. All captured in the closure (no per-call alloc).
+export function makeHeadingFn(turns, serpentine = false) {
+  // Sort + precompute the cumulative heading BEFORE each region so heading(x) is the sum of
+  // all completed turns + the partial (smoothstep) ramp of the region currently containing
+  // x. NO serpentine. All captured in the closure (no per-call alloc).
   const regs = (turns || []).slice().sort((a, b) => a.x0 - b.x0);
   const before = new Float64Array(regs.length); // accumulated turn heading at each region start
   let acc = 0;
   for (let i = 0; i < regs.length; i++) { before[i] = acc; acc += regs[i].turnRad; }
   return function heading(x) {
-    let h = serpentine ? serpHeading(x) : 0;
+    let h = 0;                         // turns-only: 0 off-curve (no serpentine in heading)
     for (let i = 0; i < regs.length; i++) {
       const r = regs[i];
       if (x <= r.x0) break;            // regions are sorted; nothing further applies yet

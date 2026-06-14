@@ -7,7 +7,7 @@
 
 import * as THREE from './vendor/three.module.js';
 import { PHYS_CONST } from './physics.js';
-import { Path, makeHeadingFn, serpHeading } from './path.js';
+import { Path, makeHeadingFn, serpZ } from './path.js';
 
 // POC §8 tokens
 const COL = {
@@ -27,21 +27,22 @@ const RIBBON_DEPTH = 1.5;     // z-extrusion of the track — a THIN WINDING RIB
 const RIBBON_DOWN = 0.8;      // SLAB DEPTH below the surface — a THINNER board like the reference (was 1.2, too chunky; the user asked for a slimmer track). The width (z-depth RIBBON_DEPTH 1.5) stays NARROW and UNCHANGED; only this vertical slab thickness shrank so the path reads as a slim plank, not a deep wall. The ceiling ROOF track + the rival lane reuse the SAME value (consistent thickness, all closed boxes).
 
 // ── HEADING-BASED PATH (the track GENUINELY turns in 3D, §C + bends) ─────────
-// The track centre-line is now a HEADING (yaw) PATH (see engine/path.js): the
-// forward coordinate x is arc-length, and pathHeading(x) is the tangent yaw. The
-// world position of a point at forward x, lateral L, height y is
-//   worldX = pathX(x) + L·(-sin h),  worldZ = pathZ(x) + L·(cos h),  worldY = -y
-// (h = heading). This REPLACES the old cosmetic z-offset `laneCurveZ(x)`: the gentle
-// serpentine sway is FOLDED into the heading (serpHeading), so straights still read
-// as a gently winding ribbon, and a real bend is just a region where the heading ramps
-// through a large angle (data-driven `turn` per segment). Physics x / progress / win are
-// untouched — this only shapes the centre-line + places the cubes/legs/objects/camera.
+// The track centre-line is a HEADING (yaw) PATH (see engine/path.js): the forward
+// coordinate x is arc-length, and pathHeading(x) is the tangent yaw. The world position
+// of a point at forward x, lateral L, height y is
+//   Le = L + serpZ(x);  worldX = pathX(x) + Le·(-sin h),  worldZ = pathZ(x) + Le·(cos h),  worldY = -y
+// (h = heading). The HEADING is built from TURNS ONLY — the gentle serpentine is a COSMETIC
+// LATERAL offset (serpZ added to L in the transform), NOT a heading. So a real bend (a
+// data-driven `turn`/`curve` region) yaws the cube + swings the camera, but the cosmetic
+// serpentine sway does NEITHER: on a straight heading≡0 ⇒ worldZ = L + serpZ(x), the cube is
+// UPRIGHT and the camera is SIDE-ON. (Folding serpZ into the heading was the "diagonal course
+// / self-rotating cube" regression — see path.js.) Physics x / progress / win are untouched.
 //
-// COMPATIBILITY: `laneCurveZ(x)` is kept as a thin wrapper returning the centre-line's
-// lateral world-z deflection. When a Path exists it delegates to path.laneCurveZ (= the
-// integrated pathZ); with NO Path (defensive / pre-build) it falls back to the OLD
-// closed-form `CURVE_AMP·sin(CURVE_FREQ·x)`. With heading ≡ 0 the transform reduces to
-// (x, -y, L) — BYTE-IDENTICAL to the old (x, -y, laneZ + 0) placement (regression guard).
+// COMPATIBILITY: `laneCurveZ(x)` is kept as a thin wrapper returning the lane centre's
+// lateral world-z deflection. When a Path exists it delegates to path.laneCurveZ (= pathZ +
+// serpZ projected); with NO Path (defensive / pre-build) it falls back to the OLD closed-form
+// `CURVE_AMP·sin(CURVE_FREQ·x)`. With heading ≡ 0 the transform reduces to (x, -y, L + serpZ(x))
+// — BYTE-IDENTICAL to the old (x, -y, laneZ + laneCurveZ(x)) placement (regression guard).
 const CURVE_AMP = 2.5;        // legacy serpentine peak z deflection (matches path.SERP_AMP)
 const CURVE_FREQ = 0.12;      // legacy serpentine spatial frequency (matches path.SERP_FREQ)
 // Module-level "active path" the compat wrapper reads. Set by Renderer.buildTrack; the
@@ -282,16 +283,20 @@ export class Renderer {
       const x0 = (physics ? physics.startX : track.startX) - 8;     // lead-in margin (cube starts at startX-3)
       const x1 = (physics ? physics.finishX : track.finishX) + 8;   // run-out margin
       const turns = (physics && physics.turnRegions) ? physics.turnRegions : [];
-      const headingFn = makeHeadingFn(turns, /*serpentine*/ true);
-      // ANCHOR at startX to the OLD world placement: pathX(startX)=startX and
-      // pathZ(startX)=CURVE_AMP·sin(CURVE_FREQ·startX) (the old laneCurveZ there), so the
-      // straight lead-in sits EXACTLY where it did before (no global shift from the lead-in
-      // margin integration). LUT step 0.25u — finer than the ribbon sampling (RIBBON_DX 0.5)
-      // so the centre-line stays smooth through bends; ~(x1-x0)/0.25 samples built once.
+      // HEADING = TURNS ONLY (the serpentine is a COSMETIC lateral offset, never a heading).
+      // ⇒ path.heading(x) == 0 everywhere except inside a real curve/turn region, so on
+      // straights the cube stays UPRIGHT and the camera stays SIDE-ON (no self-rotation, no
+      // diagonal course). The gentle serpentine is re-introduced as serpZFn below.
+      const headingFn = makeHeadingFn(turns, /*serpentine*/ false);
+      // ANCHOR at startX to the OLD world placement: pathX(startX)=startX, pathZ(startX)=0
+      // (the turn-only centre-line carries no serpentine — that rides as the lateral offset),
+      // so the straight lead-in sits EXACTLY where it did before. LUT step 0.25u — finer than
+      // the ribbon sampling (RIBBON_DX 0.5) so the centre-line stays smooth through bends.
       const startX = physics ? physics.startX : track.startX;
       this.path = new Path(x0, x1, 0.25, headingFn, {
         anchorX: startX,
-        anchorZ: CURVE_AMP * Math.sin(CURVE_FREQ * startX),
+        anchorZ: 0,
+        serpZFn: serpZ,   // cosmetic lateral sway (= old laneCurveZ); does NOT yaw/swing
       });
       _activePath = this.path;          // back-compat: the exported laneCurveZ() reads this
     }
@@ -1411,8 +1416,10 @@ export class Renderer {
     // HEADING-FOLLOW CHASE: build the camera offset in the PATH-LOCAL frame (the EXACT
     // same relative geometry as before — a bit BEHIND along the tangent, UP, and to the
     // +lateral/camera side), then rotate it by the eased heading `hc` so it SWINGS with
-    // the path. On a straight (hc≈0) T=(1,0,0), Lat=(0,0,1) ⇒ the math below reduces to
-    // exactly the old camX=x-3.2 / camZ=centreZ+10.6 / lookAt(x+1.5,…,centreZ) — identical.
+    // the path through a REAL bend. `hc` is the TURNS-ONLY heading (0 on straights/serpentine),
+    // so on a straight (hc≈0) T=(1,0,0), Lat=(0,0,1) ⇒ the math below reduces to exactly the
+    // old camX=x-3.2 / camZ=centreZ+10.6 / lookAt(x+1.5,…,centreZ) — the camera stays SIDE-ON
+    // and never swings with the cosmetic serpentine wiggle.
     //   BEHIND_T : behind the cube along -tangent (was the -3.2 in x)
     //   SIDE_LAT : to the +z camera side along +lateral (was the 10.6/11.2 in z)
     //   FWD_T    : look a little ahead along +tangent (was the +1.5 in x)
@@ -1425,9 +1432,13 @@ export class Renderer {
     // path-local basis in the horizontal (XZ) plane:
     //   tangent  T   = ( cosH, sinH)   (+x at hc=0)
     //   lateral  Lat = (-sinH, cosH)   (+z at hc=0, == the transform's +L direction)
-    // cube centre-line world XZ (lane centre L=0), at the cube's forward x.
-    const cx = this.path ? this.path.pathX(x) : x;
-    const cz = this.path ? this.path.pathZ(x) : 0;
+    // CUBE LANE-CENTRE world XZ — taken from the SAME transform the cube uses (L=0), so it
+    // INCLUDES the cosmetic serpentine lateral offset. The camera therefore tracks the cube's
+    // gentle side-to-side sway (cube stays fixed in frame, the whole band sways), exactly like
+    // the old pre-curve game's centreZ = laneZ + laneCurveZ(x).
+    const cc = this.path ? this.path.transform(x, 0, 0, this._tp) : null;
+    const cx = cc ? cc.x : x;
+    const cz = cc ? cc.z : 0;
     // camera eye = centre + BEHIND·T + SIDE·Lat (horizontal) and camY (vertical).
     const camX = cx + BEHIND_T * cosH + SIDE_LAT * (-sinH);
     const camZ = cz + BEHIND_T * sinH + SIDE_LAT * (cosH);

@@ -842,7 +842,9 @@ export class Renderer {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     geo.setIndex(tri);
-    geo.computeVertexNormals();
+    // PERF: the leg uses _legMat (MeshBasicMaterial, UNLIT) which ignores normals,
+    // and _thicken2D is leg-only — so computeVertexNormals() was pure waste: it
+    // allocated a normal Float32Array (GC garbage) + CPU on EVERY redraw. Dropped.
     return geo;
   }
 

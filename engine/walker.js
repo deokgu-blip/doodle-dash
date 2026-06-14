@@ -576,6 +576,54 @@ export class Physics {
         }
         cursorX += len;
         // surfaceY unchanged (whole periods ⇒ ends at baseY).
+      } else if (seg.kind === 'planks') {
+        // PLANKS = a run of short flat BOARDS separated by small VOID GAPS the walker
+        // must STRIDE across (the reference: a row of disconnected boards). Each board
+        // is a FLAT segment (rendered as a closed box); each gap between boards is a
+        // small RECOVERY V-TRENCH (a steep descent ramp + steep ascent ramp, tagged
+        // gap:true so it is EXEMPT from the steep-ramp hook gate and reuses the proven
+        // gap escape machinery — a short leg drops in & crawls out, NO soft-lock; a
+        // long/fast leg's bigger stride LOFTS over the void). The gap ramps are ALSO
+        // tagged plankGap:true so the RENDERER omits them from the surface ribbon (the
+        // boards read as SEPARATE closed boxes with the green void showing between),
+        // while PHYSICS keeps the recovery floor (surfFn) so a fallen foot is caught.
+        // The board top stays at `surfaceY` throughout (a level run of boards).
+        const count = Math.max(2, seg.count | 0);
+        const plankLen = (seg.plankLen != null) ? seg.plankLen : SEGMENT_DEFAULTS.plankLen;
+        const gapLen = (seg.gapLen != null) ? seg.gapLen : SEGMENT_DEFAULTS.gapLen;
+        const gapDepth = (seg.gapDepth != null) ? seg.gapDepth : SEGMENT_DEFAULTS.plankGapDepth;
+        const boardTopY = surfaceY;                     // every board sits at the run level
+        const boardThick = thick;                        // closed-box board slab depth
+        for (let p = 0; p < count; p++) {
+          // BOARD: a flat surface segment + its own closed-box render slab.
+          const bx0 = cursorX, bx1 = cursorX + plankLen;
+          addSlab(bx0 + plankLen / 2, boardTopY, plankLen, boardThick);
+          this._segs.push({ x0: bx0, x1: bx1, kind: 'planks', plank: true,
+            topYa: boardTopY, topYb: boardTopY, surfFn: () => boardTopY });
+          if (boardTopY < this._maxSurfaceTopY) this._maxSurfaceTopY = boardTopY;
+          cursorX += plankLen;
+          // GAP (between boards only — count-1 of them): a shallow recovery V-trench
+          // with NO render slab (the void shows). Built as a descent+ascent ramp pair
+          // sharing the gap escape machinery (gap:true ⇒ steep-gate exempt, no soft-lock).
+          if (p < count - 1) {
+            const halfW = gapLen / 2;
+            const dx0 = cursorX, dx1 = cursorX + halfW;
+            const dTopY0 = boardTopY, dTopY1 = boardTopY + gapDepth; // +down ⇒ deeper
+            const dSlope = gapDepth / halfW;
+            this._segs.push({ x0: dx0, x1: dx1, kind: 'ramp', gap: true, plankGap: true,
+              topYa: dTopY0, topYb: dTopY1, slope: dSlope,
+              surfFn: (px) => dTopY0 + dSlope * (px - dx0) });
+            if (dTopY1 < this._maxSurfaceTopY) this._maxSurfaceTopY = dTopY1;
+            const ax0 = cursorX + halfW, ax1 = cursorX + gapLen;
+            const aTopY0 = boardTopY + gapDepth, aTopY1 = boardTopY;
+            const aSlope = -gapDepth / halfW;
+            this._segs.push({ x0: ax0, x1: ax1, kind: 'ramp', gap: true, plankGap: true,
+              topYa: aTopY0, topYb: aTopY1, slope: aSlope,
+              surfFn: (px) => aTopY0 + aSlope * (px - ax0) });
+            cursorX += gapLen;
+          }
+        }
+        // surfaceY unchanged (the boards run level).
       } else if (seg.kind === 'tunnel') {
         // TUNNEL = a flat FLOOR stretch with a LOW CEILING above it (the inverse of a
         // WALL). The floor is a normal flat surface (the cube walks it). The ceiling is
@@ -718,6 +766,7 @@ export class Physics {
     // ramp / wall (steep riser face) / bumps (wavy surface) all carry an analytic slope.
     if (s && (s.kind === 'ramp' || s.kind === 'wall' || s.kind === 'bumps') && typeof s.slope === 'number') return s.slope; // downhill > 0 (y +down)
     if (s && (s.kind === 'flat' || s.kind === 'stairs')) return 0;
+    if (s && s.kind === 'planks' && s.plank) return 0; // a plank board is level
     const dx = 0.35;
     const yR = this.surfaceYAt(px + dx), yL = this.surfaceYAt(px - dx);
     if (yR == null || yL == null) return 0;
@@ -801,6 +850,7 @@ export class Physics {
       return clampMag(Math.atan(seg.slope) * TUNE.tiltGain, TUNE.tiltMax);
     }
     if (seg && seg.kind === 'flat') return 0;
+    if (seg && seg.kind === 'planks' && seg.plank) return 0; // a plank board is level
     // gap / unknown: finite-difference (and hold the current lean over a gap).
     const dx = TUNE.tiltDx;
     const yR = this.surfaceYAt(px + dx);

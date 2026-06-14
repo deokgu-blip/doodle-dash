@@ -2,7 +2,7 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 232,
+  "finishX": 247.4,
   "segments": [
     {
       "kind": "flat",
@@ -64,7 +64,21 @@
     },
     {
       "kind": "flat",
-      "length": 6,
+      "length": 4,
+      "rough": 0.9
+    },
+    {
+      "kind": "planks",
+      "count": 6,
+      "plankLen": 1.4,
+      "gapLen": 1.0,
+      "gapDepth": 1.6,
+      "rough": 0.9,
+      "_note": "GAPPED PLANKS — long/fast leg (big stride) sails over the voids; short leg drops into the shallow recovery trench and crawls out (slow, no soft-lock). Long-favourable."
+    },
+    {
+      "kind": "flat",
+      "length": 4,
       "rough": 0.9
     },
     {

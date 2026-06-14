@@ -251,6 +251,10 @@ export class Renderer {
     };
     for (const s of segs) {
       if (s.kind === 'gap') continue;           // no surface over a gap (skip)
+      // PLANKS VOID: the gap between boards is a recovery trench in PHYSICS (gap:true,
+      // tagged plankGap) but a VISUAL VOID — omit it from the render surface so the
+      // boards read as SEPARATE closed boxes with the green void showing between them.
+      if (s.plankGap) continue;
       const y0 = s.surfFn(s.x0), y1 = s.surfFn(s.x1);
       if (y0 == null || y1 == null) continue;
       // a riser: if this sample starts ABOVE (more negative) where the previous
@@ -310,27 +314,47 @@ export class Renderer {
       if (isEnd || (bumpKeepCount % BUMP_STRIDE) === 0) thinned.push(p);
       bumpKeepCount++;
     }
+    // PLANKS VOID detection: a span between two consecutive profile points whose
+    // MIDPOINT falls in a VISUAL VOID (a plankGap recovery trench, or a bare gap with
+    // no rendered surface) is the empty space between boards. We mark a BREAK there so
+    // the ribbon is CLOSED (end-capped) on both sides and never bridges a quad across
+    // the void — the boards read as separate closed boxes. NB: a plankGap DOES carry a
+    // physics recovery surfFn (so surfaceYAt isn't null there), so we test the SEGMENT
+    // KIND at the midpoint, not surfaceYAt, to find the visual void.
+    const segCoversMid = (mid) => {
+      for (const s of segs) {
+        if (mid < s.x0 - 1e-6 || mid > s.x1 + 1e-6) continue;
+        if (s.plankGap || s.kind === 'gap') return false; // a void (not rendered)
+        return true;                                      // a real rendered surface
+      }
+      return false;                                       // outside any segment ⇒ void
+    };
+    const isVoidSpan = (a, b) => !segCoversMid((a + b) / 2);
     // Densify: insert intermediate x samples (RIBBON_DX) between profile points so
     // the z-curve bends smoothly over long flats/ramps; keep the exact profile pts
     // (incl. stair risers) so steps stay sharp. Bumps gaps are now ~2× wider after the
     // decimation; we DON'T re-densify inside a bumps window (that would undo the cut),
     // so the bumps span between two kept points stays a single straight render segment.
+    // `breakAfter[i]` ⇒ a void follows ring i (close this box, start a new one at i+1).
     const xs = [];
+    const breakAfter = [];
     for (let i = 0; i < thinned.length - 1; i++) {
       const a = thinned[i], b = thinned[i + 1];
-      xs.push(a.x);
+      xs.push(a.x); breakAfter.push(false);
       const span = b.x - a.x;
-      // skip re-densification when this span lies inside a bumps window (keep it coarse).
       const mid = (a.x + b.x) / 2;
+      // a void (plank gap) span: mark a break, do NOT densify or bridge across it.
+      if (isVoidSpan(a.x, b.x)) { breakAfter[breakAfter.length - 1] = true; continue; }
+      // skip re-densification when this span lies inside a bumps window (keep it coarse).
       if (span > RIBBON_DX * 1.5 && !inBumps(mid)) {
         const n = Math.floor(span / RIBBON_DX);
         for (let k = 1; k < n; k++) {
           const t = k / n;
-          xs.push(a.x + span * t);
+          xs.push(a.x + span * t); breakAfter.push(false);
         }
       }
     }
-    xs.push(thinned[thinned.length - 1].x);
+    xs.push(thinned[thinned.length - 1].x); breakAfter.push(false);
     // surfaceY at an arbitrary x via the physics sampler (highest surface), with a
     // hold-last fallback so a momentary null (segment seam round-off) never gaps.
     let lastY = prof[0].y;
@@ -370,7 +394,10 @@ export class Renderer {
         x, ry, zN,  x, by, zN,   // near wall top, bottom
         x, ry, zF,  x, by, zF    // far wall top, bottom
       );
-      if (i > 0) {
+      // PLANKS VOID: a break BEFORE this ring (the previous span was a void) ⇒ do NOT
+      // bridge a quad across the empty space, and the previous ring CLOSES its board.
+      const breakBefore = i > 0 && breakAfter[i - 1];
+      if (i > 0 && !breakBefore) {
         // TOP quad between ring i-1 and i.
         const a = (i - 1) * 2, b = a + 1, c = i * 2, d = c + 1;
         topIdx.push(a, c, b, b, c, d);
@@ -384,17 +411,20 @@ export class Renderer {
         // bottom (facing down): nearBot/farBot
         sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);
       }
-      // ── END CAPS (ㅁ closure): the cross-section quad at the FIRST and LAST ring so
-      //    the box is fully closed — no hollow see-through at the path ends. Each ring's
-      //    4 side verts (nearTop +0, nearBot +1, farTop +2, farBot +3) form the cap quad
-      //    nearTop→farTop→farBot→nearBot. DoubleSide material ⇒ solid from either face. ──
-      if (i === 0 || i === N - 1) {
+      // ── END CAPS (ㅁ closure): the cross-section quad so every box is fully closed —
+      //    no hollow see-through at the path ends OR at a PLANKS void boundary. We cap
+      //    the FIRST/LAST ring of the whole lane AND the ring on EACH side of a void
+      //    (this ring if a break is BEFORE it = a board's left face; or if a break is
+      //    AFTER it = a board's right face). Each ring's 4 side verts (nearTop +0,
+      //    nearBot +1, farTop +2, farBot +3) form the cap quad; DoubleSide ⇒ solid. ──
+      const capHere = (i === 0 || i === N - 1) || breakBefore || breakAfter[i];
+      if (capHere) {
         const b4 = i * 4;
         sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
         // ...AND the reverse winding so the cap is solid from EITHER face. The side
         // material is FrontSide (perf): a single-winding cap got back-face-culled from
         // the camera ⇒ the cross-section read as an OPEN ㄷ. Both windings ⇒ filled ㅁ.
-        // (Only the 2 end-cap quads are double-wound — negligible fill; walls stay culled.)
+        // (Only the cap quads are double-wound — negligible fill; walls stay culled.)
         sideIdx.push(b4 + 0, b4 + 3, b4 + 2, b4 + 0, b4 + 1, b4 + 3);
       }
       prevX = x;

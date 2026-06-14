@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'} SegmentKind
  */
 
 /**
@@ -24,6 +24,15 @@
  *                                     iff reach <= clearance (the LONGER the leg, the more it strikes the
  *                                     ceiling). Smaller clearance ⇒ only shorter legs fit. The inverse of
  *                                     a WALL (which needs a LONG leg). Default SEGMENT_DEFAULTS.tunnelClearance.
+ * @property {number} [count]          PLANKS only: number of plank boards in the run (gaps = count-1, BETWEEN
+ *                                     boards). Each board is a flat segment; each gap is a small void the
+ *                                     walker must STRIDE across (a long/fast leg sails over, a short leg
+ *                                     drops into the recovery trench and crawls out — no soft-lock).
+ * @property {number} [plankLen]       PLANKS only: x-length of each plank board (world units). Default SEGMENT_DEFAULTS.plankLen.
+ * @property {number} [gapLen]         PLANKS only: x-length of each gap between boards (world units). Default SEGMENT_DEFAULTS.gapLen.
+ * @property {number} [gapDepth]       PLANKS only: how deep the gap's recovery trench drops below the board top
+ *                                     (a short leg falls this far, then crawls out — never a bottomless pit).
+ *                                     Default SEGMENT_DEFAULTS.plankGapDepth.
  * @property {number} [rough]          0..1 friction (rough floor), default 0.6
  * @property {number} [bouncy]         0..1 restitution (rubber), default 0
  */
@@ -68,10 +77,16 @@ export const SEGMENT_DEFAULTS = Object.freeze({
   // The walls require reach >= ~1.15 (Rw), so a tunnel clearance below that makes the
   // two gimmicks MUTUALLY EXCLUSIVE — no single reach passes both (see walker.js TUNE).
   tunnelClearance: 0.95,
+  // PLANKS: default board length, gap length, and the gap's recovery-trench depth.
+  // The gaps are the gimmick: a long/fast leg (big stride) sails over them, a short
+  // leg drops into the shallow recovery trench and crawls out (slow, no soft-lock).
+  plankLen: 1.4,
+  gapLen: 1.0,
+  plankGapDepth: 1.6,
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks'];
 
 /** @type {LegPreset[]} */
 export const LEG_PRESETS = ['wheel', 'stick', 'hook'];
@@ -96,11 +111,14 @@ export function validateTrack(t) {
   t.segments.forEach((s, i) => {
     if (!SEGMENT_KINDS.includes(s.kind))
       throw new Error(`segment[${i}].kind invalid: ${s.kind}`);
-    // a GAP carries its horizontal extent as `width` (the V-trench span); all other
-    // kinds use `length`. Either way the extent must be a positive number.
+    // a GAP carries its horizontal extent as `width` (the V-trench span); a PLANKS
+    // run DERIVES its extent from count×plankLen + (count-1)×gapLen; all other kinds
+    // use `length`. Either way the extent must be a positive number.
     if (s.kind === 'gap') {
       if (!(s.width > 0) && !(s.length > 0))
         throw new Error(`segment[${i}] gap needs width>0 (or length>0)`);
+    } else if (s.kind === 'planks') {
+      // length is OPTIONAL for planks (computed from count/plankLen/gapLen).
     } else if (typeof s.length !== 'number' || s.length <= 0) {
       throw new Error(`segment[${i}].length must be a positive number`);
     }
@@ -123,6 +141,16 @@ export function validateTrack(t) {
       // (falls back to SEGMENT_DEFAULTS.tunnelClearance); if given it must be positive.
       if (s.clearance != null && !(s.clearance > 0))
         throw new Error(`segment[${i}] tunnel clearance must be > 0`);
+    }
+    if (s.kind === 'planks') {
+      // a PLANKS run needs at least 2 boards (so there is at least 1 gap to stride).
+      if (!(s.count >= 2)) throw new Error(`segment[${i}] planks needs count>=2`);
+      if (s.plankLen != null && !(s.plankLen > 0))
+        throw new Error(`segment[${i}] planks plankLen must be > 0`);
+      if (s.gapLen != null && !(s.gapLen > 0))
+        throw new Error(`segment[${i}] planks gapLen must be > 0`);
+      if (s.gapDepth != null && !(s.gapDepth > 0))
+        throw new Error(`segment[${i}] planks gapDepth must be > 0`);
     }
   });
   if (t.rival != null) {

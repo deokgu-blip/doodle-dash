@@ -177,11 +177,13 @@ export class Game {
       }
     }
     // also gate each stairs RUN once (group abutting treads) — replace the naive add.
-    // Rebuild cleanly: scan and group stairs. THREE mutually-exclusive needs now:
-    //   • tunnel       → 'short' (a too-long leg strikes the low ceiling)
-    //   • wall/gap     → 'long'  (needs the reach to step the ledge / leap the trench)
-    //   • stairs       → 'long'  (needs the reach to climb tall steps)
-    //   • STEEP uphill ramp (steepGate) → 'hook' (only a hook SHAPE grips over it)
+    // Rebuild cleanly: scan and group stairs. The mutually-exclusive needs now:
+    //   • tunnel              → 'short' (a too-long leg strikes the low ceiling)
+    //   • wall/gap            → 'long'  (needs the reach to step the ledge / leap the trench)
+    //   • GENTLE stairs       → 'long'  (length-gated: needs the reach to climb tall steps)
+    //   • STEEP stairs        → 'hook'  (hook-gated STAIRCASE: only a hook SHAPE grips the step
+    //                                     edges & climbs — reach-irrelevant)
+    //   • STEEP uphill ramp (steepGate) → 'hook' (legacy: same hook-grip rule)
     gates.length = 0;
     let prevStairX1 = -Infinity;
     for (const s of segs) {
@@ -189,7 +191,9 @@ export class Game {
       else if (s.kind === 'wall' || s.kind === 'gap') gates.push({ x: s.x0, need: 'long' });
       else if (s.kind === 'ramp' && s.steepGate && !s.gap) gates.push({ x: s.x0, need: 'hook' });
       else if (s.kind === 'stairs') {
-        if (s.x0 > prevStairX1 + 0.05) gates.push({ x: s.x0, need: 'long' });
+        // gate once per RUN (treads abut). A STEEP-gated staircase needs a HOOK; a gentle
+        // (ungated) staircase needs a LONG leg (the per-riser length gate).
+        if (s.x0 > prevStairX1 + 0.05) gates.push({ x: s.x0, need: s.steepGate ? 'hook' : 'long' });
         prevStairX1 = s.x1;
       }
     }

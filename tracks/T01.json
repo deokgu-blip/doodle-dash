@@ -33,11 +33,12 @@
       "rough": 0.9
     },
     {
-      "kind": "ramp",
+      "kind": "stairs",
       "length": 6,
       "height": 4.4,
+      "steps": 6,
       "rough": 0.9,
-      "_note": "STEEP uphill (slope 0.733) — hook-gated: only a hook leg grips over it"
+      "_note": "STEEP CLIMB = hook-gated STAIRCASE (overall slope 0.733 >= 0.6 => auto hook-gate). Visible tall step edges are the grip points: only a HOOK leg grips & climbs; straight/round legs slip => struggle-in-place at the foot => redraw a hook to pass (no soft-lock). Reach-irrelevant. 6 steps over 6u => each ~0.73u rise (clearly stepped, not micro-serrations)."
     },
     {
       "kind": "ramp",

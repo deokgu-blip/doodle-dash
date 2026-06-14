@@ -418,6 +418,7 @@ export class Physics {
     this._riserHit = { found: false, x: 0, h: 0 };
     this._tunnelHit = { found: false, x: 0, clearance: 0 };
     this._steepHit = { found: false, x: 0, slope: 0 };
+    this._steepStairRuns = [];   // build-time list of steep-gated stairs run feet/windows
 
     // ── RENDER INTERPOLATION (mobile micro-stutter fix) ──
     // The SIM ticks on a FIXED timestep (FIXED_DT) with an accumulator that carries the
@@ -566,6 +567,18 @@ export class Physics {
         const steps = seg.steps;
         const stepLen = len / steps;
         const stepH = seg.height / steps;   // per-step rise (designed climb unit)
+        // STEEP-STAIRCASE GATE (hook by SHAPE): a stairs run whose OVERALL slope (the
+        // total rise over the run length) is >= steepThresh is a STEEP CLIMB. Its tall
+        // step edges are GRIP POINTS — only a HOOK-shaped leg can grip & climb over; a
+        // straight / round leg slips and STRUGGLES in place at the foot (no advance)
+        // until a hook is redrawn. We tag EVERY tread of such a run with steepGate so
+        // _nextSteep/_nextRiser key off it (the hook gate then SUPERSEDES the per-riser
+        // length gate). GENTLE staircases (overall slope < steepThresh) get NO steepGate
+        // and stay length-gated/passable by all legs, exactly as before. Computed ONCE
+        // here at build time (no per-frame cost). Sign: stairs always rise (height>0),
+        // so the run climbs up — |overall slope| = height/length.
+        const stairSlope = seg.height / len;             // overall run slope (rise/run, positive = up)
+        const stairSteep = Math.abs(stairSlope) >= TUNE.steepThresh;
         for (let i = 0; i < steps; i++) {
           surfaceY -= stepH;                // each step rises (y up = negative)
           // CAPTURE the tread top in a per-step CONST — `surfaceY` is a mutating
@@ -577,10 +590,12 @@ export class Physics {
           const cx = cursorX + stepLen / 2;
           addSlab(cx, treadY, stepLen, slabH);
           // each tread is a flat segment; its LEFT edge (x0) is the RISER the
-          // walker must mount, carrying stepH for the climb rule.
+          // walker must mount, carrying stepH for the climb rule. On a STEEP run the
+          // tread also carries steepGate:true (the hook gate) — the run's foot is then
+          // a steep-staircase block for a non-hook leg.
           const x0 = cursorX, x1 = cursorX + stepLen;
           this._segs.push({ x0, x1, kind: 'stairs', topYa: treadY, topYb: treadY,
-            stepH, surfFn: () => treadY });
+            stepH, steepGate: stairSteep, surfFn: () => treadY });
           if (treadY < this._maxSurfaceTopY) this._maxSurfaceTopY = treadY;
           cursorX += stepLen;
         }
@@ -821,6 +836,42 @@ export class Physics {
     for (let i = 0; i < this._segs.length; i++) xs[i] = this._segs[i].x0;
     this._segX0 = xs;
     this._segHint = 0;
+
+    // ── PRECOMPUTE STEEP-STAIRCASE RUN FEET (build-time, O(n) once — never per frame). ──
+    // A steep-gated stairs run is a sequence of abutting treads all tagged steepGate. Its
+    // FOOT is the x0 of the FIRST tread (the riser a non-hook leg is stopped at). We record
+    // each run's foot x (and the run's overall slope) so _nextSteep can find the next steep
+    // CLIMB foot with a tiny bounded scan (#runs, not #treads). Also record the run window
+    // (footX0 .. lastX1) so the per-frame gate can ask "is px on a steep-gated stairs run?"
+    // without re-deriving it. A tread is a run foot iff the immediately-preceding segment is
+    // NOT a steep-gated stairs tread abutting it (x1 ≈ this.x0). Treads are pushed in x order.
+    this._steepStairRuns = [];   // [{ x0, x1, slope }] — one entry per steep staircase run
+    {
+      let prevSteepStairX1 = -Infinity, cur = null;
+      for (const s of this._segs) {
+        if (s.kind === 'stairs' && s.steepGate) {
+          if (cur && Math.abs(s.x0 - prevSteepStairX1) < 1e-6) {
+            cur.x1 = s.x1;                       // extend the current run (abutting tread)
+          } else {
+            // a new run starts: its foot is this tread's x0, slope from the run rise/run.
+            cur = { x0: s.x0, x1: s.x1, slope: 0 };
+            this._steepStairRuns.push(cur);
+          }
+          prevSteepStairX1 = s.x1;
+        } else {
+          cur = null; prevSteepStairX1 = -Infinity;
+        }
+      }
+      // fill in each run's overall slope (rise/run, physics +down ⇒ up is negative). The
+      // surface at the foot is the run's HIGH y (lowest step); at the top it is the most
+      // negative y. slope = (topY − footTopY)/(x1 − x0) < 0 for an ascent.
+      for (const r of this._steepStairRuns) {
+        const yFoot = this.surfaceYAt(r.x0 + 1e-3);
+        const yTop = this.surfaceYAt(r.x1 - 1e-3);
+        const run = Math.max(1e-3, r.x1 - r.x0);
+        r.slope = (yFoot != null && yTop != null) ? (yTop - yFoot) / run : 0;
+      }
+    }
 
     // ── SPAWN THE BALL PILES (AFTER the lookup index so surfaceYAt resolves). ──
     // We pack all piles into ONE set of flat arrays (cache-friendly stepping). Each ball
@@ -1450,21 +1501,44 @@ export class Physics {
     return h;
   }
 
-  /** Find the next STEEP UPHILL ramp (steepGate=true, not a gap) whose foot (x0) lies
-   * in (fromX, toX]. Returns { x, slope } or null. The foot is where a NON-HOOK leg is
-   * stopped (struggle-in-place). REUSEs a scratch object (no per-frame allocation). */
-  _nextSteepRamp(fromX, toX) {
+  /** Find the next STEEP UPHILL CLIMB foot whose x lies in (fromX, toX]. This covers BOTH
+   * (a) a steep-gated regular ramp (steepGate=true, not a gap — foot = x0) AND (b) a steep-
+   * gated STAIRCASE run (its FOOT = the first tread's x0, precomputed in _steepStairRuns).
+   * Returns { x, slope } or null. The foot is where a NON-HOOK leg is stopped (struggle-in-
+   * place — the step edges / slope have no grip for a straight or round leg). REUSEs a scratch
+   * object (no per-frame allocation). The staircase scan is over #runs (a handful), not #treads,
+   * so the hot path stays cheap. A steep STAIRCASE is hook-gated EXACTLY like a steep ramp. */
+  _nextSteep(fromX, toX) {
     let bestX = Infinity, bestSlope = 0, any = false;
+    // (a) steep-gated regular ramps (the original behaviour).
     for (const s of this._segs) {
       if (s.kind !== 'ramp' || !s.steepGate || s.gap) continue;
       if (s.x0 > fromX && s.x0 <= toX) {
         if (!any || s.x0 < bestX) { bestX = s.x0; bestSlope = s.slope; any = true; }
       }
     }
+    // (b) steep-gated STAIRCASE run feet (precomputed; bounded #runs scan).
+    for (let i = 0; i < this._steepStairRuns.length; i++) {
+      const r = this._steepStairRuns[i];
+      if (r.x0 > fromX && r.x0 <= toX) {
+        if (!any || r.x0 < bestX) { bestX = r.x0; bestSlope = r.slope; any = true; }
+      }
+    }
     if (!any) { this._steepHit.found = false; return null; }
     const h = this._steepHit;
     h.found = true; h.x = bestX; h.slope = bestSlope;
     return h;
+  }
+
+  /** Is px inside a steep-gated STAIRCASE run (foot..top)? Bounded #runs scan (no per-frame
+   * alloc). Used by the per-frame gate so the per-RISER length gate is SUPPRESSED on a steep
+   * staircase (the hook gate is the only thing that matters there — reach is irrelevant). */
+  _onSteepStairRun(px) {
+    for (let i = 0; i < this._steepStairRuns.length; i++) {
+      const r = this._steepStairRuns[i];
+      if (px >= r.x0 - 1e-6 && px <= r.x1 + 1e-6) return true;
+    }
+    return false;
   }
 
   /** Effective rolling radius for ω = v/r. This is the CONTACT foot's lever arm
@@ -1993,15 +2067,23 @@ export class Physics {
       // stop it at the mouth (struggle-in-place), the user must redraw shorter.
       const tunnel = this._nextTunnel(this._x, lookX + 0.5);
       const tunnelBlocks = tunnel && !this.canPassTunnel(reach, tunnel.clearance);
-      // STEEP-RAMP rule (by SHAPE, not length): if a steep UPHILL ramp foot lies just
-      // ahead, gate on HOOK-NESS. A HOOK leg grips-and-steps over (climbs); a NON-HOOK
-      // leg (straight / arc / circle / wheel) slips and STRUGGLES in place at the foot
-      // (no advance) until a hook is drawn. NO reach involvement.
-      const steep = this._nextSteepRamp(this._x, lookX + 0.5);
+      // STEEP-CLIMB rule (by SHAPE, not length): if a steep UPHILL foot lies just ahead
+      // — a steep RAMP foot OR a steep-gated STAIRCASE run foot — gate on HOOK-NESS. A
+      // HOOK leg grips-and-steps over (climbs); a NON-HOOK leg (straight / arc / circle /
+      // wheel) slips and STRUGGLES in place at the foot (no advance) until a hook is drawn.
+      // NO reach involvement: the hook gate SUPERSEDES the per-riser length gate here.
+      const steep = this._nextSteep(this._x, lookX + 0.5);
       const steepBlocks = steep && !this._isHook;
+      // SUPPRESS the per-riser LENGTH gate when the riser belongs to a STEEP-GATED STAIRCASE
+      // run: on a steep staircase the HOOK gate is the only thing that matters (a non-hook is
+      // already stopped at the foot by `steep`; a hook of ANY reach must climb — the tall step
+      // edges are its grip points). Without this a short hook would ALSO trip _blockedByRiser
+      // (double-gating). A GENTLE (ungated) staircase keeps its normal length gate unchanged.
+      const riserOnSteepStair = riser && this._onSteepStairRun(riser.x);
+      const riserBlocks = riser && !riserOnSteepStair && !this.canClimb(reach, riser.h);
       // whichever gate's stop-point comes FIRST along x wins (so a wall just before a
-      // tunnel, or a steep ramp before a wall, blocks at the nearer obstacle).
-      const riserStopX = (riser && !this.canClimb(reach, riser.h)) ? (riser.x - CUBE_SIZE * 0.5) : Infinity;
+      // tunnel, or a steep climb before a wall, blocks at the nearer obstacle).
+      const riserStopX = riserBlocks ? (riser.x - CUBE_SIZE * 0.5) : Infinity;
       const tunnelStopX = tunnelBlocks ? (tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap) : Infinity;
       const steepStopX = steepBlocks ? (steep.x - CUBE_SIZE * 0.5 - TUNE.steepEnterGap) : Infinity;
       if (steepBlocks && steepStopX <= riserStopX && steepStopX <= tunnelStopX) {
@@ -2020,8 +2102,10 @@ export class Physics {
         this._blocked = true;
         this._blockedByTunnel = true;
         if (this._x > tunnelStopX) this._x = tunnelStopX;
-      } else if (riser && !this.canClimb(reach, riser.h)) {
-        // blocked: stop just before the riser.
+      } else if (riserBlocks) {
+        // blocked: stop just before the riser (a GENTLE staircase/wall step too tall for this
+        // reach). A steep-gated staircase riser is NOT a riserBlocks (the hook gate governs it
+        // — see riserOnSteepStair above), so this is only the length gate of ungated steps.
         v = 0;
         this._blocked = true;
         this._blockedByRiser = true; // a step we can't clear — struggle against it
@@ -2043,6 +2127,10 @@ export class Physics {
           // climbing the steep wall face (a climbable long leg) — slow, like stairs.
           terrain = TUNE.stairClimbSlow;
         } else if (seg.kind === 'stairs' || (riser && this.canClimb(reach, riser.h))) {
+          // climbing stairs (gentle = any leg by length; steep = a HOOK leg whose grip on the
+          // tall step edges carried it past the foot gate above) — grip-and-step pace. On a
+          // steep-gated staircase a non-hook leg never reaches this branch (it is stopped at
+          // the foot by `steepBlocks`), so only a hook rides the steep stairs hypotenuse up.
           terrain = TUNE.stairClimbSlow;
         }
       }

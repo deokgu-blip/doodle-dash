@@ -354,8 +354,26 @@ export class Game {
   }
 
   // ── render loop (browser only) ──
+  // PERF (RENDER CAP): on a 120/144Hz panel the RAF fires 120/144×/s. The SIM must
+  // still advance at real time every frame (so 38s races, refresh-rate independence
+  // and slow-motion are byte-identical), but RENDERING twice as often as the eye/
+  // panel needs just doubles the GPU work for no visible gain. So we SPLIT the loop:
+  //   • step()  runs EVERY rAF with the true elapsed frame·timeScale → sim is exact at
+  //     any refresh rate (the fixed-step accumulator already carries the remainder, so
+  //     this is identical to the old per-frame step).
+  //   • sync + updateCamera + render + HUD run AT a 60fps BUDGET (RENDER_DT gate). A
+  //     render-accumulator banks each frame's REAL elapsed time and fires a render when
+  //     it has banked >= RENDER_DT (1000/60), then SUBTRACTS RENDER_DT (carrying the
+  //     overshoot). Carrying the remainder makes the long-run average EXACTLY 60fps at
+  //     ANY refresh rate (60Hz ⇒ 1 render/frame; 120Hz ⇒ every 2nd; 144Hz ⇒ a 1,1,0…
+  //     cadence that still averages 60 — NOT the 48fps a coarse "since-last >= dt" gate
+  //     would give). The sim being independent of the render cadence means the cube's
+  //     on-screen position is always the latest sim state — no stutter, just fewer
+  //     redraws of the same continuously-advancing world.
+  RENDER_DT = 1000 / 60;       // 60fps render budget (sim still runs every frame).
   startLoop() {
     if (this.headless) return;
+    this._renderAcc = this.RENDER_DT;   // render the very first frame immediately.
     const loop = (t) => {
       this._raf = requestAnimationFrame(loop);
       if (!this._lastT) this._lastT = t;
@@ -366,48 +384,72 @@ export class Game {
       // user is drawing, 1.0 otherwise). The fixed-step accumulator in step() carries
       // the sub-tick remainder, so 0.1× simply advances ~10% of the ticks per frame —
       // both player AND rival slow together (it is applied to the whole step).
+      // ALWAYS step (every rAF) so the sim runs at real time on ANY refresh rate.
       this.step(frame * this._timeScale);
-      this.renderer.sync(this.physics);
-      if (this.rivalSpec) this.renderer.syncRival(this.rival);
-      this.renderer.updateCamera(this.physics);
-      this.renderer.render();
-      this._renderHud();
+      // RENDER CAP: bank REAL elapsed (NOT timeScale-scaled, so slow-motion does NOT
+      // change the render cadence — it stays 60fps redraws of a slowly-advancing sim,
+      // i.e. smooth bullet-time). Fire at most once per loop; carry the overshoot so the
+      // long-run render rate averages exactly 60 at any refresh rate.
+      this._renderAcc += frame;
+      if (this._renderAcc >= this.RENDER_DT) {
+        // cap the carry so a long stall (tab-switch) doesn't force a render burst.
+        this._renderAcc = Math.min(this._renderAcc - this.RENDER_DT, this.RENDER_DT);
+        this.renderer.sync(this.physics);
+        if (this.rivalSpec) this.renderer.syncRival(this.rival);
+        this.renderer.updateCamera(this.physics);
+        this.renderer.render();
+        this._renderHud();
+      }
     };
     this._raf = requestAnimationFrame(loop);
   }
   stopLoop() { if (this._raf) cancelAnimationFrame(this._raf); this._raf = null; }
 
   // ── HUD ──
+  // PERF (ON-CHANGE): the old _renderHud wrote progressFill.width, youMarker.left,
+  // rivalMarker.left/display, countdown.textContent/display and overlay.display on
+  // EVERY rendered frame. Writing layout-affecting style props (width/left) and
+  // textContent forces the browser to dirty layout each call (≈6 DOM writes/frame).
+  // The displayed values only change at integer-% / countdown-tick / phase boundaries,
+  // so we CACHE the last written value per field and skip the DOM write when it is
+  // unchanged. Reads of the cache are free; the bar still updates the instant the %
+  // ticks. (CSS `transition` on width/left still animates between the discrete writes.)
   _renderHud() {
     const h = this.hud, s = this.state;
     if (!h || !h.progressFill) return;
-    h.progressFill.style.width = `${Math.round(s.progress * 100)}%`;
-    if (h.youMarker) h.youMarker.style.left = `${Math.round(s.progress * 100)}%`;
+    const c = this._hudCache || (this._hudCache = {});
+
+    const prog = Math.round(s.progress * 100);
+    if (c.prog !== prog) { c.prog = prog; h.progressFill.style.width = `${prog}%`; if (h.youMarker) h.youMarker.style.left = `${prog}%`; }
+
     // RIVAL marker on the same bar (only when there is an opponent).
     if (h.rivalMarker) {
       if (this.rivalSpec) {
-        h.rivalMarker.style.display = 'block';
-        h.rivalMarker.style.left = `${Math.round(s.rivalProgress * 100)}%`;
-      } else {
-        h.rivalMarker.style.display = 'none';
+        const rprog = Math.round(s.rivalProgress * 100);
+        if (c.rivalDisp !== 'block') { c.rivalDisp = 'block'; h.rivalMarker.style.display = 'block'; }
+        if (c.rprog !== rprog) { c.rprog = rprog; h.rivalMarker.style.left = `${rprog}%`; }
+      } else if (c.rivalDisp !== 'none') {
+        c.rivalDisp = 'none'; h.rivalMarker.style.display = 'none';
       }
     }
 
     if (h.countdown) {
       if (s.phase === 'countdown') {
         const n = Math.ceil(s.countdownMs / 700);
-        h.countdown.textContent = n >= 4 ? '3' : (n <= 0 ? 'GO!' : String(n));
-        h.countdown.style.display = 'block';
-      } else {
-        h.countdown.style.display = 'none';
+        const txt = n >= 4 ? '3' : (n <= 0 ? 'GO!' : String(n));
+        if (c.cdTxt !== txt) { c.cdTxt = txt; h.countdown.textContent = txt; }
+        if (c.cdDisp !== 'block') { c.cdDisp = 'block'; h.countdown.style.display = 'block'; }
+      } else if (c.cdDisp !== 'none') {
+        c.cdDisp = 'none'; h.countdown.style.display = 'none';
       }
     }
     if (h.overlay) {
       if (s.phase === 'win' || s.phase === 'lose') {
-        h.overlay.style.display = 'flex';
-        if (h.overlayTitle) h.overlayTitle.textContent = s.phase === 'win' ? 'terrific!' : 'try again';
-      } else {
-        h.overlay.style.display = 'none';
+        if (c.ovDisp !== 'flex') { c.ovDisp = 'flex'; h.overlay.style.display = 'flex'; }
+        const title = s.phase === 'win' ? 'terrific!' : 'try again';
+        if (h.overlayTitle && c.ovTitle !== title) { c.ovTitle = title; h.overlayTitle.textContent = title; }
+      } else if (c.ovDisp !== 'none') {
+        c.ovDisp = 'none'; h.overlay.style.display = 'none';
       }
     }
   }

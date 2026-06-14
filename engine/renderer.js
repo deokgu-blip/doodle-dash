@@ -113,7 +113,15 @@ export class Renderer {
     // culling halves that fragment work with NO visual change as long as the box is
     // closed (verified by the closed-section screenshot — no see-through). The ribbon
     // builder winds near-wall / far-wall / bottom / end-caps consistently outward.
-    this._sideMat = new THREE.MeshStandardMaterial({ color: COL.trackEdge, roughness: 0.85, side: THREE.FrontSide });
+    // PERF (UNLIT): the side/end/under faces are a flat SOLID edge colour — no texture,
+    // just a single trackEdge tint shaded by the scene lights. These side faces span the
+    // ENTIRE length of both lanes (≈98% of the scene's triangles), so MeshStandardMaterial
+    // meant a full per-pixel PBR lighting eval (ambient + 2 dir lights, normal-based) on
+    // the LARGEST fill area in the frame — on a 120Hz high-DPI panel that dominated GPU.
+    // The art is flat single-colour, so an UNLIT MeshBasicMaterial renders the IDENTICAL
+    // solid trackEdge colour at zero lighting cost. FrontSide kept (closed box ⇒ back-face
+    // cull halves the side fill; computeVertexNormals stays harmless, just unused now).
+    this._sideMat = new THREE.MeshBasicMaterial({ color: COL.trackEdge, side: THREE.FrontSide });
   }
 
   _buildBackground() {
@@ -132,14 +140,18 @@ export class Renderer {
   }
 
   _buildLights() {
-    const amb = new THREE.AmbientLight(0xffffff, 0.75);
+    // PERF (UNLIT pass): the track sides/top + leg + face + finish are all UNLIT
+    // (MeshBasic) now — they ignore these lights entirely. Only the two cubes + axle
+    // shafts are MeshLambert and need lighting. Lambert cost scales with the light
+    // count, so we keep just AMBIENT + ONE directional (the key light) and DROP the old
+    // magenta fill light (it existed mainly to tint the PBR side walls, which are now
+    // flat Basic). Ambient bumped a touch so the unlit dropping of the fill doesn't make
+    // the cube's shadowed faces too dark. Result: a clear top-bright / side-darker box.
+    const amb = new THREE.AmbientLight(0xffffff, 0.82);
     this.scene.add(amb);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.85);
     dir.position.set(-4, 8, 6);
     this.scene.add(dir);
-    const fill = new THREE.DirectionalLight(0xC24FD6, 0.18);
-    fill.position.set(4, 2, -4);
-    this.scene.add(fill);
   }
 
   /** Build the track ribbon + ground from the physics floor bodies. When a
@@ -468,7 +480,13 @@ export class Renderer {
    * (reference close-up) instead of two strokes overlapping in the middle. */
   _buildCharacterCube(bodyColor, faceColor) {
     const cubeGeo = new THREE.BoxGeometry(PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE, PHYS_CONST.CUBE_SIZE * 0.9);
-    const cubeMat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.45, metalness: 0.05 });
+    // PERF (UNLIT-ish): the cube is small (few pixels), but PBR (Standard) is the most
+    // expensive shader. We drop to MeshLambertMaterial — a CHEAP single-pass diffuse
+    // (1-light Gouraud-ish, no specular/roughness/metalness sampling) — so the cube
+    // still catches the directional light and reads as a 3D box (top face brighter than
+    // the side faces), NOT a flat single-colour sticker, but at a fraction of the PBR
+    // cost. The ambient + 1 directional light kept in _buildLights drive this shading.
+    const cubeMat = new THREE.MeshLambertMaterial({ color: bodyColor });
     const cube = new THREE.Mesh(cubeGeo, cubeMat);
     const faceTex = this._makeFace(faceColor);
     const faceMat = new THREE.MeshBasicMaterial({ map: faceTex, transparent: true });
@@ -498,7 +516,10 @@ export class Renderer {
 
     // axle BAR: a slim shaft laid along z, threading the two leg planes so the
     // two strokes read as spokes on ONE axle. Sits behind the front face.
-    const barMat = new THREE.MeshStandardMaterial({ color: HUB_RING, roughness: 0.5, metalness: 0.1 });
+    // PERF (UNLIT-ish): same as the cube — drop the axle shaft from PBR to the cheap
+    // 1-light diffuse MeshLambertMaterial. It still gets a touch of cylindrical shading
+    // from the directional light (so the round shaft reads), at a fraction of the cost.
+    const barMat = new THREE.MeshLambertMaterial({ color: HUB_RING });
     const bar = new THREE.Mesh(
       new THREE.CylinderGeometry(AXLE_R, AXLE_R, HALF_Z * 2, 16),
       barMat

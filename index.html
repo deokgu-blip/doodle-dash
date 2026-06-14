@@ -73,10 +73,33 @@
     color:#fff; background:var(--player); cursor:pointer; }
   .btn.retry{ background:#999; }
   .btn:active{ transform:scale(.95); }
+
+  /* ── debug overlay (top-left, real-time FPS / frame-ms / draw / mem) ──
+     Fixed to the VIEWPORT top-left (not the 9:16 stage box) so it reads as a true
+     screen HUD; respects the notch via safe-area insets. High z so it sits over the
+     game + the topbar/progress bar, but pointer-events:none so it never eats touches
+     (the draw box / restart button stay fully usable underneath). Small + reads as a
+     few short lines so it does NOT cover the "DRAW A LEG" hint or the progress bar.
+     Monospace + dark translucent bg + bright text for at-a-glance readability. */
+  #debug-overlay{
+    position:fixed;
+    top:calc(2px + var(--safe-t)); left:calc(2px + env(safe-area-inset-left));
+    z-index:9999; pointer-events:none;
+    margin:0; padding:5px 7px; border-radius:8px;
+    background:rgba(0,0,0,.62); color:#5BFF9A;
+    font:600 10px/1.32 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    white-space:pre; letter-spacing:.2px;
+    text-shadow:0 1px 1px rgba(0,0,0,.6);
+    -webkit-font-smoothing:antialiased;
+  }
 </style>
 </head>
 <body>
   <div id="bg"></div>
+  <pre id="debug-overlay">FPS --/60
+ms   --  avg  --  max
+draw --  tris --
+mem geo --  tex --</pre>
   <div id="stage">
     <canvas id="gl"></canvas>
 
@@ -127,7 +150,7 @@
     overlayTitle: $('overlay-title'),
   };
 
-  const game = new Game({ canvas: gl, drawCanvas: drawcanvas, hud });
+  const game = new Game({ canvas: gl, drawCanvas: drawcanvas, hud, debugEl: $('debug-overlay') });
   window.game = game;
   // expose Matter for headless tuning harness (no effect on gameplay)
   import('./engine/vendor/matter.module.js').then((m) => { window.Matter = m.default || m; });

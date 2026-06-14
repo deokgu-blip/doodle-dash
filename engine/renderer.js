@@ -874,6 +874,11 @@ export class Renderer {
 
   render() { this.renderer.render(this.scene, this.camera); }
 
+  /** Live three.js render/memory stats (draw calls, triangles, geometries, textures)
+   * for the debug overlay. Returns the WebGLRenderer's `.info` object directly (read-
+   * only consumption — no behaviour change). Null-safe for the headless path. */
+  info() { return this.renderer ? this.renderer.info : null; }
+
   /** START-HITCH PRE-WARM: compile every material's shader program + upload textures
    * NOW (right after the scene is built) instead of lazily on the first render(). The
    * first frame otherwise pays a ~10ms synchronous program-link + texture-upload stall

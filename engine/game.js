@@ -5,6 +5,7 @@
 import { Physics, presetStroke } from './physics.js';
 import { Renderer } from './renderer.js';
 import { validateTrack, RIVAL_DEFAULTS } from './track_schema.js';
+import { DebugOverlay } from './debug_overlay.js';
 
 const COUNTDOWN_MS = 2600; // 3 -> 2 -> 1 -> GO
 
@@ -23,6 +24,14 @@ export class Game {
     this.headless = !!opts.headless;
 
     this.physics = new Physics();
+    // DEBUG OVERLAY (display only): real-time achieved-render-FPS + render-gap (avg/max)
+    // + draw calls / triangles / GPU geometry-texture counts, drawn top-left. Created
+    // even headless (with a null DOM element) so verifiers can read its measured stats.
+    // It is FED one sample per render() in startLoop — see below. Zero gameplay effect.
+    this.debug = new DebugOverlay(
+      opts.debugEl || null,
+      () => (this.renderer ? this.renderer.info() : null)
+    );
     // RIVAL: a SECOND, fully independent walker on a parallel lane (the computer
     // opponent). Same class, own track build, own leg preset + pace. Player and
     // rival never share state — they are two clean Physics instances.
@@ -399,6 +408,10 @@ export class Game {
         this.renderer.updateCamera(this.physics);
         this.renderer.render();
         this._renderHud();
+        // DEBUG OVERLAY: feed the REAL RAF timestamp `t` of THIS render (not sim/timeScale
+        // time) so the achieved-FPS + render-gap are measured against the actual screen
+        // refresh. O(1) per render; the text/DOM write inside is self-throttled to ~4×/s.
+        if (this.debug) this.debug.frame(t);
       }
     };
     this._raf = requestAnimationFrame(loop);

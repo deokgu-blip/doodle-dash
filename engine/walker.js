@@ -250,6 +250,35 @@ const TUNE = {
   ballSlowPerContact: 0.20, // each contacting ball costs 20% of speed (compounding) — a clear "방해"
   ballSlowMin: 0.30,        // hard floor on the slow factor (cube keeps ≥30% pace ⇒ never soft-locks)
   ballContactPad: 0.10,     // extra world-u so a ball "in contact" is counted a hair before exact touch
+
+  // ── BREAKING BLOCKS (a wall of standing boxes the cube SMASHES into debris) ──
+  // A `blocks` segment stands N boxes UPRIGHT on a flat run, barring the path. While INTACT
+  // a block is STATIC and STOPS the cube at its face (no auto-advance, no penetration). On
+  // contact the block BREAKS: it is replaced by `debrisPerBlock` small box fragments that
+  // INHERIT the cube's forward push (an outward impulse), then fall + litter the floor using
+  // the SAME debris physics as the balls (gravity, ground clamp, fragment-fragment &
+  // fragment-cube separation, linear friction). The settled rubble then SLOWS any cube that
+  // grinds over it (resistance ∝ contacts, floored ⇒ never a soft-lock). The cube ALWAYS
+  // smashes through. These knobs mirror the ball knobs (debris IS a ball with box render).
+  blockBreakSpeedMin: 0.6,  // min forward cube speed to register a "smash" (so a creeping touch still breaks but reads as effort)
+  debrisGravity: 26.0,      // world u/s² downward (physics +down) — same as the balls
+  debrisFriction: 5.2,      // 1/s linear velocity damping — a touch higher (boxes tumble to rest fast)
+  debrisRestitution: 0.12,  // ground/separation bounce (boxy chips bounce less than balls)
+  debrisSepStiff: 22.0,     // 1/s fragment-fragment positional separation push
+  debrisBurstSpeed: 4.5,    // base outward speed (u/s) imparted to a fragment when its block breaks (the "흩날림")
+  debrisBurstUp: 0.55,      // fraction of the burst that lifts the fragment (so chips fly up, not just slide)
+  debrisPushSpeed: 1.25,    // multiplier on the cube's forward speed imparted to a fragment it later shoves
+  debrisPushUp: 0.40,       // fraction of that push that also lifts the fragment
+  debrisCubeHalf: 0.55,     // cube collision half-extent for the debris push (== ballCubeHalf)
+  debrisContactPad: 0.10,   // extra world-u so a fragment "in contact" counts a hair before touch
+  debrisSlowPerContact: 0.16, // each contacting fragment costs 16% of speed (compounding) — the rubble "방해"
+  debrisSlowMin: 0.34,      // hard floor on the rubble slow factor (cube keeps ≥34% pace ⇒ never soft-locks)
+  // BLOCK SMASH GATE: while a block is intact and the cube has not reached its face, the
+  // cube is held at the face (struggle-in-place is NOT used — a block is broken on the very
+  // frame the cube touches it, so the hold is a single sub-step before the break). The cube
+  // stops at (blockFaceX − cubeHalf) until it breaks. blockContactPad = how close (world-u)
+  // the cube must get to a block's near face to trigger the break.
+  blockContactPad: 0.06,
 };
 
 export class Physics {
@@ -345,6 +374,29 @@ export class Physics {
     this._ballContacts = 0;          // # balls the cube was in contact with last step (diagnostic)
     this._ballRenderList = null;     // reusable [{x,y,r}] views for the renderer (no per-frame alloc)
 
+    // ── BREAKING BLOCKS (standing boxes the cube smashes) + their DEBRIS (boxy balls). ──
+    // STANDING BLOCKS: a small array of upright boxes (x,faceX,topY,baseY,w,h, broken). While
+    // a block is NOT broken it is STATIC and bars the cube (held at its face, no penetration);
+    // on contact `broken` flips true and the block's render mesh is hidden. DEBRIS: flat
+    // arrays exactly like the balls (x,y,vx,vy,r) + an `active` flag (a fragment is inert until
+    // its block breaks). Debris physics IS the ball physics (gravity/clamp/separation/cube
+    // push) with a box render. `_blockResist` is the cube slow-factor from the rubble it is
+    // grinding over. All allocated ONCE in buildTrack; update() only mutates values.
+    this._blockN = 0;                // number of standing blocks (0 ⇒ none)
+    this._blocks = null;             // [{ x,faceX,topY,baseY,w,h, broken, segX0,segX1 }] standing blocks (render reads via blocksRenderList)
+    this._brokenCount = 0;           // # blocks broken so far (diagnostic)
+    this._debN = 0;                  // number of debris fragments (0 ⇒ none)
+    this._debX = null;               // Float64Array — fragment x
+    this._debY = null;               // Float64Array — fragment y (+down)
+    this._debVX = null;              // Float64Array — fragment x velocity
+    this._debVY = null;              // Float64Array — fragment y velocity (+down)
+    this._debR = null;               // Float64Array — fragment half-size (collision radius)
+    this._debActive = null;         // Uint8Array — 1 once its block has broken (inert before)
+    this._debResist = 1;             // last cube speed slow-factor from the rubble (1 = clear)
+    this._debContacts = 0;           // # debris the cube was in contact with last step (diagnostic)
+    this._debRenderList = null;      // reusable [{x,y,r,active}] views for the renderer (no per-frame alloc)
+    this._blockRenderList = null;    // reusable [{x,topY,baseY,w,h,broken}] views for standing blocks
+
     // ── PRE-RACE IDLE FLOAT (reference start look) ──
     // When `_idleFloat` is on, update() ignores the locomotion body-height path and
     // instead HOVERS the cube above the surface with a gentle sine bob (no forward,
@@ -439,6 +491,12 @@ export class Physics {
     this._ballN = 0;
     this._ballX = null; this._ballY = null; this._ballVX = null; this._ballVY = null; this._ballR = null;
     this._ballResist = 1; this._ballContacts = 0; this._ballRenderList = null;
+    // BREAKING BLOCKS + DEBRIS: cleared here and rebuilt in buildTrack.
+    this._blockN = 0; this._blocks = null; this._brokenCount = 0; this._blockRenderList = null;
+    this._debN = 0;
+    this._debX = null; this._debY = null; this._debVX = null; this._debVY = null; this._debR = null;
+    this._debActive = null; this._debResist = 1; this._debContacts = 0; this._debRenderList = null;
+    this._blockSpecs = null;
   }
 
   /** Pre-race idle float toggle (reference start look). While ON the cube hovers
@@ -724,6 +782,28 @@ export class Physics {
         (this._ballSpecs || (this._ballSpecs = [])).push({ x0: bx0, x1: bx1, count: bCount, r: bR, spread: bSpread, surfaceY });
         cursorX += len;
         // surfaceY unchanged (flat run under the pile).
+      } else if (seg.kind === 'blocks') {
+        // BLOCKS = a FLAT run with a WALL OF STANDING BOXES upright on it. The floor is an
+        // ordinary flat surface (the cube walks it with the normal gait — no climb/tunnel
+        // gate). The OBSTACLE is the standing blocks: while INTACT each block bars the path
+        // (the cube is held at its face, no penetration). On contact a block BREAKS into
+        // debris fragments that fall + litter the floor and SLOW the cube grinding over them
+        // (resistance ∝ contacts, floored ⇒ no soft-lock). We add the flat surface here and
+        // RECORD the wall spec; the blocks + debris are built AFTER the loop (once every
+        // surfaceFn exists so we can clamp debris onto the surface).
+        const bx0 = cursorX, bx1 = cursorX + len;
+        addSlab(bx0 + len / 2, surfaceY, len, thick);
+        this._segs.push({ x0: bx0, x1: bx1, kind: 'blocks', topYa: surfaceY, topYb: surfaceY,
+          surfFn: () => surfaceY });
+        if (surfaceY < this._maxSurfaceTopY) this._maxSurfaceTopY = surfaceY;
+        const blkCount = Math.max(1, (seg.blockCount != null ? seg.blockCount : SEGMENT_DEFAULTS.blockCount) | 0);
+        const blkW = (seg.blockW != null) ? seg.blockW : SEGMENT_DEFAULTS.blockW;
+        const blkH = (seg.blockH != null) ? seg.blockH : SEGMENT_DEFAULTS.blockH;
+        const debPer = Math.max(1, (seg.debrisPerBlock != null ? seg.debrisPerBlock : SEGMENT_DEFAULTS.debrisPerBlock) | 0);
+        (this._blockSpecs || (this._blockSpecs = [])).push({
+          x0: bx0, x1: bx1, count: blkCount, w: blkW, h: blkH, debrisPer: debPer, surfaceY });
+        cursorX += len;
+        // surfaceY unchanged (flat run under the wall).
       }
     }
 
@@ -793,6 +873,87 @@ export class Physics {
       this._ballSpecs = null; // specs consumed
     } else {
       this._ballN = 0;
+    }
+
+    // ── SPAWN THE STANDING BLOCKS + their (latent) DEBRIS (AFTER the lookup index). ──
+    // Each wall lays its blocks UPRIGHT in a row across the segment window, resting their
+    // BASE on the surface. Debris is pre-allocated (one slot per block × debrisPer, capped
+    // at debrisCapTotal) but INACTIVE — a fragment only comes alive when its parent block
+    // breaks (on cube contact), where it is given an outward burst. All arrays allocated
+    // ONCE here; update()/_stepBlocks only mutate values (zero per-frame allocation).
+    if (this._blockSpecs && this._blockSpecs.length) {
+      // first pass: count blocks + plan debris (capped), build the standing-block list.
+      const blocks = [];
+      let debTotal = 0;
+      const cap = SEGMENT_DEFAULTS.debrisCapTotal;
+      for (const sp of this._blockSpecs) {
+        const w = sp.w, h = sp.h, n = sp.count;
+        // lay the blocks in a row centred in the segment. A small inter-block gap so the
+        // wall reads as separate boxes (not one slab). Row width = n*w + (n-1)*gap.
+        const gap = w * 0.35;
+        const rowW = n * w + (n - 1) * gap;
+        const cx = (sp.x0 + sp.x1) / 2;
+        const rowX0 = cx - rowW / 2;
+        for (let k = 0; k < n; k++) {
+          const bx0 = rowX0 + k * (w + gap);   // block's near (left) face x
+          const bxc = bx0 + w / 2;             // block centre x
+          const surf = this.surfaceYAt(bxc);
+          const base = (surf == null ? sp.surfaceY : surf); // surface (top) the block stands on
+          const topY = base - h;               // block top (physics +down ⇒ up = negative)
+          blocks.push({ x: bxc, faceX: bx0, topY, baseY: base, w, h,
+            broken: false, debrisPer: sp.debrisPer, segX0: sp.x0, segX1: sp.x1 });
+          debTotal += sp.debrisPer;
+        }
+      }
+      // cap debris: if the plan exceeds the cap, scale each block's debris down proportionally.
+      let debN = debTotal;
+      if (debN > cap) {
+        const scale = cap / debTotal;
+        let acc = 0;
+        for (const b of blocks) { b.debrisPer = Math.max(1, Math.round(b.debrisPer * scale)); }
+        for (const b of blocks) acc += b.debrisPer;
+        debN = acc;
+      }
+      this._blockN = blocks.length;
+      this._blocks = blocks;
+      this._brokenCount = 0;
+      this._blockRenderList = new Array(this._blockN);
+      for (let i = 0; i < this._blockN; i++) {
+        const b = this._blocks[i];
+        this._blockRenderList[i] = { x: b.x, topY: b.topY, baseY: b.baseY, w: b.w, h: b.h, broken: false };
+      }
+      // pre-allocate debris (inactive). Assign each block a contiguous debris index range so
+      // a break only touches its own slots. r = a small chip half-size from the block width.
+      this._debN = debN;
+      this._debX = new Float64Array(debN);
+      this._debY = new Float64Array(debN);
+      this._debVX = new Float64Array(debN);
+      this._debVY = new Float64Array(debN);
+      this._debR = new Float64Array(debN);
+      this._debActive = new Uint8Array(debN);
+      this._debRenderList = new Array(debN);
+      let di = 0;
+      for (const b of this._blocks) {
+        const r = b.w * SEGMENT_DEFAULTS.debrisRfrac; // chip half-size
+        b.debIdx0 = di; b.debIdx1 = di + b.debrisPer;
+        for (let k = 0; k < b.debrisPer; k++) {
+          // park the (inactive) fragment at the block's body so a stray render before break
+          // would still be inside the block. Activated + burst on break.
+          this._debX[di] = b.x;
+          this._debY[di] = b.topY + b.h * 0.5; // block mid-height
+          this._debVX[di] = 0; this._debVY[di] = 0;
+          this._debR[di] = r;
+          this._debActive[di] = 0;
+          this._debRenderList[di] = { x: this._debX[di], y: this._debY[di], r, active: false };
+          di++;
+        }
+      }
+      this._debResist = 1; this._debContacts = 0;
+      this._syncBlockRenderList();
+      this._syncDebrisRenderList();
+      this._blockSpecs = null; // specs consumed
+    } else {
+      this._blockN = 0; this._debN = 0;
     }
 
     // create the cube (positioned in setLegStroke once we know the reach)
@@ -1572,6 +1733,173 @@ export class Physics {
     }
   }
 
+  // ── BREAKING-BLOCK + DEBRIS PHYSICS (debris IS a ball with a box render) ──
+  /** Break a single standing block into its debris fragments. The fragments are ACTIVATED
+   * (already pre-allocated in the block's index range) and given an OUTWARD burst — mostly
+   * forward (the cube's travel +x) and UP (the "흩날림"), scattered deterministically so a
+   * rebuild reproduces the same break. After this the fragments fall + litter the floor via
+   * _stepBlocks' ball physics. ZERO allocation. `vCube` scales the burst (a faster smash
+   * flings the chips harder). Called from _stepBlocks the frame the cube reaches the face. */
+  _breakBlock(b, vCube) {
+    if (b.broken) return;
+    b.broken = true;
+    this._brokenCount++;
+    const burst = TUNE.debrisBurstSpeed;
+    const upFrac = TUNE.debrisBurstUp;
+    // a smashing cube adds some of its forward speed to the burst (more violent smash).
+    const extra = Math.max(0, vCube) * 0.6;
+    for (let i = b.debIdx0; i < b.debIdx1; i++) {
+      this._debActive[i] = 1;
+      // scatter the fragment within the block volume so they start spread (not co-located).
+      const j = ((Math.sin(i * 12.9898 + 4.123) * 43758.5453) % 1 + 1) % 1; // [0,1)
+      const j2 = ((Math.sin(i * 78.233 + 1.77) * 12543.213) % 1 + 1) % 1;   // [0,1)
+      this._debX[i] = b.faceX + (0.15 + 0.7 * j) * b.w;          // across the block width
+      this._debY[i] = b.topY + (0.1 + 0.8 * j2) * b.h;           // up the block height
+      // outward velocity: mostly forward (+x) with a spread, and up (physics +down ⇒ -y).
+      const spd = burst * (0.6 + 0.8 * j) + extra;
+      this._debVX[i] = spd * (0.55 + 0.5 * j2);                  // forward (always +x ⇒ flies ahead)
+      this._debVY[i] = -spd * upFrac * (0.6 + 0.9 * j);          // up (then gravity pulls it down)
+    }
+  }
+
+  /** Advance the breaking-block wall + its debris by `dt` seconds. Two parts:
+   *   (1) STANDING BLOCKS: while a block is intact it BARS the cube. If the cube's near edge
+   *       has reached the block's near face, the block BREAKS into debris (no soft-lock — the
+   *       break happens on contact, the cube then plows the rubble). The first intact block
+   *       whose face is AHEAD of (or at) the cube sets `barFaceX` — the x the cube is held at
+   *       this frame (so it cannot pass an unbroken block). Returns barFaceX (or +Infinity).
+   *   (2) DEBRIS: the SAME light single-body physics as the balls (gravity, ground clamp,
+   *       fragment-fragment separation, cube push, friction). Counts the fragments the cube
+   *       is in contact with (for the rubble resistance). Pure value mutation — ZERO alloc.
+   * `cubeX = -1e9` (the settle path) ⇒ no break, no push. */
+  _stepBlocks(dt, cubeX, cubeY, vCube) {
+    let barFaceX = Infinity;
+    // (1) STANDING BLOCKS: break on contact; the nearest intact block ahead bars the cube.
+    if (this._blockN) {
+      const half = TUNE.debrisCubeHalf;
+      const pad = TUNE.blockContactPad;
+      for (let i = 0; i < this._blockN; i++) {
+        const b = this._blocks[i];
+        if (b.broken) continue;
+        // the cube's leading edge reaches the block's near face?
+        if (cubeX > -1e8 && (cubeX + half + pad) >= b.faceX) {
+          // BREAK: the cube has smashed into this block. (We break even on a slow touch so a
+          // creeping cube still clears the wall — no soft-lock; the burst just scales with v.)
+          this._breakBlock(b, vCube);
+          continue;
+        }
+        // still intact and ahead ⇒ it bars the cube at its near face.
+        if (b.faceX < barFaceX) barFaceX = b.faceX;
+      }
+    }
+    // (2) DEBRIS physics (ball model with a box render). Only ACTIVE fragments are stepped.
+    const N = this._debN;
+    if (!N) { this._debContacts = 0; return barFaceX; }
+    const X = this._debX, Y = this._debY, VX = this._debVX, VY = this._debVY, R = this._debR, A = this._debActive;
+    const g = TUNE.debrisGravity, fr = TUNE.debrisFriction, rest = TUNE.debrisRestitution;
+    const cubeHalf = TUNE.debrisCubeHalf;
+    let contacts = 0;
+    const damp = Math.exp(-fr * dt);
+    // integrate gravity + friction, advect, ground-clamp.
+    for (let i = 0; i < N; i++) {
+      if (!A[i]) continue;
+      VY[i] += g * dt;
+      VX[i] *= damp; VY[i] *= damp;
+      X[i] += VX[i] * dt; Y[i] += VY[i] * dt;
+      const surf = this.surfaceYAt(X[i]);
+      if (surf != null) {
+        const restY = surf - R[i];
+        if (Y[i] > restY) { Y[i] = restY; if (VY[i] > 0) VY[i] = -VY[i] * rest; }
+      }
+    }
+    // fragment-fragment separation (positional, O(N²) — N<=24). Only active pairs.
+    const sepStiff = TUNE.debrisSepStiff;
+    for (let i = 0; i < N; i++) {
+      if (!A[i]) continue;
+      for (let j = i + 1; j < N; j++) {
+        if (!A[j]) continue;
+        let dx = X[j] - X[i], dy = Y[j] - Y[i];
+        let dist = Math.hypot(dx, dy);
+        const minD = R[i] + R[j];
+        if (dist < minD && dist > 1e-6) {
+          const overlap = minD - dist;
+          const nx = dx / dist, ny = dy / dist;
+          const corr = overlap * 0.5;
+          X[i] -= nx * corr; Y[i] -= ny * corr;
+          X[j] += nx * corr; Y[j] += ny * corr;
+          const rel = (VX[j] - VX[i]) * nx + (VY[j] - VY[i]) * ny;
+          if (rel < 0) {
+            const imp = -rel * sepStiff * dt * 0.5;
+            VX[i] -= nx * imp; VY[i] -= ny * imp;
+            VX[j] += nx * imp; VY[j] += ny * imp;
+          }
+        } else if (dist <= 1e-6) {
+          X[j] += R[j] * 0.5; X[i] -= R[i] * 0.5;
+        }
+      }
+    }
+    // CUBE → DEBRIS push (shove the rubble ahead) + contact count.
+    if (cubeX > -1e8) {
+      for (let i = 0; i < N; i++) {
+        if (!A[i]) continue;
+        const dx = X[i] - cubeX, dy = Y[i] - cubeY;
+        const reach = cubeHalf + R[i] + TUNE.debrisContactPad;
+        const dist = Math.hypot(dx, dy);
+        if (dist < reach) {
+          contacts++;
+          if (dx > -R[i]) {
+            const over = reach - dist;
+            let nx = dist > 1e-6 ? dx / dist : 1, ny = dist > 1e-6 ? dy / dist : 0;
+            X[i] += nx * over; Y[i] += ny * over;
+            const push = Math.max(0, vCube) * TUNE.debrisPushSpeed;
+            if (push > VX[i]) VX[i] = push;
+            VY[i] -= push * TUNE.debrisPushUp;
+          }
+        }
+      }
+    }
+    // FINAL GROUND CLAMP (separation / push moved chips positionally — re-seat them).
+    for (let i = 0; i < N; i++) {
+      if (!A[i]) continue;
+      const surf = this.surfaceYAt(X[i]);
+      if (surf == null) continue;
+      const restY = surf - R[i];
+      if (Y[i] > restY) { Y[i] = restY; if (VY[i] > 0) VY[i] = 0; }
+    }
+    this._debContacts = contacts;
+    return barFaceX;
+  }
+
+  /** Resistance slow-factor for the cube from the rubble it is grinding over. Same form as
+   * the ball resistance: (1−debrisSlowPerContact)^contacts, floored at debrisSlowMin so the
+   * cube NEVER stops (no soft-lock). 1 = clear / no rubble. */
+  _debrisResistFactor(contacts) {
+    if (!contacts) return 1;
+    const f = Math.pow(1 - TUNE.debrisSlowPerContact, contacts);
+    return Math.max(TUNE.debrisSlowMin, f);
+  }
+
+  /** Refresh the renderer's standing-block views from the live block list (reused objects,
+   * no per-frame allocation). The only mutating field is `broken` (geometry is static). */
+  _syncBlockRenderList() {
+    if (!this._blockN || !this._blockRenderList) return;
+    for (let i = 0; i < this._blockN; i++) {
+      const v = this._blockRenderList[i], b = this._blocks[i];
+      v.broken = b.broken;
+      v.x = b.x; v.topY = b.topY; v.baseY = b.baseY; v.w = b.w; v.h = b.h;
+    }
+  }
+
+  /** Refresh the renderer's debris views from the flat arrays (reused objects, no per-frame
+   * allocation). `active` tells the renderer whether to show the fragment yet. */
+  _syncDebrisRenderList() {
+    if (!this._debN || !this._debRenderList) return;
+    for (let i = 0; i < this._debN; i++) {
+      const v = this._debRenderList[i];
+      v.x = this._debX[i]; v.y = this._debY[i]; v.r = this._debR[i]; v.active = !!this._debActive[i];
+    }
+  }
+
   // ── MAIN STEP ──
   update(dtMs, running) {
     if (!this.cube) return;
@@ -1627,6 +1955,15 @@ export class Physics {
         this._stepBalls(dt, this._x, this.cube.position.y, 0);
         this._ballResist = 1;
         this._syncBallRenderList();
+      }
+      // BLOCKS: keep the standing wall + any (pre-race) debris settling while the cube
+      // floats. cubeX == -1e9 ⇒ no break, no push (the cube is "far away" pre-race), so the
+      // wall stays intact and upright at the start. No resistance while idle.
+      if (this._blockN || this._debN) {
+        this._stepBlocks(dt, -1e9, 0, 0);
+        this._debResist = 1;
+        this._syncBlockRenderList();
+        this._syncDebrisRenderList();
       }
       return;
     }
@@ -1738,9 +2075,35 @@ export class Physics {
       // no consequence (sub-16ms). 1 = clear (no slowdown).
       v *= this._ballResist;
 
+      // BREAKING-BLOCK RUBBLE RESISTANCE: once a block is broken its debris litters the floor
+      // and SLOWS the cube grinding over it — same additive resistance as the balls (∝ how
+      // many fragments the cube is in contact with, floored so it never soft-locks). The
+      // standing-block BAR (cube held at an intact block's face) is applied as an x-clamp on
+      // the advance below; the break itself happens in _stepBlocks at the END of this frame.
+      // `_debResist` is last frame's factor (1-step lag of no consequence). 1 = clear.
+      v *= this._debResist;
+
       // 3. advance
       const adv = v * dt;
-      const nextX = this._x + adv;
+      let nextX = this._x + adv;
+      // STANDING-BLOCK BAR: do not let the cube pass the near face of an INTACT block this
+      // frame. We clamp the advance so the cube's leading edge sits AT the nearest intact
+      // block's face (cube centre == faceX − half). _stepBlocks (END of this frame) then sees
+      // the contact (cubeX + half + pad >= faceX) and BREAKS the block the SAME frame, so the
+      // cube plows through with no perceptible stall. This is NOT a soft-lock and never lets
+      // the cube penetrate an intact block. (Includes the blockContactPad slack so the clamp
+      // and the break trigger agree to within a chip.)
+      if (this._blockN) {
+        const half = TUNE.debrisCubeHalf;
+        let barStopX = Infinity;
+        for (let i = 0; i < this._blockN; i++) {
+          const b = this._blocks[i];
+          if (b.broken) continue;
+          const stopX = b.faceX - half; // cube centre x where its leading edge meets the face
+          if (stopX < barStopX) barStopX = stopX;
+        }
+        if (barStopX < Infinity && nextX > barStopX) nextX = Math.max(this._x, barStopX);
+      }
       if (nextX < this.finishX + 1) this._x = nextX;
     }
     this._vx = v;
@@ -1942,6 +2305,19 @@ export class Physics {
       this._syncBallRenderList();
     }
 
+    // 8. BREAKING BLOCKS: step the standing wall + its debris with THIS frame's cube position
+    //    + forward speed. _stepBlocks (a) BREAKS any intact block the cube's leading edge has
+    //    reached (turning it into bursting debris), and (b) advances the debris with the ball
+    //    physics (gravity / ground clamp / separation / cube push), counting how many chips
+    //    the cube is shoving for the rubble resistance (applied to v NEXT frame). Like the
+    //    balls this is purely additive beyond the standing-block bar (clamped on _x above).
+    if (this._blockN || this._debN) {
+      this._stepBlocks(dt, this._x, this.cube.position.y, v);
+      this._debResist = this._debrisResistFactor(this._debContacts);
+      this._syncBlockRenderList();
+      this._syncDebrisRenderList();
+    }
+
     // safety: NaN guard (kinematic can't explode, but assert anyway)
     if (!Number.isFinite(this._x) || !Number.isFinite(this._bodyY)) this._exploded = true;
   }
@@ -2137,6 +2513,33 @@ export class Physics {
     if (!this._ballN) return [];
     const out = new Array(this._ballN);
     for (let i = 0; i < this._ballN; i++) out[i] = { x: this._ballX[i], y: this._ballY[i], r: this._ballR[i] };
+    return out;
+  }
+
+  // ── BREAKING-BLOCK getters (renderer + verifier read these) ──
+  /** Number of STANDING blocks (intact + broken) in the wall (0 ⇒ none). */
+  get blockCount() { return this._blockN || 0; }
+  /** Reusable [{x,topY,baseY,w,h,broken}] views of every standing block for the renderer's
+   * reused box meshes (hide the mesh once `broken`). Same array object across frames. */
+  get blocks() { return this._blockN ? this._blockRenderList : null; }
+  /** # blocks broken (smashed) so far (diagnostic). */
+  get brokenBlocks() { return this._brokenCount || 0; }
+  /** Number of debris fragment slots (active + inactive) (0 ⇒ none). */
+  get debrisCount() { return this._debN || 0; }
+  /** Reusable [{x,y,r,active}] views of every debris fragment (physics y +down) for the
+   * renderer's reused box meshes (show only `active` fragments). Same array each frame. */
+  get debris() { return this._debN ? this._debRenderList : null; }
+  /** Last-applied cube speed slow-factor from the rubble (1 = clear, <1 = grinding over
+   * debris; floored at TUNE.debrisSlowMin so it never reaches 0 — no soft-lock). */
+  get debrisResist() { return this._debResist; }
+  /** # debris the cube was in contact with last step (diagnostic). */
+  get debrisContacts() { return this._debContacts || 0; }
+  /** Snapshot of ACTIVE debris centres as {x,y,r} (NEW objects — for the verifier's
+   * movement delta; not used on the hot render path). */
+  debrisSnapshot() {
+    if (!this._debN) return [];
+    const out = [];
+    for (let i = 0; i < this._debN; i++) if (this._debActive[i]) out.push({ x: this._debX[i], y: this._debY[i], r: this._debR[i] });
     return out;
   }
 

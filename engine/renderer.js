@@ -156,6 +156,22 @@ export class Renderer {
     // distinct from the cube blue / rival green). Shared ⇒ never disposed on rebuild.
     this._ballGeo = new THREE.SphereGeometry(1, 12, 10); // unit sphere, ~12×10 (low-poly, scaled per ball)
     this._ballMat = new THREE.MeshLambertMaterial({ color: 0xF2A93B }); // golden-amber pile
+
+    // ── BREAKING-BLOCK shared geometry + materials (built ONCE, reused for every block). ──
+    // ONE unit BoxGeometry (scaled per block / per debris chip) shared by every standing
+    // block AND every debris fragment, plus two Lambert materials: a slate-grey for the
+    // intact STANDING blocks (a clear obstacle that contrasts the lime field + purple track,
+    // distinct from the blue cube / amber balls) and a slightly darker grey for the broken
+    // DEBRIS chips (so the rubble reads as "the same stone, smashed"). Lambert so the boxes
+    // catch the key light and read 3D (top face brighter). Shared ⇒ never disposed on rebuild.
+    this._blockGeo = new THREE.BoxGeometry(1, 1, 1); // unit box, scaled per block / per chip
+    this._blockMat = new THREE.MeshLambertMaterial({ color: 0x9AA0A8 }); // slate-grey standing block
+    this._debrisMat = new THREE.MeshLambertMaterial({ color: 0x7C828B }); // darker grey rubble chip
+    // BREAKING-BLOCK meshes (built in buildTrack; positions/visibility synced each frame).
+    this.blockMeshes = [];        // player lane standing blocks
+    this.debrisMeshes = [];       // player lane debris chips
+    this.rivalBlockMeshes = [];   // rival lane standing blocks
+    this.rivalDebrisMeshes = [];  // rival lane debris chips
   }
 
   _buildBackground() {
@@ -209,6 +225,13 @@ export class Renderer {
     for (const m of this.ballMeshes) this.scene.remove(m);
     for (const m of this.rivalBallMeshes) this.scene.remove(m);
     this.ballMeshes = []; this.rivalBallMeshes = [];
+    // BREAKING-BLOCK: drop old block + debris meshes (shared geo/material kept — _isSharedMat).
+    for (const m of this.blockMeshes) this.scene.remove(m);
+    for (const m of this.debrisMeshes) this.scene.remove(m);
+    for (const m of this.rivalBlockMeshes) this.scene.remove(m);
+    for (const m of this.rivalDebrisMeshes) this.scene.remove(m);
+    this.blockMeshes = []; this.debrisMeshes = [];
+    this.rivalBlockMeshes = []; this.rivalDebrisMeshes = [];
     // PERF (SPIKE FIX): a track (re)build invalidates the prebuilt rival leg variant
     // geometry (lane z / chain can change), so free the cache here. The game re-arms it
     // via prebuildRivalLegVariants() right after this build, before the run starts.
@@ -258,6 +281,10 @@ export class Renderer {
     // ── BALL-FIELD: build one reused sphere mesh per physics ball (player lane). The
     //    rival pile (its own physics field) is built when syncRival first sees it. ──
     this._buildBalls(physics, 0);
+
+    // ── BREAKING-BLOCK: build one reused box mesh per standing block + per debris chip
+    //    (player lane). The rival wall (its own physics field) is built lazily in syncRival. ──
+    this._buildBlocks(physics, 0);
   }
 
   /** Build the reusable sphere meshes for a walker's ball field on the given lane.
@@ -293,6 +320,75 @@ export class Renderer {
     for (let i = 0; i < n; i++) {
       const b = balls[i];
       meshes[i].position.set(b.x, -b.y, laneZ + laneCurveZ(b.x));
+    }
+  }
+
+  /** Build the reusable box meshes for a walker's breaking-block wall + debris on the given
+   * lane. One Mesh per standing block (sized to the block, sitting upright on the surface)
+   * sharing the constructor's _blockGeo + _blockMat, and one small Mesh per debris fragment
+   * sharing _blockGeo + _debrisMat. Geometry/material are shared ⇒ only the Mesh wrappers
+   * are made here. Standing blocks are placed ONCE (they are static until broken — then
+   * hidden); debris is placed (and shown/hidden) every frame in _syncBlocks. */
+  _buildBlocks(physics, laneZ) {
+    const isRival = Math.abs(laneZ) > 1e-3;
+    const blkRef = isRival ? 'rivalBlockMeshes' : 'blockMeshes';
+    const debRef = isRival ? 'rivalDebrisMeshes' : 'debrisMeshes';
+    for (const m of this[blkRef]) this.scene.remove(m);
+    for (const m of this[debRef]) this.scene.remove(m);
+    this[blkRef] = []; this[debRef] = [];
+    const blocks = physics.blocks;
+    if (blocks && blocks.length) {
+      for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i];
+        const mesh = new THREE.Mesh(this._blockGeo, this._blockMat);
+        // a CLOSED box sized to the block; slightly under the path width in z so it reads on
+        // the band. Centre y = mid-height (render y = -((topY+baseY)/2)); top = -topY.
+        mesh.scale.set(b.w, b.h, Math.min(RIBBON_DEPTH * 0.9, b.w * 1.4));
+        const cy = -(b.topY + b.baseY) / 2;   // render-y of the block centre (up)
+        mesh.position.set(b.x, cy, laneZ + laneCurveZ(b.x));
+        mesh.visible = !b.broken;
+        this.scene.add(mesh);
+        this[blkRef].push(mesh);
+      }
+    }
+    const debris = physics.debris;
+    if (debris && debris.length) {
+      for (let i = 0; i < debris.length; i++) {
+        const d = debris[i];
+        const mesh = new THREE.Mesh(this._blockGeo, this._debrisMat);
+        const s = d.r * 2; // chip edge == 2× the half-size collision radius
+        mesh.scale.set(s, s, s);
+        mesh.position.set(d.x, -d.y, laneZ + laneCurveZ(d.x));
+        mesh.visible = !!d.active;
+        this.scene.add(mesh);
+        this[debRef].push(mesh);
+      }
+    }
+  }
+
+  /** Update the standing blocks (hide a broken one) + debris chips (position + show once its
+   * block has burst) from the live physics each frame. Position/visibility only — no geometry,
+   * no allocation. The pile is small (blocks<=~6, debris<=24) ⇒ trivially cheap. A spinning
+   * tumble is faked by deriving a render rotation from the chip's position (cheap, no state). */
+  _syncBlocks(physics, laneZ, blockMeshes, debrisMeshes) {
+    const blocks = physics.blocks;
+    if (blocks && blockMeshes.length) {
+      const n = Math.min(blocks.length, blockMeshes.length);
+      for (let i = 0; i < n; i++) blockMeshes[i].visible = !blocks[i].broken;
+    }
+    const debris = physics.debris;
+    if (debris && debrisMeshes.length) {
+      const n = Math.min(debris.length, debrisMeshes.length);
+      for (let i = 0; i < n; i++) {
+        const d = debris[i], m = debrisMeshes[i];
+        m.visible = !!d.active;
+        if (!d.active) continue;
+        m.position.set(d.x, -d.y, laneZ + laneCurveZ(d.x));
+        // cheap tumble: rotate by a function of position so flying chips look like they spin
+        // (no per-chip angular state — purely cosmetic, deterministic).
+        m.rotation.z = d.x * 1.7 + i;
+        m.rotation.x = d.y * 1.3;
+      }
     }
   }
 
@@ -996,6 +1092,8 @@ export class Renderer {
     this._syncLegGroups(this.legGroups, physics, alpha);
     // BALL-FIELD: drive the reused player-lane sphere meshes from the live pile.
     if (this.ballMeshes.length) this._syncBalls(physics, 0, this.ballMeshes);
+    // BREAKING-BLOCK: drive the reused player-lane block + debris meshes from the live wall.
+    if (this.blockMeshes.length || this.debrisMeshes.length) this._syncBlocks(physics, 0, this.blockMeshes, this.debrisMeshes);
   }
 
   /** Sync the rival cube + its legs (call every frame when racing). alpha: see sync(). */
@@ -1014,6 +1112,15 @@ export class Renderer {
       this._buildBalls(rival, this.rivalLaneZ);
     }
     if (this.rivalBallMeshes.length) this._syncBalls(rival, this.rivalLaneZ, this.rivalBallMeshes);
+    // BREAKING-BLOCK (rival lane): lazily build the rival wall + debris meshes the first time
+    // we see its field (the rival walker is built after the player buildTrack), then drive them.
+    if ((rival.blockCount || rival.debrisCount) &&
+        (this.rivalBlockMeshes.length !== rival.blockCount || this.rivalDebrisMeshes.length !== rival.debrisCount)) {
+      this._buildBlocks(rival, this.rivalLaneZ);
+    }
+    if (this.rivalBlockMeshes.length || this.rivalDebrisMeshes.length) {
+      this._syncBlocks(rival, this.rivalLaneZ, this.rivalBlockMeshes, this.rivalDebrisMeshes);
+    }
   }
 
   _syncLegGroups(groups, physics = null, alpha = 0) {
@@ -1238,7 +1345,8 @@ export class Renderer {
    * in the constructor, reused on every rebuild). They must NEVER be disposed when a
    * track/leg group is torn down, or the next build would render with a dead material. */
   _isSharedMat(m) {
-    return m === this._legMat || m === this._topMat || m === this._sideMat || m === this._ballMat;
+    return m === this._legMat || m === this._topMat || m === this._sideMat || m === this._ballMat
+      || m === this._blockMat || m === this._debrisMat;
   }
 
   /** True for the SHARED textures (built once in the constructor, reused forever). The

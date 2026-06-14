@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'|'blocks'} SegmentKind
  */
 
 /**
@@ -39,6 +39,13 @@
  * @property {number} [ballR]          BALLS only: ball radius (world units). Default SEGMENT_DEFAULTS.ballR.
  * @property {number} [ballSpread]     BALLS only: x-extent the pile is initially scattered over (default = a
  *                                     fraction of the segment length so the pile blocks the path mid-segment).
+ * @property {number} [blockCount]     BLOCKS only: number of STANDING blocks in the wall the cube must smash
+ *                                     (default SEGMENT_DEFAULTS.blockCount). Each intact block bars the path;
+ *                                     on cube contact it BREAKS into debris that falls + litters the floor.
+ * @property {number} [blockW]         BLOCKS only: each standing block's x-width (world units). Default SEGMENT_DEFAULTS.blockW.
+ * @property {number} [blockH]         BLOCKS only: each standing block's height (world units). Default SEGMENT_DEFAULTS.blockH.
+ * @property {number} [debrisPerBlock] BLOCKS only: how many debris fragments a broken block becomes (default
+ *                                     SEGMENT_DEFAULTS.debrisPerBlock). Total debris is capped at debrisCapTotal.
  * @property {number} [rough]          0..1 friction (rough floor), default 0.6
  * @property {number} [bouncy]         0..1 restitution (rubber), default 0
  */
@@ -98,10 +105,21 @@ export const SEGMENT_DEFAULTS = Object.freeze({
   ballCountMax: 20,     // PERF cap — O(N²) separation stays cheap for N<=20
   ballR: 0.34,          // ball radius (world units) — a touch under the cube half-size
   ballSpreadFrac: 0.5,  // initial x-scatter = this fraction of the segment length (pile mid-segment)
+  // BLOCKS: a wall of STANDING boxes that bar the cube's path. On contact a block BREAKS
+  // into small debris fragments that fall (gravity), litter the floor, and SLOW the cube
+  // that grinds over them (reusing the ball-debris physics: gravity + ground clamp +
+  // fragment-fragment / fragment-cube separation + a resistance slow-factor). The cube
+  // ALWAYS smashes through (no soft-lock) — breaking + plowing the rubble just costs speed.
+  blockCount: 4,        // default standing blocks per `blocks` segment
+  blockW: 0.7,          // each standing block's x-width (world units)
+  blockH: 1.4,          // each standing block's height (world units) — taller than the cube ⇒ a real wall
+  debrisPerBlock: 5,    // fragments a broken block becomes
+  debrisCapTotal: 24,   // PERF hard cap on total debris (O(N²) separation stays cheap)
+  debrisRfrac: 0.26,    // debris fragment half-size as a fraction of blockW (small chips)
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls', 'blocks'];
 
 /** @type {LegPreset[]} */
 export const LEG_PRESETS = ['wheel', 'stick', 'hook'];
@@ -177,6 +195,18 @@ export function validateTrack(t) {
         throw new Error(`segment[${i}] balls ballR must be > 0`);
       if (s.ballSpread != null && !(s.ballSpread > 0))
         throw new Error(`segment[${i}] balls ballSpread must be > 0`);
+    }
+    if (s.kind === 'blocks') {
+      // a BLOCKS wall stands on a flat run — needs a positive length to walk over. count /
+      // dims are optional (fall back to SEGMENT_DEFAULTS); if present they must be positive.
+      if (s.blockCount != null && !(s.blockCount > 0))
+        throw new Error(`segment[${i}] blocks blockCount must be > 0`);
+      if (s.blockW != null && !(s.blockW > 0))
+        throw new Error(`segment[${i}] blocks blockW must be > 0`);
+      if (s.blockH != null && !(s.blockH > 0))
+        throw new Error(`segment[${i}] blocks blockH must be > 0`);
+      if (s.debrisPerBlock != null && !(s.debrisPerBlock > 0))
+        throw new Error(`segment[${i}] blocks debrisPerBlock must be > 0`);
     }
   });
   if (t.rival != null) {

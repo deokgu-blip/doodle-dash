@@ -2,7 +2,7 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 258.4,
+  "finishX": 272.4,
   "segments": [
     {
       "kind": "flat",
@@ -88,6 +88,21 @@
       "gapDepth": 1.6,
       "rough": 0.9,
       "_note": "GAPPED PLANKS — long/fast leg (big stride) sails over the voids; short leg drops into the shallow recovery trench and crawls out (slow, no soft-lock). Long-favourable."
+    },
+    {
+      "kind": "flat",
+      "length": 4,
+      "rough": 0.9
+    },
+    {
+      "kind": "blocks",
+      "length": 10,
+      "blockCount": 4,
+      "blockW": 0.7,
+      "blockH": 1.4,
+      "debrisPerBlock": 5,
+      "rough": 0.9,
+      "_note": "BREAKING BLOCKS — a wall of upright boxes barring the path. The cube SMASHES each on contact: the block bursts into debris that falls, litters the floor, and SLOWS the cube grinding over the rubble (resistance ∝ contacts, floored ⇒ no soft-lock). The cube always breaks through. Reuses the ball-debris physics (gravity/clamp/separation/cube-push)."
     },
     {
       "kind": "flat",

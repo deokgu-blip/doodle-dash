@@ -302,7 +302,43 @@ export class Physics {
     // (callers read the fields the same step ⇒ no aliasing). Byte-identical results.
     this._riserHit = { found: false, x: 0, h: 0 };
     this._tunnelHit = { found: false, x: 0, clearance: 0 };
+
+    // ── RENDER INTERPOLATION (mobile micro-stutter fix) ──
+    // The SIM ticks on a FIXED timestep (FIXED_DT) with an accumulator that carries the
+    // sub-tick remainder. On a real-device rAF the inter-frame interval jitters around
+    // 16.67ms, so the accumulator drains 0 ticks on some frames (cube frozen) and 2 on
+    // the next (cube double-jumps) — the "지지직" the user sees even at a steady 60fps.
+    // We FIX it by RENDERING an INTERPOLATED pose between the PREVIOUS tick's state and
+    // the CURRENT tick's state, weighted by alpha = _acc/FIXED_DT (the un-drained
+    // remainder). The SIM itself is UNTOUCHED (still fixed-step, still deterministic) —
+    // only the drawn pose is a lerp, so the on-screen motion is continuous regardless of
+    // rAF jitter. `_interpPrev` snapshots the render-relevant state RIGHT BEFORE each
+    // tick (captureInterp), and `_interpHasPrev` guards the first frame (prev==curr).
+    // The leg angles are the only per-leg interp targets (position == the axle == cube
+    // x/y, so legs reuse the cube's interpolated x/y).
+    this._interpPrev = { x: 0, bodyY: 0, bodyBaseY: 0, angle: 0, theta: 0 };
+    this._interpHasPrev = false;
   }
+
+  /** RENDER INTERPOLATION: snapshot the render-relevant CURRENT state into `_interpPrev`
+   * RIGHT BEFORE a sim tick advances it. The renderer then lerps prev→curr by the
+   * leftover-accumulator alpha so the drawn pose is continuous under rAF jitter. The
+   * snapshot is the cube forward x, the FULL body y (with bob/loft), the bob-free camera
+   * base y, the body tilt and the master leg phase θ — every quantity the renderer reads
+   * to place the cube + legs + camera. Pure copy (no allocation), zero sim effect. */
+  captureInterp() {
+    const p = this._interpPrev;
+    p.x = this._x;
+    p.bodyY = this._bodyY;
+    p.bodyBaseY = Number.isFinite(this._bodyBaseY) ? this._bodyBaseY : this._bodyY;
+    p.angle = this._angle;
+    p.theta = this._theta;
+    this._interpHasPrev = true;
+  }
+
+  /** Mark the prev-snapshot stale (e.g. after a teleport / fresh placement / track
+   * rebuild) so the next render uses curr directly (no lerp from an unrelated pose). */
+  resetInterp() { this._interpHasPrev = false; }
 
   reset() {
     this.cube = null;
@@ -583,6 +619,10 @@ export class Physics {
     // the interactive start; headless/forceStart paths build + start immediately).
     this._idleFloat = false;
     this._idlePhase = 0;
+    // RENDER INTERPOLATION: a fresh track build teleports the cube to startX, so any
+    // prior prev-snapshot is unrelated — mark it stale so the next render draws curr
+    // directly (no lerp across the teleport).
+    this.resetInterp();
   }
 
   /**
@@ -870,6 +910,9 @@ export class Physics {
       this._loftAmpLive = 0;
       this._footBaseY = surf;
       this._prevFootBaseY = surf;
+      // RENDER INTERPOLATION: a fresh leg teleports x to startX — drop any stale prev so
+      // the next render draws curr directly (no lerp across the teleport).
+      this.resetInterp();
     } else if (this._air) {
       // CONTINUE while in the LOFT float of a stride: a mid-stride redraw must NOT
       // teleport the body to the ground (that would be a fake landing snap). The loft
@@ -1584,6 +1627,51 @@ export class Physics {
    * smooth while the cube visibly bobs IN-FRAME (the bob is cube.position.y − this).
    * Falls back to bodyY before the first step. */
   get bodyCamY() { return this.cube ? (Number.isFinite(this._bodyBaseY) ? this._bodyBaseY : this.cube.position.y) : 0; }
+
+  /** RENDER INTERPOLATION getters — the renderer reads these (with the game's alpha)
+   * INSTEAD of the raw cube/leg fields, so the drawn pose is a continuous lerp between
+   * the previous and current sim ticks even when rAF jitters (the micro-stutter fix).
+   * alpha ∈ [0,1] is the leftover-accumulator ratio (game exposes _acc/FIXED_DT). When
+   * there is no valid prev snapshot (first frame / after a reset) we fall back to the
+   * CURRENT value (no lerp) so the pose is always sane. The leg world angle = θ + the
+   * leg's phaseOffset + the body tilt — we interpolate θ and tilt and recombine, so the
+   * caller passes the per-leg phaseOffset. Angles use a plain lerp (per-tick deltas are
+   * tiny so wraparound is a non-issue at the render alpha). */
+  interpX(alpha) {
+    if (!this.cube) return this.startX;
+    if (!this._interpHasPrev) return this._x;
+    const a = this._interpPrev;
+    return a.x + (this._x - a.x) * alpha;
+  }
+  interpBodyY(alpha) {
+    if (!this.cube) return 0;
+    if (!this._interpHasPrev) return this._bodyY;
+    const a = this._interpPrev;
+    return a.bodyY + (this._bodyY - a.bodyY) * alpha;
+  }
+  interpBodyCamY(alpha) {
+    if (!this.cube) return 0;
+    const cur = Number.isFinite(this._bodyBaseY) ? this._bodyBaseY : this._bodyY;
+    if (!this._interpHasPrev) return cur;
+    const a = this._interpPrev;
+    return a.bodyBaseY + (cur - a.bodyBaseY) * alpha;
+  }
+  interpAngle(alpha) {
+    if (!this.cube) return 0;
+    if (!this._interpHasPrev) return this._angle;
+    const a = this._interpPrev;
+    return a.angle + (this._angle - a.angle) * alpha;
+  }
+  /** Interpolated world leg angle for a leg with the given phaseOffset: lerp θ and the
+   * body tilt, then add phaseOffset (which is constant — it never changes per tick). */
+  interpLegAngle(alpha, phaseOffset) {
+    if (!this.cube) return phaseOffset || 0;
+    if (!this._interpHasPrev) return this._theta + (phaseOffset || 0) + (this._angle || 0);
+    const a = this._interpPrev;
+    const theta = a.theta + (this._theta - a.theta) * alpha;
+    const tilt = a.angle + (this._angle - a.angle) * alpha;
+    return theta + (phaseOffset || 0) + tilt;
+  }
   /** Current geometric bob excursion (render-positive UP amount the cube sits BELOW
    * the bob-free base; ≥ 0). Exposed for the verifier's (J) bob-amplitude report. */
   get bob() { return this._bob || 0; }

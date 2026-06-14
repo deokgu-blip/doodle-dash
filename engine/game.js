@@ -347,11 +347,30 @@ export class Game {
     // burst (e.g. tab-switch). 240 ticks/frame is generous headroom either way.
     let n = 0;
     while (this._acc >= dt && n < 240) {
+      // RENDER INTERPOLATION: snapshot each walker's render-relevant state as `prev`
+      // RIGHT BEFORE the tick advances it. Whatever the LAST tick of this frame leaves
+      // behind is the correct `prev` for the next frame's interpolated render (the sim
+      // state is `curr`). Capturing per-tick (not once per frame) keeps prev exactly one
+      // FIXED_DT behind curr, so alpha = _acc/FIXED_DT lerps a true sub-tick fraction.
+      // Pure copy, deterministic, zero sim effect.
+      this.physics.captureInterp();
+      if (this.rivalSpec) this.rival.captureInterp();
       this._tick(dt);
       this._acc -= dt;
       n++;
     }
+    // RENDER INTERPOLATION: expose the leftover-accumulator ratio. The render lerps
+    // prev→curr by this so the on-screen pose is continuous under rAF jitter (a tick may
+    // fire 0× on one frame and 2× on the next, but the drawn x advances smoothly). At a
+    // perfectly steady 60Hz this is ~constant ⇒ no visible change; under jitter it
+    // absorbs the 0-tick/2-tick beat. dt here is the EFFECTIVE tick (FIXED_DT at full
+    // speed, FIXED_DT·ts in slow-mo) so alpha stays a correct fraction in BOTH regimes.
+    this._alpha = dt > 0 ? Math.min(1, Math.max(0, this._acc / dt)) : 0;
   }
+
+  /** RENDER INTERPOLATION: leftover-accumulator ratio (0..1) the renderer uses to lerp
+   * the previous→current sim pose. Defaults to 0 (draw the current pose) before any step. */
+  get alpha() { return this._alpha || 0; }
 
   _tick(dt) {
     const s = this.state;
@@ -447,9 +466,14 @@ export class Game {
       this.step(frame * this._timeScale);
       // RENDER EVERY rAF (no cap, no skip): always sync + camera + render + HUD once per
       // refresh. The sim being stepped above means we always draw the latest sim state.
-      this.renderer.sync(this.physics);
-      if (this.rivalSpec) this.renderer.syncRival(this.rival);
-      this.renderer.updateCamera(this.physics, frame / 1000);
+      // RENDER INTERPOLATION: pass the leftover-accumulator alpha so the renderer draws an
+      // INTERPOLATED pose between the previous and current sim ticks — continuous on-screen
+      // motion even when rAF jitter makes a frame drain 0 ticks then the next drain 2 (the
+      // mobile micro-stutter "지지직" fix). The sim is unchanged; only the drawn pose lerps.
+      const alpha = this._alpha || 0;
+      this.renderer.sync(this.physics, alpha);
+      if (this.rivalSpec) this.renderer.syncRival(this.rival, alpha);
+      this.renderer.updateCamera(this.physics, frame / 1000, alpha);
       this.renderer.render();
       this._renderHud();
       // DEBUG OVERLAY: feed the REAL RAF timestamp `t` so achieved-FPS + render-gap are

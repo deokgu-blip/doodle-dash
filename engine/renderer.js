@@ -653,9 +653,11 @@ export class Renderer {
     }
     // bind the visible variant's groups to the live rival leg bodies (match by side),
     // so _syncLegGroups(this.rivalLegGroups) drives the shown meshes from live physics.
+    // RENDER INTERPOLATION: also refresh the leg's phaseOffset from the live leg so the
+    // interpolated world angle (built from the walker's θ/tilt + this offset) is correct.
     for (const lg of target) {
       const live = rival.legs.find((l) => l.side === lg.side);
-      if (live) lg.body = live.body;
+      if (live) { lg.body = live.body; lg.phaseOffset = live.phaseOffset || 0; }
     }
     this.rivalLegGroups = target;
     this._activeRivalPreset = preset;
@@ -705,7 +707,10 @@ export class Renderer {
       // z offset by side (straddle) PLUS the lane centre offset. The serpentine
       // curve z (laneCurveZ(x)) is ADDED per-frame in _syncLegGroups (it depends
       // on the live x), so we keep the static part here and the dynamic part there.
-      groups.push({ mesh: grp, body, side: l.side, laneZ, z: laneZ + l.side * LEG_Z_OFFSET });
+      // RENDER INTERPOLATION: store the leg's phaseOffset so _syncLegGroups can rebuild
+      // the INTERPOLATED world angle (= lerp(θ) + phaseOffset + lerp(tilt)) from the
+      // walker, instead of reading the raw (un-interpolated) body.angle.
+      groups.push({ mesh: grp, body, side: l.side, phaseOffset: l.phaseOffset || 0, laneZ, z: laneZ + l.side * LEG_Z_OFFSET });
     }
     return groups;
   }
@@ -848,43 +853,63 @@ export class Renderer {
     return geo;
   }
 
-  /** Sync all meshes from physics bodies (call every frame). */
-  sync(physics) {
+  /** Sync all meshes from physics bodies (call every frame).
+   *
+   * RENDER INTERPOLATION: `alpha` (0..1, the game's leftover-accumulator ratio) blends the
+   * PREVIOUS sim tick's pose with the CURRENT one so the drawn cube/legs/camera advance
+   * CONTINUOUSLY even when rAF jitter makes a frame drain 0 ticks then the next drain 2
+   * (the mobile micro-stutter fix). When alpha is omitted/0 with no prev snapshot the
+   * walker getters return the current value — i.e. identical to the old direct read. The
+   * SIM is untouched; only the drawn pose lerps. */
+  sync(physics, alpha = 0) {
     if (this.cubeMesh && physics.cube) {
-      const p = physics.cube.position;
       // The axle is the cube's geometric CENTRE, and the leg stroke ribbons are
       // drawn in the leg-local frame whose origin == that axle. So the cube mesh
       // centre must sit EXACTLY at the physics cube centre (no drop) — then the
       // drawn leg lines emanate from the cube's middle and sweep down to the
       // ground (the reference look). render y = -physY. §C: the player lane is at
       // z = laneCurveZ(x) so the cube rides the same serpentine band.
-      this.cubeMesh.position.set(p.x, -p.y, laneCurveZ(p.x));
-      this.cubeMesh.rotation.z = -physics.cube.angle;
+      // INTERPOLATED forward x + full body y + tilt (lerp prev→curr by alpha).
+      const ix = physics.interpX(alpha);
+      const iy = physics.interpBodyY(alpha);
+      this.cubeMesh.position.set(ix, -iy, laneCurveZ(ix));
+      this.cubeMesh.rotation.z = -physics.interpAngle(alpha);
     }
-    this._syncLegGroups(this.legGroups);
+    this._syncLegGroups(this.legGroups, physics, alpha);
   }
 
-  /** Sync the rival cube + its legs (call every frame when racing). */
-  syncRival(rival) {
+  /** Sync the rival cube + its legs (call every frame when racing). alpha: see sync(). */
+  syncRival(rival, alpha = 0) {
     if (this.rivalCubeMesh && rival.cube) {
-      const p = rival.cube.position;
-      // §C: rival lane base + serpentine curve at its own x.
-      this.rivalCubeMesh.position.set(p.x, -p.y, this.rivalLaneZ + laneCurveZ(p.x));
-      this.rivalCubeMesh.rotation.z = -rival.cube.angle;
+      // §C: rival lane base + serpentine curve at its own x. INTERPOLATED (see sync()).
+      const ix = rival.interpX(alpha);
+      const iy = rival.interpBodyY(alpha);
+      this.rivalCubeMesh.position.set(ix, -iy, this.rivalLaneZ + laneCurveZ(ix));
+      this.rivalCubeMesh.rotation.z = -rival.interpAngle(alpha);
     }
-    this._syncLegGroups(this.rivalLegGroups);
+    this._syncLegGroups(this.rivalLegGroups, rival, alpha);
   }
 
-  _syncLegGroups(groups) {
+  _syncLegGroups(groups, physics = null, alpha = 0) {
+    // RENDER INTERPOLATION: the legs pivot about the cube axle (== cube x/y), so they
+    // ride the INTERPOLATED cube x/y; each leg's world spin angle is rebuilt from the
+    // walker's interpolated θ + the leg's constant phaseOffset + interpolated tilt
+    // (interpLegAngle). Falls back to the raw body fields when no walker is passed
+    // (defensive — keeps any legacy direct call working).
+    const ax = physics ? physics.interpX(alpha) : null;
+    const ay = physics ? physics.interpBodyY(alpha) : null;
     for (const lg of groups) {
       const body = lg.body;
+      const bx = (ax != null) ? ax : body.position.x;
+      const by = (ay != null) ? ay : body.position.y;
       // Both legs share the same physics x/y; the static z offset gives the
       // two-leg (left/right) straddle, and §C adds laneCurveZ(x) so the legs ride
       // the serpentine band with the cube. Each leg spins at its own 180°-offset
       // angle — the alternating walk.
-      lg.mesh.position.set(body.position.x, -body.position.y, lg.z + laneCurveZ(body.position.x));
+      lg.mesh.position.set(bx, -by, lg.z + laneCurveZ(bx));
       // render y = -physY -> a CCW physics rotation appears CW on screen.
-      lg.mesh.rotation.z = -body.angle;
+      const ang = physics ? physics.interpLegAngle(alpha, lg.phaseOffset) : body.angle;
+      lg.mesh.rotation.z = -ang;
     }
   }
 
@@ -892,12 +917,17 @@ export class Renderer {
    * cube fills ~1/3 of the screen, sat in the lower-centre with a big sky above,
    * the winding ribbon receding ahead). Follows the serpentine z-curve so the
    * cube stays framed as the band snakes. Keeps the smooth _camY vertical glide. */
-  updateCamera(physics, dt = 1 / 60) {
-    const x = physics.cube ? physics.cube.position.x : physics.startX;
+  updateCamera(physics, dt = 1 / 60, alpha = 0) {
+    // RENDER INTERPOLATION: follow the INTERPOLATED forward x + bob-free base y (same
+    // alpha the cube/legs use) so the camera tracks the cube in lock-step — no relative
+    // drift between the (interpolated) cube and the camera under rAF jitter. The camera
+    // additionally low-passes these (the _camY / _camCurveZ ease below), so the interp is
+    // a tiny sub-tick refinement on an already-smoothed follow.
+    const x = physics.cube ? physics.interpX(alpha) : physics.startX;
     // Track the BOB-FREE base height (physics.bodyCamY), NOT the bobbing cube y, so
     // the camera glides with the terrain trend only — the cube bobs IN-FRAME (a
     // walking juice) while the SCREEN never jolts up/down with each foot-plant.
-    const baseRenderY = (physics.cube ? -physics.bodyCamY : 0.9);
+    const baseRenderY = (physics.cube ? -physics.interpBodyCamY(alpha) : 0.9);
     const cubeRenderY = baseRenderY;
     // SMOOTH VERTICAL FOLLOW (kept): the body snaps up at each stair step (so the
     // foot never penetrates). Easing a separate _camY toward the bob-free base

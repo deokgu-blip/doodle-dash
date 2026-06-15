@@ -111,13 +111,6 @@ const TUNE = {
   tiltSlewMax: 0.029,    // rad/frame cap on cube.angle change (slew limiter ⇒ no per-frame lean snap at segment seams; just under the (I) DANG_MAX 0.03 gate)
   tiltMax: 0.65,         // rad — clamp so a near-vertical step can't flip the body (§E: lowered 0.85→0.65, the reference lean is gentler)
   tiltGain: 1.0,         // scale on the measured tangent angle (1 = exact match)
-  // STAIR BODY-FLOAT bias: the cube floats along the staircase's tread-top CHORD (a smooth
-  // diagonal). That chord is already at/above every tread top (no penetration), so the cube
-  // needs only a HAIR of extra lift. This was a FULL step (1.0), which floated the cube a whole
-  // step ABOVE the staircase — its feet dangled against the step EDGES/risers (옆면) instead of
-  // sitting on the tread tops (특정 면) — the user's "계단 옆면 밟고 오름" awkwardness. Now a hair,
-  // so the cube SITS ON the steps and the foot plants on the tread.
-  stairFloatBias: 0.12,  // (was 1.0 ×stepRise) fraction of one step the body floats above the tread-top chord
   // CLIMB RULE: a step of height h is climbable iff reach >= climbBase + climbK*h
   // i.e. taller steps demand a longer leg. Solve h_max(reach) = (reach-base)/K.
   // Calibrated so the SHORTEST leg (reach 0.6) clears a LOW step (~0.25) but is
@@ -203,6 +196,17 @@ const TUNE = {
   // smooth. bobGain scales the visible amplitude (1 = the raw geometric bob).
   bobGain: 1.0,           // scale on the geometric bob amplitude (visible "juice")
   bobMax: 0.5,            // world-u clamp on the per-frame bob excursion (anti-motion-sickness)
+  // ── PLANT "쿵" SQUASH (땅을 딱딱 짚는 손맛) — COSMETIC weight accent, render-only ──
+  // The walker is kinematic, so a foot-plant had no IMPACT — the body just smoothly bobbed
+  // ("너무 가볍다"). We add a SQUASH-AND-STRETCH on the CUBE MESH synced to the foot-PLANT phase
+  // (cos(2θ) peaks at θ≈0,π — a leg straight down = a footfall, twice per rotation = each leg's
+  // plant): the cube COMPRESSES (squashes flatter) the instant a foot lands and springs back
+  // between plants, so every step reads as a weighted "쿵". Pure render scale on cubeMesh — it
+  // does NOT move the physics body / foot / gates (zero penetration & all gates untouched). Faded
+  // in with forward speed so an idle cube doesn't sit squashed. Applied to player + rival alike.
+  plantSquash: 0.17,      // peak vertical compression fraction at a footfall (0.17 ⇒ cube 17% flatter, x/z widen to compensate) — firm, reference-like
+  plantSquashPow: 1.7,    // sharpen the pulse so the squash is a CRISP impact at the plant (higher ⇒ briefer, snappier "쿵"), not a constant throb
+  plantSquashSpeedRef: 2.0, // forward speed (u/s) at which the squash fades fully IN (slower ⇒ less; idle ⇒ 0, no frozen squash)
   // cadence: ω = v / effectiveRadius. effectiveRadius == the CONTACT foot's lever
   // arm (reach + lineRadius) so the planted foot's world speed is v − ω·r == 0
   // (no slip, BY CONSTRUCTION). Longer reach ⇒ larger radius ⇒ lower ω: a long
@@ -1602,17 +1606,13 @@ export class Physics {
         }
       }
       const run = Math.max(1e-3, x1 - x0);
-      // Ride the staircase HYPOTENUSE — the line through each tread's top-OUTER
-      // corner — which sits at or ABOVE every tread top. Floating the body to this
-      // line keeps the foot on/above every tread (zero penetration) while the body
-      // glides up a single smooth diagonal (no per-step snap). We add only a HAIR of
-      // lift (stairFloatBias·stepRise): the chord ALONE is already ≥ every tread top, so
-      // a full-step bias (the old value) just floated the cube a whole step ABOVE the
-      // staircase — feet dangling against the step EDGES/risers instead of on the tread
-      // tops (the user's "옆면 밟고 오름" awkwardness). The up-only foot clamp in _syncLegs
-      // catches any sub-epsilon seam round-off, so a small bias stays penetration-free.
-      const bias = (seg.stepH || 0) * TUNE.stairFloatBias;
-      const yTop0 = ya - bias, yTop1 = yb - bias;
+      // NOTE: this helper is currently UNREFERENCED (the cube body height comes from
+      // _groundedCubeY, which grazes the DISCRETE treads; the stepped 한-칸씩 climb is driven by
+      // the dwell-reach gait + stepped commit level). Kept as a smooth tread-top-chord sampler in
+      // case a body-float path needs it. Ride the staircase HYPOTENUSE biased up one step (always
+      // ≥ every tread top ⇒ penetration-free).
+      const stepRise = seg.stepH || 0;
+      const yTop0 = ya - stepRise, yTop1 = yb - stepRise;
       const t = clamp01((px - x0) / run);
       return yTop0 + (yTop1 - yTop0) * t;
     }
@@ -2069,6 +2069,17 @@ export class Physics {
       }
     }
     return false;
+  }
+
+  /** On ANY ascending staircase (gentle/length-gated OR steep/hook-gated, incl. a committed
+   * high-fork run) at px? Drives the STEP-CLIMB CADENCE (dwell-reach leg gait + per-plant
+   * bite-lift + stepped body ascent) so the cube climbs tread-by-tread (한 칸씩 짚고) on EVERY
+   * staircase, not only the steep hook one — the user's reference feel. Stairs always rise in
+   * our tracks (descents are ramps), so "on a stairs seg" == "ascending". */
+  _onStairRun(px) {
+    if (this._onSteepStairRun(px)) return true;     // steep-gated runs (incl. committed high-fork)
+    const s = this._segAt(px);
+    return !!(s && s.kind === 'stairs');
   }
 
   /** Effective rolling radius for ω = v/r. This is the CONTACT foot's lever arm
@@ -2751,7 +2762,12 @@ export class Physics {
       // PRESERVED: foot world speed = v_body − ω·r = v·warp − (v/r·warp)·r ≈ 0 at every phase). The
       // warp's MEAN over a half-stride is EXACTLY 1, so the per-stride distance is UNCHANGED — the
       // climb advances at the same average pace and ALWAYS reaches the top (no stall, no soft-lock).
-      const gripGate = TUNE.gripGaitEnable && v > 1e-6 && this._isHook && this._onSteepStairRun(this._x);
+      // STAIR-CLIMB CADENCE: dwell-and-reach (한 칸씩 짚고) on ANY ascending staircase — gentle or
+      // steep, ANY leg shape (was: steep-gated + hook only, which left gentle stairs gliding). The
+      // dwell-reach warp is mean-1 over a stride ⇒ no-slip & climb pace are unchanged regardless of
+      // leg shape; it just redistributes each stride into a HOLD (foot planted on a tread) + a quick
+      // REACH to the next tread edge — the reference's tread-by-tread climb.
+      const gripGate = TUNE.gripGaitEnable && v > 1e-6 && this._onStairRun(this._x);
       {
         const depthTarget = gripGate ? TUNE.gripDwell : 0;
         const ag = 1 - Math.exp(-TUNE.gripGaitLerp * dt);
@@ -2849,7 +2865,7 @@ export class Physics {
     // already eased + applied to `v` in the advance step above; here ω is derived from that ALREADY-
     // WARPED `v`, so `_theta += ω·dt` reproduces the SAME dwell-reach phase rate as the body — the
     // planted foot stays put (no-slip preserved) and the climb pace is unchanged (mean warp = 1).
-    const gripping = drive && this._isHook && this._onSteepStairRun(this._x) && this._gripGaitLive > 1e-3;
+    const gripping = drive && this._onStairRun(this._x) && this._gripGaitLive > 1e-3;
     if (drive && v > 1e-6) {
       const vSurf = v / cosA;
       // ry_contact = the deeper (carrying) leg's CURRENT vertical lever (== support
@@ -3244,6 +3260,20 @@ export class Physics {
     if (!this._interpHasPrev) return this._angle;
     const a = this._interpPrev;
     return a.angle + (this._angle - a.angle) * alpha;
+  }
+  /** Plant "쿵" squash amount [0..plantSquash] for the render frame — peaks at each foot-PLANT
+   * (cos(2θ)≈1) and is ~0 between plants, faded in with forward speed. The renderer reads this
+   * and SCALES the cube mesh (flatter on impact) for a weighted footfall. Derived from the SAME
+   * interpolated θ the legs use, so the squash stays in lock-step with the visible footfall under
+   * rAF jitter. COSMETIC — never touches the physics body/foot (no penetration / gate effect). */
+  interpSquash(alpha) {
+    if (!this.cube) return 0;
+    let th;
+    if (!this._interpHasPrev) th = this._theta;
+    else { const a = this._interpPrev; th = a.theta + (this._theta - a.theta) * alpha; }
+    const pulse = 0.5 * (1 + Math.cos(2 * th));          // 1 at a foot-plant (leg straight down), 0 mid-stride
+    const moving = clamp01(Math.abs(this._vx || 0) / TUNE.plantSquashSpeedRef);
+    return TUNE.plantSquash * Math.pow(pulse, TUNE.plantSquashPow) * moving;
   }
   /** Interpolated world leg angle for a leg with the given phaseOffset: lerp θ and the
    * body tilt, then add phaseOffset (which is constant — it never changes per tick). */

@@ -1326,6 +1326,10 @@ export class Renderer {
       const p = this.path.transform(ix, lat, iy, this._tp);
       this.cubeMesh.position.set(p.x, p.y, p.z);
       this.cubeMesh.rotation.set(0, this.path.heading(ix), -physics.interpAngle(alpha));
+      // PLANT "쿵" SQUASH: flatten the cube at each footfall (cosmetic weight). Symmetric about
+      // the centre (legs anchor at the centre, so they stay attached); y compresses, x/z widen.
+      const sq = physics.interpSquash ? physics.interpSquash(alpha) : 0;
+      this.cubeMesh.scale.set(1 + sq * 0.5, 1 - sq, 1 + sq * 0.5);
     }
     this._syncLegGroups(this.legGroups, physics, alpha);
     // BALL-FIELD: drive the reused player-lane sphere meshes from the live pile.
@@ -1344,6 +1348,8 @@ export class Renderer {
       const p = this.path.transform(ix, this.rivalLaneZ, iy, this._tp);
       this.rivalCubeMesh.position.set(p.x, p.y, p.z);
       this.rivalCubeMesh.rotation.set(0, this.path.heading(ix), -rival.interpAngle(alpha));
+      const sq = rival.interpSquash ? rival.interpSquash(alpha) : 0;
+      this.rivalCubeMesh.scale.set(1 + sq * 0.5, 1 - sq, 1 + sq * 0.5);
     }
     this._syncLegGroups(this.rivalLegGroups, rival, alpha);
     // BALL-FIELD (rival lane): lazily build the rival pile meshes the first time we see

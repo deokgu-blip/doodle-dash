@@ -2,7 +2,7 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 319.5,
+  "finishX": 275.5,
   "segments": [
     {
       "kind": "flat",
@@ -122,28 +122,9 @@
     },
     {
       "kind": "flat",
-      "length": 6,
+      "length": 10,
       "rough": 0.9,
-      "_note": "STRAIGHT LEAD-IN to the curving road — the player runs straight here just before the sweeping S-bend, so the turn reads as a deliberate road shape (like the reference)."
-    },
-    {
-      "kind": "curve",
-      "length": 22,
-      "turn": 65,
-      "rough": 0.9,
-      "_note": "도는 길 — FIRST SWEEP of a broad S-curve. The path HEADING ramps smoothly (smoothstep) from 0 through +65deg over 22u, so the road GENUINELY TURNS toward the +z camera side in 3D. Physics is still the 1-D arc-length walk (the cube follows the curving centre-line and YAWS to face along it; all gates stay green). A `curve` is physically a flat run that only carries the `turn`. The RIVAL (BOLT) runs the parallel lane, its offset perpendicular to the heading, so it stays BESIDE the player through the bend."
-    },
-    {
-      "kind": "curve",
-      "length": 22,
-      "turn": -65,
-      "rough": 0.9,
-      "_note": "도는 길 — SECOND SWEEP of the S-curve. The HEADING ramps back from +65deg through -65deg (net 0), so the road sweeps the OTHER way and the cube exits running at the ORIGINAL heading — a tidy S that returns to the lane it came in on, keeping the rest of the course coherent. Together the two sweeps read as a prominent winding road (a +65/-65 S over 44u)."
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
+      "_note": "STRAIGHT RUN — the winding 'curve' (도는 길) S-bend that USED to sit here was REMOVED per user request (the rotating/spiral road felt forced). The two `curve` segments (turn +65/-65 over 44u) were deleted and replaced by this single straight flat so the course stays coherent and the road no longer rotates. finishX recomputed 319.5 -> 275.5 (removed the 44u of curve arc-length; everything after shifts left 44u). The `curve` ENGINE code (track_schema `curve` kind, walker heading/yaw, renderer curving path) is KEPT dormant so a straight road is unaffected and curves could be re-added later. Lead-in flat(6) merged with the old flat(4) after the curves into flat(10)."
     },
     {
       "kind": "stairs",
@@ -254,9 +235,9 @@
   ],
   "rival": {
     "legPreset": "limb_long",
-    "pace": 0.88,
+    "pace": 0.83,
     "laneOffset": 2.8,
     "name": "BOLT",
-    "_note": "pace lowered 0.95 -> 0.88 when the SPLIT-PATH FORK was removed from the course. The fork's hook gate used to hand the rival a FAST (hook) leg through mid-course; removing it (plus the tunnel-exit leg RELEASE added in game.js _buildRivalSchedule) changed the rival's mid-course pace, so the pace is re-tuned so the ADAPTIVE player still WINS (rival finishes just behind) while a crippled player still LOSES (rival finishes well within budget). Verified by scripts/verify_t01.mjs RACE fast->WIN / short->LOSE gates."
+    "_note": "pace lowered 0.88 -> 0.83 when the winding CURVE (도는 길) was removed (course shortened 319.5 -> 275.5) AND the ball push was softened (gentler shove ⇒ the player grinds the pile a touch slower). Both shifted the race so the ADAPTIVE player finished just behind; re-tuned so the adaptive player WINS comfortably (rival finishes just behind) while a crippled player still LOSES (rival finishes well within budget). Earlier: 0.95 -> 0.88 when the SPLIT-PATH FORK was removed. Verified by scripts/verify_t01.mjs RACE fast->WIN / short->LOSE gates."
   }
 }

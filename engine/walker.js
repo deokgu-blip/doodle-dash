@@ -111,6 +111,13 @@ const TUNE = {
   tiltSlewMax: 0.029,    // rad/frame cap on cube.angle change (slew limiter ⇒ no per-frame lean snap at segment seams; just under the (I) DANG_MAX 0.03 gate)
   tiltMax: 0.65,         // rad — clamp so a near-vertical step can't flip the body (§E: lowered 0.85→0.65, the reference lean is gentler)
   tiltGain: 1.0,         // scale on the measured tangent angle (1 = exact match)
+  // STAIR BODY-FLOAT bias: the cube floats along the staircase's tread-top CHORD (a smooth
+  // diagonal). That chord is already at/above every tread top (no penetration), so the cube
+  // needs only a HAIR of extra lift. This was a FULL step (1.0), which floated the cube a whole
+  // step ABOVE the staircase — its feet dangled against the step EDGES/risers (옆면) instead of
+  // sitting on the tread tops (특정 면) — the user's "계단 옆면 밟고 오름" awkwardness. Now a hair,
+  // so the cube SITS ON the steps and the foot plants on the tread.
+  stairFloatBias: 0.12,  // (was 1.0 ×stepRise) fraction of one step the body floats above the tread-top chord
   // CLIMB RULE: a step of height h is climbable iff reach >= climbBase + climbK*h
   // i.e. taller steps demand a longer leg. Solve h_max(reach) = (reach-base)/K.
   // Calibrated so the SHORTEST leg (reach 0.6) clears a LOW step (~0.25) but is
@@ -320,13 +327,16 @@ const TUNE = {
   ballFriction: 5.0,     // 1/s linear velocity damping (rolling/ground friction) — settles balls
   ballRestitution: 0.18, // 0..1 bounce on ground / separation (a little lively, mostly damped)
   ballSepStiff: 22.0,    // 1/s ball-ball separation push rate (positional, impulse-like)
-  // FIX ㉢ — STRONGER SHOVE so plowing the pile is CLEARLY felt: the cube flings the balls
-  // harder (bigger ballPushSpeed) and a WIDER push circle (ballCubeHalf) so more of the heap is
-  // in contact at once (the heap bunches AHEAD of the cube → more contacts → more drag, the
-  // "헤쳐나가야" plow feel). The displacement/scatter therefore reads clearly (balls fly off).
-  ballPushSpeed: 1.9,    // (was 1.35) multiplier on the cube's forward speed imparted to a ball it shoves — a harder shove (bigger scatter)
-  ballPushUp: 0.55,      // (was 0.45) more lift so shoved balls pop up & scatter (the interaction reads)
-  ballCubeHalf: 0.7,     // (was 0.55) WIDER push circle ⇒ the cube contacts MORE of the pile at once (more drag, more visible scatter)
+  // USER FIX (억지 밀림) — the SHOVE was over-tuned (1.9× + 0.55 lift) so the balls LAUNCHED
+  // away unnaturally ("너무 억지로 밀려"). The push is now GENTLE & natural: the cube nudges balls
+  // forward at ~1× its own speed with only a little lift, so they ROLL/scatter believably rather
+  // than fly off. The PLOW DRAG (방해) is UNCHANGED — it comes from the contact count (ballCubeHalf
+  // width + ballContactPad + the per-contact slow below), NOT from the push velocity — so the
+  // "헤쳐나가야" feel and the race gates are preserved while the motion reads soft.
+  ballPushSpeed: 1.35,   // (was 1.9) ~1.35× the cube speed imparted forward — clears balls out of the path (so the cube doesn't wallow / lose the race) WITHOUT the violent fling of 1.9
+  ballPushUp: 0.35,      // (was 0.55) the 억지 fix: balls roll up & OVER the cube edge in a gentle pop (launch velocity ~halved) instead of LEAPING into the air — still lifts them clear of the contact band so the cube doesn't wallow
+  ballPushPosFrac: 0.85, // fraction of the overlap ejected POSITIONALLY per frame — softens the snap-out a touch while still clearing the ball ahead (no lingering/wallow)
+  ballCubeHalf: 0.7,     // WIDER push circle ⇒ the cube contacts MORE of the pile at once (drives the DRAG/방해, kept)
   // RESISTANCE: each ball the cube is in contact with multiplies its speed DOWN. The
   // factor is (1 − ballSlowPerContact)^contacts, clamped at ballSlowMin so the cube
   // NEVER fully stops (no soft-lock) — it always grinds through. FIX ㉢: STRENGTHENED so
@@ -351,13 +361,16 @@ const TUNE = {
   debrisFriction: 5.6,      // (was 5.2) a touch higher linear damping so the chips tumble to rest near the wall (don't drift far downstream into the run-out, so the cube cleanly recovers speed after the window)
   debrisRestitution: 0.12,  // ground/separation bounce (boxy chips bounce less than balls)
   debrisSepStiff: 26.0,     // (was 22) stronger fragment-fragment separation so chips SPREAD OUT flat on the floor (litter), not pile up vertically (keeps the settled rubble bottom on the floor)
-  // FIX ㉢ — a more VIOLENT smash (bigger forward+spread burst) so the rubble visibly scatters,
-  // but kept LOW (small up-fraction) so chips fly OUT & litter FLAT on the floor, not pile up.
-  debrisBurstSpeed: 4.6,    // (was 4.5) base outward speed (u/s) when a block breaks — a clear "흩날림" (scatter on smash), but not flung far downstream
-  debrisBurstUp: 0.34,      // (was 0.55) LESS lift ⇒ chips fly OUTWARD and litter FLAT on the floor (not stacked) — keeps the settled rubble bottom ~on the floor
-  debrisPushSpeed: 0.9,     // (was 1.25) a GENTLE later shove: the cube does NOT carry the rubble far downstream (it plows through and leaves it behind near the wall), so the cube clearly RECOVERS speed once past the rubble. The drag comes from the CONTACT count (pad + per-contact), not from carrying the pile.
-  debrisPushUp: 0.3,        // (was 0.40) LESS up on the later shove (chips slide/spread along the floor, don't pile) ⇒ rubble stays littered flat near the wall, recovery after is clean
-  debrisCubeHalf: 0.7,      // (was 0.55) WIDER push circle ⇒ the cube contacts MORE rubble at once (more drag, more scatter)
+  // USER FIX (억지 밀림) — the smash burst was over-tuned (4.6) so chips flew off too violently
+  // ("큐브가 너무 억지로 밀려"). Softened to a believable break: chips scatter a bit and litter the
+  // floor, the cube nudges them gently. The rubble DRAG (방해) is UNCHANGED (contact count: cubeHalf
+  // width + contactPad + per-contact slow), so the smash-through effort and race gates are kept.
+  debrisBurstSpeed: 2.8,    // (was 4.6) base outward speed (u/s) on a block break — a believable "흩날림", not an explosion
+  debrisBurstUp: 0.3,       // (was 0.34) low lift ⇒ chips litter FLAT on the floor (not stacked)
+  debrisPushSpeed: 0.5,     // (was 0.9) a soft later nudge — the cube leaves the rubble behind near the wall and recovers cleanly. Drag is from CONTACTS, not from carrying the pile.
+  debrisPushUp: 0.18,       // (was 0.3) barely any up on the later shove ⇒ chips slide/spread along the floor, don't pile
+  debrisPushPosFrac: 0.6,   // fraction of overlap ejected POSITIONALLY per frame — eases chips out (no snap-out) while staying no-clip
+  debrisCubeHalf: 0.7,      // WIDER push circle ⇒ the cube contacts MORE rubble at once (drives the DRAG/방해, kept)
   debrisContactPad: 0.24,   // (was 0.10) count a fragment "in contact" a hair earlier (more of the rubble drags)
   // FIX ㉢ — STRONGER rubble drag so plowing the debris is CLEARLY felt (~0.4–0.55 of clear),
   // floored so it never soft-locks; ramps with the contact count (compounding per fragment).
@@ -1592,12 +1605,14 @@ export class Physics {
       // Ride the staircase HYPOTENUSE — the line through each tread's top-OUTER
       // corner — which sits at or ABOVE every tread top. Floating the body to this
       // line keeps the foot on/above every tread (zero penetration) while the body
-      // glides up a single smooth diagonal (no per-step snap). For an ASCENT (yb<ya)
-      // bias the START end up by a full step (the hypotenuse leads the first tread);
-      // for a DESCENT bias the END end. We bias both ends up by one step which is
-      // safe (always ≥ the treads) and symmetric.
-      const stepRise = seg.stepH || 0;
-      const yTop0 = ya - stepRise, yTop1 = yb - stepRise;
+      // glides up a single smooth diagonal (no per-step snap). We add only a HAIR of
+      // lift (stairFloatBias·stepRise): the chord ALONE is already ≥ every tread top, so
+      // a full-step bias (the old value) just floated the cube a whole step ABOVE the
+      // staircase — feet dangling against the step EDGES/risers instead of on the tread
+      // tops (the user's "옆면 밟고 오름" awkwardness). The up-only foot clamp in _syncLegs
+      // catches any sub-epsilon seam round-off, so a small bias stays penetration-free.
+      const bias = (seg.stepH || 0) * TUNE.stairFloatBias;
+      const yTop0 = ya - bias, yTop1 = yb - bias;
       const t = clamp01((px - x0) / run);
       return yTop0 + (yTop1 - yTop0) * t;
     }
@@ -2298,8 +2313,10 @@ export class Physics {
           // only PUSH balls at/ahead of the cube (dx >= a small negative) so it shoves
           // the pile forward; balls already behind it are left to settle.
           if (dx > -R[i]) {
-            // separate the ball out of the cube along the contact normal (positional).
-            const over = reach - dist;
+            // ease the ball out of the cube along the contact normal (positional) — a FRACTION
+            // of the overlap per frame (ballPushPosFrac) so it slides out softly instead of
+            // snapping out (the "억지 밀림" fix); ball-ball sep + the cube's forward motion finish it.
+            const over = (reach - dist) * TUNE.ballPushPosFrac;
             let nx = dist > 1e-6 ? dx / dist : 1, ny = dist > 1e-6 ? dy / dist : 0;
             X[i] += nx * over; Y[i] += ny * over;
             // impart the cube's forward speed (× ballPushSpeed) + a little lift so the
@@ -2464,7 +2481,7 @@ export class Physics {
         if (dist < reach) {
           contacts++;
           if (dx > -R[i]) {
-            const over = reach - dist;
+            const over = (reach - dist) * TUNE.debrisPushPosFrac;   // ease chips out softly (억지 밀림 fix)
             let nx = dist > 1e-6 ? dx / dist : 1, ny = dist > 1e-6 ? dy / dist : 0;
             X[i] += nx * over; Y[i] += ny * over;
             const push = Math.max(0, vCube) * TUNE.debrisPushSpeed;

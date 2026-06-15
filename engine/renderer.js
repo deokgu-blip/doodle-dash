@@ -119,8 +119,15 @@ export class Renderer {
     this.path = null;
     // Alloc-free scratch objects for the per-frame transform (no per-frame GC).
     this._tp = { x: 0, y: 0, z: 0 };
-    this._tpL = { x: 0, y: 0, z: 0 };
-    this._tpR = { x: 0, y: 0, z: 0 };
+    this._tpL = { x: 0, y: 0, z: 0 };   // near-TOP rail (build loop)
+    this._tpR = { x: 0, y: 0, z: 0 };   // far-TOP rail  (build loop)
+    // SEPARATE scratch objects for the SLAB-BOTTOM rails. transform() RETURNS the
+    // scratch it is handed, so the four ring corners (near/far × top/bottom) MUST each
+    // own a distinct scratch — reusing _tpL/_tpR for the bottom rails aliased the top
+    // rail onto the bottom value ⇒ the side walls collapsed to ZERO height ⇒ the road
+    // read FLAT/papery (the regression). These keep the build loop alloc-free.
+    this._tpLb = { x: 0, y: 0, z: 0 };  // near-BOTTOM rail (build loop)
+    this._tpRb = { x: 0, y: 0, z: 0 };  // far-BOTTOM rail  (build loop)
 
     // RIVAL (computer opponent) — parallel lane, own cube + legs, offset in z.
     this.rivalCubeMesh = null;
@@ -653,10 +660,14 @@ export class Renderer {
       const syB = sy + RIBBON_DOWN;         // slab bottom (dropped) in physics y
       // PATH TRANSFORM: band edges PERPENDICULAR to the heading at L = laneZ ± half (turns
       // with the path, no z-shear). At heading 0 ⇒ (x, -sy, laneZ∓half) — old placement.
-      const Nt = this.path.transform(x, laneZ - half, sy, this._tpL);   // near top
-      const Ft = this.path.transform(x, laneZ + half, sy, this._tpR);   // far top
-      const Nb = this.path.transform(x, laneZ - half, syB, this._tpL);  // near bottom
-      const Fb = this.path.transform(x, laneZ + half, syB, this._tpR);  // far bottom
+      // FOUR DISTINCT scratch objects — transform() returns the scratch it is given, so the
+      // bottom rails MUST NOT reuse the top rails' scratch (that aliased top→bottom and
+      // collapsed the slab to zero height ⇒ the FLAT road regression). Distinct ⇒ the slab
+      // keeps its full RIBBON_DOWN thickness; still alloc-free (the four are reused per ring).
+      const Nt = this.path.transform(x, laneZ - half, sy, this._tpL);    // near top
+      const Ft = this.path.transform(x, laneZ + half, sy, this._tpR);    // far top
+      const Nb = this.path.transform(x, laneZ - half, syB, this._tpLb);  // near bottom
+      const Fb = this.path.transform(x, laneZ + half, syB, this._tpRb);  // far bottom
       const u = x * uScale;
       // TOP-surface copies (white, stripe zone). V is constant in the stripe zone (stripes
       // vary only along U), so both rails sit at TOP_V.
@@ -757,10 +768,13 @@ export class Renderer {
       for (let i = 0; i < N; i++) {
         const x = xs[i];
         // PATH TRANSFORM: same lane centre + heading as the floor, edges perpendicular.
+        // FOUR DISTINCT scratch objects — bottom/underside rails must NOT reuse the top
+        // rails' scratch (transform() returns the scratch handed in; aliasing collapsed the
+        // slab to zero thickness — the FLAT regression). Distinct ⇒ full RIBBON_DOWN slab.
         const Nt = this.path.transform(x, laneZ - half, topPy, this._tpL);
         const Ft = this.path.transform(x, laneZ + half, topPy, this._tpR);
-        const Nu = this.path.transform(x, laneZ - half, underPy, this._tpL);  // near underside
-        const Fu = this.path.transform(x, laneZ + half, underPy, this._tpR);  // far underside
+        const Nu = this.path.transform(x, laneZ - half, underPy, this._tpLb);  // near underside
+        const Fu = this.path.transform(x, laneZ + half, underPy, this._tpRb);  // far underside
         const u = x * uScale;
         pos.push(Nt.x, Nt.y, Nt.z,  Ft.x, Ft.y, Ft.z);                        // TOP copies (white)
         uv.push(u, TOP_V,  u, TOP_V); col.push(1, 1, 1,  1, 1, 1);
@@ -861,11 +875,13 @@ export class Renderer {
         // centre on the high flat top. The high-committed cube rides this SAME offset (renderer
         // sync.forkLateralAt) ⇒ WYSIWYG. 0 outside the fork ⇒ identical to before for the rest.
         const flat = physics.forkHighLatAt ? physics.forkHighLatAt(x) : 0;
-        // PATH TRANSFORM: same lane centre + heading as the floor (+ the lateral split), edges perpendicular.
+        // PATH TRANSFORM: same lane centre + heading as the floor (+ the lateral split), edges
+        // perpendicular. FOUR DISTINCT scratch objects — bottom rails must not reuse the top
+        // rails' scratch (transform() returns it; aliasing flattened the slab — the regression).
         const Nt = this.path.transform(x, laneZ + flat - half, sy, this._tpL);
         const Ft = this.path.transform(x, laneZ + flat + half, sy, this._tpR);
-        const Nb = this.path.transform(x, laneZ + flat - half, syB, this._tpL);
-        const Fb = this.path.transform(x, laneZ + flat + half, syB, this._tpR);
+        const Nb = this.path.transform(x, laneZ + flat - half, syB, this._tpLb);
+        const Fb = this.path.transform(x, laneZ + flat + half, syB, this._tpRb);
         const u = x * uScale;
         pos.push(Nt.x, Nt.y, Nt.z,  Ft.x, Ft.y, Ft.z);                        // TOP copies (white)
         uv.push(u, TOP_V,  u, TOP_V); col.push(1, 1, 1,  1, 1, 1);
@@ -1550,6 +1566,13 @@ export class Renderer {
     ctx.fillRect(0, 8, c.width, 8);        // WHITE swatch (bottom half) ⇒ ×edge-colour on sides
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
+    // flipY=FALSE so texture-V matches the CANVAS rows the code drew: V in [0,0.5) = the TOP
+    // 8px = the STRIPE zone (sampled by TOP_V=0.25), V in [0.5,1] = the BOTTOM 8px = the WHITE
+    // swatch (sampled by SIDE_V=0.75). Texture defaults to flipY=true, which INVERTED the two
+    // zones — the top verts then sampled the white swatch (×white vertex colour ⇒ a WHITE top
+    // instead of the purple stripe) while the sides sampled the stripes. That was the second
+    // half of the "flat road" regression (top read white/papery). flipY=false fixes it.
+    tex.flipY = false;
     tex.wrapS = THREE.RepeatWrapping;      // endless stripe rhythm along U
     tex.wrapT = THREE.ClampToEdgeWrapping; // keep the two V zones from bleeding into each other
     tex.magFilter = THREE.NearestFilter;   // crisp band edges + zone split (no muddy blur)

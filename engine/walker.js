@@ -270,6 +270,32 @@ const TUNE = {
   stepCamLerp: 40.0,     // 1/s — the camera-base ease rate during a stepped climb (faster than surfaceLerp so the step REACHES the tread quickly, leaving a flat HOLD before the next plant; still eased ⇒ no instant snap)
   stepPlantPhaseCos: 0.5,// the plant is detected when cos(2θ) rises above this (θ≈0,π ⇒ a foot straight down = a plant); a hysteresis edge advances the tread level once per plant
 
+  // ── FIX ㉣ — GRIP-CLIMB LEG GAIT (the leg DWELLS at the plant, then REACHES — NOT a constant roll) ──
+  // The previous fixes stepped the BODY (camera base) but the LEG kept rotating at the no-slip constant
+  // rate (ω = v/r), so on screen the leg looked like a WHEEL rolling up — the user's "그냥 미끄러지면서
+  // 올라가버려" (it slides). The genuine grip-climb the user wants is a HOLD–REACH–HOLD leg rhythm: the
+  // foot PLANTS on a tread edge → the leg HOLDS there (dwell) while the body pulls up → the leg quickly
+  // REACHES to the next tread edge and plants again. We get this by PHASE-WARPING the leg's θ advance
+  // during a steep-hook climb: θ advances SLOWLY through the plant phase (a visible dwell, foot down at
+  // the tread edge) and QUICKLY through the swing/reach phase. CRITICAL: the warp's MEAN over a full
+  // half-stride is EXACTLY 1, so the leg's AVERAGE angular speed equals the no-slip value — the climb
+  // advances at the SAME pace, never stalls (the dwell is a visual redistribution of the SAME rotation,
+  // not a brake). At a plant the instantaneous ω is still ≈ v/r (no foot slip on contact). Active ONLY
+  // on a steep-gated hook stair climb; everywhere else warp≡1 (normal rolling gait UNCHANGED).
+  gripGaitEnable: true,   // turn the dwell-reach leg phase-warp on for steep-gated stair hook climbs
+  gripDwell: 0.78,        // 0..~0.95 — DWELL strength. The phase rate near a plant is multiplied DOWN by ~(1−gripDwell) and the reach phase sped UP to compensate (mean stays 1). 0.78 ⇒ the leg nearly HOLDS at the plant (≈0.22× rate) then snaps through the reach — a clear "짚고" beat. 0 = constant roll (off).
+  gripGaitLerp: 11.0,     // 1/s — ease the warp depth in/out at the climb boundaries (no pop entering/leaving the steep stair)
+  // ── LEG LENGTH → REACH (treads-per-plant): a LONGER leg grabs FARTHER/MORE treads per plant ──
+  // The user's idea: "다리 길이에 따라 몇 번째 계단을 밟는다는 설정". A long leg REACHES over several treads
+  // and plants on a higher edge (covers more treads per stride); a short leg plants on the immediate
+  // next tread (one at a time). We map reach → treadsPerPlant: at each foot-PLANT the committed body
+  // tread level jumps UP by up to `treadsPerPlant` real tread edges (clamped to the actual staircase, so
+  // it never overshoots the top ⇒ still penetration-free, still reaches the top reliably). The leg's
+  // SLOWER ω (a longer lever ⇒ lower v/r) already spaces its plants farther apart, so grabbing more
+  // treads per plant keeps the body in sync with the foot (no float). Structurally O(1) per plant.
+  gripTreadsShort: 1,     // treads a SHORT leg (reach≈MIN) grabs per plant (one at a time)
+  gripTreadsLong: 3,      // treads a LONG leg (reach≈MAX) grabs per plant (a big reaching stride over several steps)
+
   // ── PRE-RACE IDLE FLOAT (reference start look) ──
   // Before the race starts (the player has not yet started drawing a leg, OR is drawing
   // the very first leg during the 3-2-1 countdown) the cube does NOT sit on the track.
@@ -411,6 +437,10 @@ export class Physics {
     this._stepLevelY = null;         // eased body-stand level toward _stepCommitY (the visible hold-then-step-up motion)
     this._stepPlantArmed = true;     // plant-edge hysteresis: armed between plants, fires once per plant to advance the tread
     this._stepProfile = 0;           // last stepped-vs-grounded lift applied (diagnostic for the verifier)
+    // ── FIX ㉣ — GRIP-CLIMB leg gait (dwell-reach phase warp) state ──
+    this._gripGaitLive = 0;          // eased warp DEPTH (0 off a steep-hook climb ⇒ constant roll; ramps to gripDwell on the climb)
+    this._gripWarp = 1;              // last applied phase-rate warp (1 = no warp; <1 dwell at plant, >1 reach between) — diagnostic for the verifier
+    this._gripDwelling = false;      // true on a frame the leg is in the DWELL (plant-hold) part of the climb gait — diagnostic
 
     // gate used by the verifier's leg-driven assertion (motor-off ⇒ no motion).
     this.motorEnabled = true;
@@ -581,6 +611,9 @@ export class Physics {
     this._stepLevelY = null;
     this._stepPlantArmed = true;
     this._stepProfile = 0;
+    this._gripGaitLive = 0;
+    this._gripWarp = 1;
+    this._gripDwelling = false;
     this._idleFloat = false;
     this._idlePhase = 0;
     // BALL-FIELD: cleared here and rebuilt in buildTrack (the segment scan spawns them).
@@ -1788,6 +1821,9 @@ export class Physics {
       this._stepLevelY = null;
       this._stepPlantArmed = true;
       this._stepProfile = 0;
+      this._gripGaitLive = 0;
+      this._gripWarp = 1;
+      this._gripDwelling = false;
       this._footBaseY = surf;
       this._prevFootBaseY = surf;
       // RENDER INTERPOLATION: a fresh leg teleports x to startX — drop any stale prev so
@@ -2151,6 +2187,33 @@ export class Physics {
    * Smooth ⇒ continuous loft, no pop; the body lands once per stride (a real run). */
   _hopPulse(theta) {
     return 0.5 * (1 - Math.cos(2 * theta));
+  }
+
+  /** FIX ㉣ — GRIP-CLIMB phase-rate WARP ∈ (0, …): how much faster/slower the leg phase θ
+   * advances at the current phase during a steep-hook climb. With the two legs 180° apart a
+   * foot PLANTS twice per π of θ (θ ≡ 0 mod π = a foot straight down). We want the leg to DWELL
+   * (advance SLOWLY) through the plant phase — a visible "짚고" hold at the tread edge — and
+   * REACH (advance QUICKLY) through the swing between plants. cos(2θ) is +1 at the plants and −1
+   * between, so warp = 1 − depth·cos(2θ) is (1−depth) at a plant (slow dwell) and (1+depth)
+   * mid-swing (fast reach). CRUCIALLY its MEAN over a half-stride is EXACTLY 1 (the cos term
+   * integrates to 0), so the leg's AVERAGE ω is the no-slip v/r — the climb advances at the SAME
+   * pace, never stalls; the dwell only REDISTRIBUTES the rotation in time (a visual beat), it does
+   * not brake the climb. `depth` 0 ⇒ warp ≡ 1 (constant roll, off). At a plant warp·ω is the slow
+   * dwell but the foot is on the ground only momentarily there, so no-slip on contact is preserved
+   * (the instantaneous contact still has ω = warp·v/r matched to the body's forward motion). */
+  _gripPhaseWarp(theta, depth) {
+    if (depth <= 1e-4) return 1;
+    return 1 - depth * Math.cos(2 * theta);
+  }
+
+  /** FIX ㉣ — LEG LENGTH → TREADS-PER-PLANT (the user's "다리 길이에 따라 몇 번째 계단을 밟는다").
+   * A LONGER reach REACHES over MORE treads per plant (a big climbing stride); a SHORT reach plants
+   * on the immediate next tread (one at a time). Maps reach (MIN..MAX) → [gripTreadsShort .. gripTreadsLong],
+   * rounded to a whole number of tread edges (an integer count of footholds). O(1), no allocation. */
+  _gripTreadsPerPlant(reach) {
+    const t = this.reachNorm(reach); // 0 (short) .. 1 (long)
+    const n = TUNE.gripTreadsShort + (TUNE.gripTreadsLong - TUNE.gripTreadsShort) * t;
+    return Math.max(1, Math.round(n));
   }
 
   // ── BALL-FIELD PHYSICS (light single-sphere model) ──
@@ -2662,6 +2725,26 @@ export class Physics {
       // `_debResist` is last frame's factor (1-step lag of no consequence). 1 = clear.
       v *= this._debResist;
 
+      // FIX ㉣ — GRIP-CLIMB GAIT: while a HOOK drives a steep-gated stair climb, ease the leg
+      // phase-warp DEPTH in (and out at the boundaries). The warp REDISTRIBUTES this frame's
+      // motion in time — the body DWELLS (advances slowly) while the foot is planted at a tread
+      // edge, then PULLS UP/forward quickly during the leg's reach to the next edge. We compute
+      // the warp from the CURRENT (start-of-frame) θ and apply the SAME factor to BOTH the forward
+      // advance (here) AND the θ rotation (section b), so the planted foot stays put (no-slip
+      // PRESERVED: foot world speed = v_body − ω·r = v·warp − (v/r·warp)·r ≈ 0 at every phase). The
+      // warp's MEAN over a half-stride is EXACTLY 1, so the per-stride distance is UNCHANGED — the
+      // climb advances at the same average pace and ALWAYS reaches the top (no stall, no soft-lock).
+      const gripGate = TUNE.gripGaitEnable && v > 1e-6 && this._isHook && this._onSteepStairRun(this._x);
+      {
+        const depthTarget = gripGate ? TUNE.gripDwell : 0;
+        const ag = 1 - Math.exp(-TUNE.gripGaitLerp * dt);
+        this._gripGaitLive += (depthTarget - this._gripGaitLive) * ag;
+        if (this._gripGaitLive < 1e-4) this._gripGaitLive = 0;
+      }
+      this._gripWarp = this._gripPhaseWarp(this._theta, this._gripGaitLive);
+      this._gripDwelling = (this._gripGaitLive > 1e-3) && (this._gripWarp < 0.85);
+      v *= this._gripWarp; // dwell (slow) at the plant, reach (fast) between — mean-1 ⇒ same avg pace
+
       // 3. advance
       const adv = v * dt;
       let nextX = this._x + adv;
@@ -2744,6 +2827,12 @@ export class Physics {
     const hop = this._hopPulse(this._theta);
     // normalized loft intensity ∈ [0,1] (amp scaled by the cap) — drives stride-stretch.
     const loftIntensity = clamp01(this._loftAmpLive / Math.max(1e-4, TUNE.loftMax));
+    // FIX ㉣ — GRIP-CLIMB GAIT GATE (reused below for the grip-lift + stepped body ascent): true
+    // while a HOOK is actually driving a steep-gated stair climb. The leg phase-WARP itself was
+    // already eased + applied to `v` in the advance step above; here ω is derived from that ALREADY-
+    // WARPED `v`, so `_theta += ω·dt` reproduces the SAME dwell-reach phase rate as the body — the
+    // planted foot stays put (no-slip preserved) and the climb pace is unchanged (mean warp = 1).
+    const gripping = drive && this._isHook && this._onSteepStairRun(this._x) && this._gripGaitLive > 1e-3;
     if (drive && v > 1e-6) {
       const vSurf = v / cosA;
       // ry_contact = the deeper (carrying) leg's CURRENT vertical lever (== support
@@ -2758,6 +2847,9 @@ export class Physics {
       // the slower roll never slips. The stretch scales with the loft intensity so flat
       // ground keeps the normal cadence everywhere.
       const stretch = 1 + TUNE.strideStretch * loftIntensity * hop;
+      // ω from the (already grip-warped) v ⇒ the leg DWELLS at the plant and REACHES between,
+      // EXACTLY in step with the warped forward advance ⇒ the planted foot does not slip and the
+      // visible leg motion is the hold-reach-hold "짚고" rhythm (NOT a constant roll) on the climb.
       omega = vSurf / (ryContact * stretch);
       this._theta += omega * dt;
       this._vTip = omega * ryContact; // == v_surface at a plant (planted foot stationary)
@@ -2774,9 +2866,11 @@ export class Physics {
       this._theta += omega * dt;
       this._vTip = 0; // slipping — no net foot progress
       this._trying = true;
+      this._gripWarp = 1; this._gripDwelling = false; // no climb gait while struggling in place
     } else {
       this._vTip = 0;
       this._trying = false;
+      this._gripWarp = 1; this._gripDwelling = false;
     }
     this._omega = omega; // rad/s — recorded on each leg.body in _syncLegs
 
@@ -2834,8 +2928,7 @@ export class Physics {
     // glide. The amplitude eases in/out at the run boundaries (no pop) and is small (no
     // jitter / motion-sickness). It is UPWARD-ONLY (RAISES the body), so it can never push the
     // body INTO a riser ⇒ zero penetration is structurally preserved. Active only when a HOOK
-    // is actually driving a steep-stair climb (v>0, on a steep-gated run).
-    const gripping = drive && v > 1e-6 && this._isHook && this._onSteepStairRun(this._x);
+    // is actually driving a steep-stair climb (`gripping`, computed once in section (b) above).
     {
       const gripTarget = gripping ? TUNE.gripLiftMax : 0;
       const ag = 1 - Math.exp(-TUNE.gripLerp * dt);
@@ -2864,10 +2957,21 @@ export class Physics {
       stepActive = true;
       const realSurf = this.surfaceYAt(this._x);          // current tread top under the body (physics +down)
       const treadTop = (realSurf != null) ? realSurf : groundSurf;
-      // the tread the cube will climb ONTO next ≈ the surface ~one cube ahead (a discrete level one
-      // step up, or the same near the top). The body steps ONTO this at a plant.
-      const aheadSurf = this.surfaceYAt(this._x + CUBE_SIZE * 0.8);
+      // FIX ㉣ — LEG LENGTH → TREADS-PER-PLANT (the user's "다리 길이에 따라 몇 번째 계단을 밟는다"):
+      // a SHORT leg plants on the IMMEDIATE next tread (one ahead), a LONG leg REACHES over MORE
+      // treads (its lookahead extends with reach), so each plant of a long leg lands on a higher/
+      // farther tread edge — a bigger climbing stride. `nReach` whole footholds; the lookahead is
+      // a cube-width per foothold so the sampled surface is a real tread top `nReach` steps up.
+      const nReach = this._gripTreadsPerPlant(this._reach);
+      // the tread the cube will climb ONTO next: sample the surface `nReach` cube-widths ahead (a
+      // long leg looks farther). It is a REAL tread top (surfaceYAt is the stepped staircase), so the
+      // committed level is always a genuine foothold — the body lands ON it (penetration-free).
+      const aheadSurf = this.surfaceYAt(this._x + CUBE_SIZE * 0.8 * nReach);
       const nextTreadTop = (aheadSurf != null && aheadSurf < treadTop) ? aheadSurf : treadTop;
+      // ALSO clamp how far the commit may lead the real ground beneath the body — never more than the
+      // tread the cube is GROUNDED on (so the body never floats above a real foot contact ⇒ no float
+      // bug). For the long-leg multi-tread reach we allow the commit to lead up to the `nReach`-ahead
+      // tread, which the FOOT (a long leg) physically reaches.
       if (!this._stepClimbActive) {
         this._stepClimbActive = true;
         this._stepCommitY = treadTop;                      // seed at the current tread (no pop)
@@ -2875,8 +2979,9 @@ export class Physics {
         this._stepPlantArmed = true;
       }
       // PLANT EDGE (cos(2θ) peaks ≈1 at θ≈0,π — a leg straight down catching a step edge): on the
-      // rising edge of a plant, COMMIT one tread UP (to nextTreadTop), then HOLD until the next
-      // plant (hysteresis arms between plants). This is the discrete "한 칸" advance.
+      // rising edge of a plant, COMMIT up to `nReach` treads UP (to nextTreadTop — a SHORT leg's
+      // nextTreadTop is one tread up, a LONG leg's is several), then HOLD until the next plant
+      // (hysteresis arms between plants). A long leg therefore grabs MORE steps per plant.
       const plantCos = 0.5 * (1 + Math.cos(2 * this._theta)); // 1 at plant
       if (plantCos >= TUNE.stepPlantPhaseCos && this._stepPlantArmed) {
         if (nextTreadTop < this._stepCommitY) this._stepCommitY = nextTreadTop; // step UP (more-negative y); never DOWN
@@ -2886,9 +2991,9 @@ export class Physics {
       }
       // The commit changes ONLY at a plant (above) ⇒ it HOLDS perfectly flat between plants, so the
       // camera reaches it and STOPS (a clean flat hold) until the next plant jumps it up — the crisp
-      // "한 칸씩" cadence. We only guard it from running AHEAD of the next reachable tread (so it never
-      // leads more than one step up) and never DROPS below the tread the cube has reached (no sag).
-      if (this._stepCommitY < nextTreadTop) this._stepCommitY = nextTreadTop; // never lead beyond one tread up
+      // "한 칸씩" cadence. We only guard it from running AHEAD of the next reachable tread (the leg's
+      // `nReach`-ahead foothold) and never DROP below the tread the cube has reached (no sag).
+      if (this._stepCommitY < nextTreadTop) this._stepCommitY = nextTreadTop; // never lead beyond the leg's reach
       if (this._stepCommitY > treadTop) this._stepCommitY = treadTop;         // never sag below the reached tread (the cube already stands here)
       // The stand level is the DISCRETE committed tread — it JUMPS at a plant and HOLDS flat between
       // plants (it does NOT continuously ease, or the holds would smear back into a glide). The
@@ -3255,6 +3360,19 @@ export class Physics {
   get stepProfile() { return this._stepProfile || 0; }
   /** True while the body is doing the stepped (vs glide) steep-stair climb. */
   get stepClimbActive() { return !!this._stepClimbActive; }
+  /** FIX ㉣: the live LEG PHASE-WARP factor (1 = constant roll; <1 = the leg DWELLS at the plant,
+   * >1 = the leg REACHES between plants). On a steep-hook climb this PULSES between (1−depth) at the
+   * plant and (1+depth) mid-swing (mean 1) — the verifier reads it to prove the leg does NOT rotate
+   * at a constant rate during the climb (the dwell-reach "짚고" gait, not a slide). 1 everywhere else. */
+  get gripWarp() { return (this._gripWarp == null) ? 1 : this._gripWarp; }
+  /** FIX ㉣: true on a frame the climb leg is in its DWELL (plant-hold) part. */
+  get gripDwelling() { return !!this._gripDwelling; }
+  /** FIX ㉣: the eased grip-gait depth ∈ [0, gripDwell] (0 ⇒ normal roll; >0 ⇒ the dwell-reach gait is
+   * active on a steep-hook climb). Diagnostic for the verifier (the gait is engaged on the climb). */
+  get gripGaitDepth() { return this._gripGaitLive || 0; }
+  /** FIX ㉣: how many TREAD edges the CURRENT leg grabs per plant (1 = short leg, more = long leg).
+   * The user's "다리 길이에 따라 몇 번째 계단을 밟는다" — reported so the verifier proves long > short. */
+  get treadsPerPlant() { return this._gripTreadsPerPlant(this._reach); }
   /** Vertical velocity (physics +down; up = negative) — non-zero only while airborne. */
   get vy() { return this._vy || 0; }
   /** Clearance of the support foot's lowest point ABOVE the surface under the body

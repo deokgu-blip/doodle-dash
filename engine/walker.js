@@ -3017,8 +3017,13 @@ export class Physics {
     // WARPED `v`, so `_theta += ω·dt` reproduces the SAME dwell-reach phase rate as the body — the
     // planted foot stays put (no-slip preserved) and the climb pace is unchanged (mean warp = 1).
     const gripping = drive && this._onStairRun(this._x) && this._gripGaitLive > 1e-3;
-    if (drive && v > 1e-6) {
-      const vSurf = v / cosA;
+    if (drive && (v > 1e-6 || this._v > 1e-6)) {
+      // NO-SLIP GRIP: spin the leg to match the cube's ACTUAL momentum speed `_v` (not the motor
+      // target), so the planted foot's world speed = v_body − ω·r ≈ 0 — the foot GRIPS the ground
+      // firmly instead of spinning faster than the body (the flat-ground "헛돎" the user removed).
+      // Momentum + tip-propulsion still live in `_v` (section 3); the leg just tracks it. Spin-in-
+      // place (real 헛돎) remains ONLY in the blocked branch below (steep slope, no grip).
+      const vSurf = this._v / cosA;
       // ry_contact = the deeper (carrying) leg's CURRENT vertical lever (== support
       // depth at the live phase+tilt). Floor it so a near-horizontal pose can't blow
       // ω up; this is the same quantity the body floats on (so foot & body agree).

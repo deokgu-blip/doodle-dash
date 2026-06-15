@@ -183,7 +183,10 @@ const TUNE = {
   // leg climbs them (unchanged). GAP ramps are EXEMPT (a short leg must escape the
   // V-trench — never gated, no soft-lock). The downhill ramps in T01 are |slope|≈0.5–0.58
   // and are NEVER gated (downhill is not a climb); only steep UPHILLs gate.
-  steepThresh: 0.6,      // |physics-slope| at/above which an UPHILL ramp is hook-gated
+  steepThresh: 0.9,      // |physics-slope| at/above which an UPHILL climb is HOOK-gated (was 0.6). Raised so
+                         // the new STEEPER staircases (slope ~0.8) stay LENGTH-gated — a long leg STEP-climbs
+                         // them tread-by-tread (the new physics) instead of forcing a hook. Only very steep
+                         // (~50°+, slope>=0.9) climbs are hook-gated now.
   steepEnterGap: 0.0,    // world-u — stop a non-hook leg this far before the steep ramp foot (0 = right at the foot)
   // ── TUNNEL RULE (the INVERSE of the climb/wall rule) ──
   // A LOW CEILING segment blocks a leg whose REACH is too long: the rotating leg
@@ -2743,7 +2746,14 @@ export class Physics {
       // (SHORT leg needed). A too-long leg's rotating sweep strikes the ceiling, so we
       // stop it at the mouth (struggle-in-place), the user must redraw shorter.
       const tunnel = this._nextTunnel(this._x, lookX + 0.5);
-      const tunnelBlocks = tunnel && !this.canPassTunnel(reach, tunnel.clearance);
+      // ALSO block a too-long leg that is ALREADY INSIDE a tunnel (e.g. entered short, then redrawn
+      // LONG mid-tunnel): the ahead-scan misses it (the mouth is now behind), so without this the
+      // leg jams on the ceiling but the body keeps SLIDING forward on momentum (the user's bug /
+      // the "auto-push" they want gone). Treat "inside a tunnel with reach > clearance" as a block;
+      // the jam then kills the forward momentum (recoil) so the body stops instead of sliding.
+      const curTun = (seg && seg.kind === 'tunnel') ? seg : null;
+      const inTunnelBlocks = !!curTun && !this.canPassTunnel(reach, curTun.clearance);
+      const tunnelBlocks = (tunnel && !this.canPassTunnel(reach, tunnel.clearance)) || inTunnelBlocks;
       // STEEP-CLIMB rule (by SHAPE, not length): if a steep UPHILL foot lies just ahead
       // — a steep RAMP foot OR a steep-gated STAIRCASE run foot — gate on HOOK-NESS. A
       // HOOK leg grips-and-steps over (climbs); a NON-HOOK leg (straight / arc / circle /
@@ -2771,10 +2781,10 @@ export class Physics {
       // penetration (the user's hard rule) while it JAMS at the mouth. (The θ-clamp in section (b)
       // is the belt-and-braces backstop.) Bound below by the old mouth offset so a barely-too-long
       // leg still stops right at the mouth, not absurdly far.
-      const tunnelStopX = tunnelBlocks
-        ? Math.min(tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap,
-                   tunnel.x - (this._reach + LEG_LINE_RADIUS + TUNE.tunnelEnterGap))
-        : Infinity;
+      const tunnelStopX = !tunnelBlocks ? Infinity
+        : tunnel ? Math.min(tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap,
+                            tunnel.x - (this._reach + LEG_LINE_RADIUS + TUNE.tunnelEnterGap))
+        : this._x;   // already INSIDE the tunnel ⇒ stop right here (no further slide)
       const steepStopX = steepBlocks ? (steep.x - CUBE_SIZE * 0.5 - TUNE.steepEnterGap) : Infinity;
       const iceStopX = iceBlocks ? (ice.x - CUBE_SIZE * 0.5 - TUNE.iceEnterGap) : Infinity;
       if (steepBlocks && steepStopX <= riserStopX && steepStopX <= tunnelStopX && steepStopX <= iceStopX) {
@@ -3269,10 +3279,15 @@ export class Physics {
     //    Next frame the motor advances θ again → re-clamps here ⇒ the leg oscillates at the contact =
     //    a JAM (redraw a shorter leg to pass — no soft-lock). Bounded iterations; zero alloc.
     if (this.legDrawn && this._chain && this._maxCeilingPen(this._theta, this._angle) > 0.001) {
-      const dir = (this._omega || 0) >= 0 ? 1 : -1;   // unwind opposite the spin
+      // Roll θ toward whichever side REDUCES the ceiling penetration ⇒ converge to the nearest
+      // angle where the leg fits under the ceiling (e.g. pointing ALONG the tunnel). Bidirectional
+      // so it always finds a clear angle even when the leg was redrawn deep into the ceiling
+      // mid-tunnel (the one-direction roll could climb away from the fit). Bounded iterations.
       let guard = 0;
-      while (this._maxCeilingPen(this._theta, this._angle) > 0.001 && guard < 40) {
-        this._theta -= dir * TUNE.ceilBackStep;
+      while (this._maxCeilingPen(this._theta, this._angle) > 0.001 && guard < 90) {
+        const penPlus = this._maxCeilingPen(this._theta + TUNE.ceilBackStep, this._angle);
+        const penMinus = this._maxCeilingPen(this._theta - TUNE.ceilBackStep, this._angle);
+        this._theta += (penMinus <= penPlus ? -TUNE.ceilBackStep : TUNE.ceilBackStep);
         guard++;
       }
       this._omega = 0;   // motor stalled — leg jammed at the ceiling

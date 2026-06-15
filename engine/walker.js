@@ -79,6 +79,21 @@ const LEG_MAX_CIRCLES = 40;      // chain sample cap (shape-faithful, bounded)
 // slip, no stop-go jerk. 'natural' is ultimately the user's call.
 const TUNE = {
   baseSpeed: 6.0,        // world u/s at the reference leg on flat ground
+  // ── FORGIVING MOMENTUM (관성) — cube speed is an integrated state easing toward the motor
+  // target (the leg/terrain-derived speed). Ramps from rest + builds over continuous running;
+  // drag bleeds it; capped (no runaway). momAccel > momDrag ⇒ speeds up faster than it coasts down.
+  momAccel: 4.5,         // 1/s — propulsion ease rate toward a HIGHER target (acceleration). Boosted because
+                         // it's now GATED by tip-contact (~half-duty, the plant phase), so the peak rate is higher.
+  momDrag: 2.0,          // 1/s — ease rate toward a LOWER target (coast-down / drag when the motor eases)
+  momMaxV: 11.0,         // world-u/s hard cap on the cube's forward speed (forgiving — no runaway)
+  tipGripFloor: 0.25,    // min propulsion fraction mid-float (0=propel ONLY at the exact plant, 1=ignore tip phase).
+                         // 0.25 ⇒ a planted stride always bites, with a clear surge-on-footfall pulse.
+  // JAM (끼임-정지): when a leg is physically caught on geometry (too-long leg hits a tunnel ceiling,
+  // or a step too tall to climb), the motor STALLS — the leg holds against the obstacle instead of
+  // free-rolling through. A small backward recoil bounces the cube on the impact (뒤로 살짝).
+  jamMotorStop: 22.0,    // 1/s — how fast the leg spin decays to a stop when jammed (motor stall ease)
+  jamRecoil: 1.2,        // world-u/s — small backward bounce velocity on the jam-impact frame (then eases to rest)
+  ceilBackStep: 0.04,    // rad — step size for unwinding the leg spin off a tunnel ceiling (the jam clamp); small ⇒ tight contact, no penetration
   refReach: 1.0,         // reach that maps to legSpeedFactor == 1
   // legSpeedFactor(reach): longer ⇒ bigger stride ⇒ faster. A gentle monotone
   // power curve, clamped. At reach=MIN ≈ 0.66, at reach=MAX ≈ 1.43.
@@ -437,6 +452,8 @@ export class Physics {
     this._blockedByTunnel = false;   // blocked specifically by a low ceiling (too-long leg) — legs keep trying
     this._trying = false;            // §C: true while struggling in place (legs churn, x≈0)
     this._vx = 0;                    // last realized forward speed (u/s)
+    this._v = 0;                     // FORGIVING MOMENTUM: integrated forward speed (eases toward the motor target)
+    this._wasJammed = false;         // JAM tracker: true last frame the leg was caught on geometry (for the recoil impulse)
     this._vTip = 0;                  // last foot tip linear speed (u/s)
     this._omega = 0;                 // last leg angular speed (rad/s)
     // ── TERRAIN-FACTOR LOW-PASS (anti-bumps-ripple) ──
@@ -1742,6 +1759,32 @@ export class Physics {
     return closest === Infinity ? null : closest;
   }
 
+  /** Max ceiling PENETRATION (world-u) over BOTH legs' chain points at a CANDIDATE spin angle
+   * `theta` (+ body `tilt`), computed from the axle-local chain directly (no leg-body rebuild,
+   * zero alloc). A point at world (px,py) with leg-line top (py − lineRadius) ABOVE (smaller y
+   * than) the ceiling there ⇒ penetration = ceilingY − (py − r) > 0. Used to JAM the leg at a
+   * tunnel ceiling (revert the spin) so a too-long leg never rolls THROUGH it. 0 if no ceiling. */
+  _maxCeilingPen(theta, tilt) {
+    const ch = this._chain;
+    if (!ch || !ch.length || !this.cube) return 0;
+    const axleX = this.cube.position.x + AXLE_X, axleY = this.cube.position.y + AXLE_Y;
+    const r = LEG_LINE_RADIUS;
+    let maxPen = 0;
+    for (let s = 0; s < 2; s++) {
+      const a = theta + (s === 0 ? 0 : this._legPhaseOffset) + (tilt || 0);
+      const ca = Math.cos(a), sa = Math.sin(a);
+      for (let i = 0; i < ch.length; i++) {
+        const px = axleX + (ch[i].x * ca - ch[i].y * sa);
+        const py = axleY + (ch[i].x * sa + ch[i].y * ca);
+        const cy = this.ceilingYAt(px);
+        if (cy == null) continue;
+        const pen = cy - (py - r);   // >0 ⇒ leg-line top is ABOVE the ceiling = penetration
+        if (pen > maxPen) maxPen = pen;
+      }
+    }
+    return maxPen;
+  }
+
   /** Local segment under px (for terrain / climb decisions). O(log n) via _segIdxAt;
    * preserves the "prefer the highest surface" semantics by testing the matched
    * segment plus its seam neighbours (the only place two segments can share an x).
@@ -2635,7 +2678,7 @@ export class Physics {
       this._bodyBaseY += (baseTarget - this._bodyBaseY) * a;
       this._angle = 0;
       this._bob = Math.abs(bob);
-      this._vx = 0; this._vTip = 0; this._omega = 0; this._vy = 0;
+      this._vx = 0; this._vTip = 0; this._omega = 0; this._vy = 0; this._v = 0;
       this._air = false; this._airFrames = 0; this._loft = 0;
       this._grip = 0; this._gripLiveAmp = 0;
       this._footBaseY = surf; this._prevFootBaseY = surf;
@@ -2723,7 +2766,15 @@ export class Physics {
       // whichever gate's stop-point comes FIRST along x wins (so a wall just before a
       // tunnel, or a steep climb before a wall, blocks at the nearer obstacle).
       const riserStopX = riserBlocks ? (riser.x - CUBE_SIZE * 0.5) : Infinity;
-      const tunnelStopX = tunnelBlocks ? (tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap) : Infinity;
+      // A too-long leg is stopped FAR ENOUGH BACK that its rotating sweep (radius ≈ reach) cannot
+      // poke forward-up INTO the tunnel ceiling region [x0,x1] — guaranteeing ZERO ceiling
+      // penetration (the user's hard rule) while it JAMS at the mouth. (The θ-clamp in section (b)
+      // is the belt-and-braces backstop.) Bound below by the old mouth offset so a barely-too-long
+      // leg still stops right at the mouth, not absurdly far.
+      const tunnelStopX = tunnelBlocks
+        ? Math.min(tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap,
+                   tunnel.x - (this._reach + LEG_LINE_RADIUS + TUNE.tunnelEnterGap))
+        : Infinity;
       const steepStopX = steepBlocks ? (steep.x - CUBE_SIZE * 0.5 - TUNE.steepEnterGap) : Infinity;
       const iceStopX = iceBlocks ? (ice.x - CUBE_SIZE * 0.5 - TUNE.iceEnterGap) : Infinity;
       if (steepBlocks && steepStopX <= riserStopX && steepStopX <= tunnelStopX && steepStopX <= iceStopX) {
@@ -2845,8 +2896,37 @@ export class Physics {
       this._gripDwelling = (this._gripGaitLive > 1e-3) && (this._gripWarp < 0.85);
       v *= this._gripWarp; // dwell (slow) at the plant, reach (fast) between — mean-1 ⇒ same avg pace
 
-      // 3. advance
-      const adv = v * dt;
+      // 3. advance — FORGIVING MOMENTUM (관성). `v` here is the MOTOR TARGET speed for this frame
+      //    (0 when blocked/idle; lowered by ball/debris resistance ⇒ the strong motor plows but
+      //    SLOWS). The cube's ACTUAL forward speed `_v` EASES toward it, so speed BUILDS UP over
+      //    continuous running and ramps from rest (inertia), and bleeds via drag when the motor
+      //    eases. The leg ω (section b) is driven by the motor target, so while `_v` lags the foot
+      //    SLIPS (ω·r > _v = wheel-spin); at steady state `_v` catches up and the foot grips.
+      //    Capped (forgiving — no runaway). [backward-recoil on a hard jam: a later step.]
+      {
+        // JAM RECOIL (뒤로 살짝): the frame the leg first JAMS into geometry (tunnel ceiling / a step
+        // it can't climb), bounce the cube back a touch, then it eases back to rest. Otherwise:
+        // ── TIP-DRIVEN PROPULSION (발끝 추진) ── the motor only PROPELS while a foot TIP is planted on
+        // the ground (plant phase: a leg straight down, cos(2θ)≈1). Two legs 180° out ⇒ a tip plants
+        // twice per rotation ⇒ propulsion PULSES with the gait (surge on each footfall, coast between)
+        // — forward on tip-contact, not on a mid-leg/body touch. Drag always applies; floored so a
+        // planted stride always bites.
+        const jammedNow = this._blockedByTunnel || this._blockedByRiser;
+        if (jammedNow && !this._wasJammed) {
+          this._v = -TUNE.jamRecoil;                                 // JAM IMPACT — small backward bounce
+        } else {
+          const tgt = v;
+          const planted = 0.5 * (1 + Math.cos(2 * this._theta));     // 1 at a foot-plant, 0 mid-float
+          const tipGrip = TUNE.tipGripFloor + (1 - TUNE.tipGripFloor) * planted;
+          const rate = (tgt > this._v) ? (TUNE.momAccel * tipGrip) : TUNE.momDrag;  // propel only on tip-contact; drag always
+          this._v += (tgt - this._v) * (1 - Math.exp(-rate * dt));
+        }
+        this._wasJammed = jammedNow;
+        if (this._v > TUNE.momMaxV) this._v = TUNE.momMaxV;
+        if (this._v < -TUNE.jamRecoil) this._v = -TUNE.jamRecoil;    // allow a SMALL backward recoil, bounded
+        if (Math.abs(this._v) < 1e-4) this._v = 0;
+      }
+      const adv = this._v * dt;
       let nextX = this._x + adv;
       // STANDING-BLOCK BAR: do not let the cube pass the near face of an INTACT block this
       // frame. We clamp the advance so the cube's leading edge sits AT the nearest intact
@@ -2867,8 +2947,12 @@ export class Physics {
         if (barStopX < Infinity && nextX > barStopX) nextX = Math.max(this._x, barStopX);
       }
       if (nextX < this.finishX + 1) this._x = nextX;
+    } else {
+      // not driving (idle/blocked-no-leg): bleed momentum to rest.
+      this._v += (0 - this._v) * (1 - Math.exp(-TUNE.momDrag * dt));
+      if (Math.abs(this._v) < 1e-4) this._v = 0;
     }
-    this._vx = v;
+    this._vx = this._v;   // report the ACTUAL (momentum) speed — drives cube.velocity + ball/debris push
 
     // ── ORDER NOTE: the geometric walking bob below reads the legs' CURRENT world
     //    angles (master phase θ + body tilt), so we advance θ and ease the tilt
@@ -2955,24 +3039,35 @@ export class Physics {
       this._vTip = omega * ryContact; // == v_surface at a plant (planted foot stationary)
       this._trying = false;
     } else if (drive && (this._blockedByRiser || this._blockedByTunnel || this._blockedBySteep || this._blockedByIce) && this._reach > CUBE_SIZE * 0.5) {
-      // §C: struggle in place (riser climb OR low-ceiling tunnel OR steep ramp OR ICE). Spin at
-      // the cadence the leg would have if walking on the flat (vNatural/effR) so the churn
-      // looks like a real walking effort. The body x does NOT advance (v stays 0) — the
-      // foot slips against the wall (riser) / spins into the low ceiling (tunnel) / slips
-      // back down the steep ramp / SPINS on the ice (a smooth leg can't grip).
-      const vNat = TUNE.baseSpeed * this.legSpeedFactor(this._reach) * this.paceFactor;
-      const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
-      omega = vNat / ryContact;
-      this._theta += omega * dt;
-      this._vTip = 0; // slipping — no net foot progress
-      this._trying = true;
-      this._gripWarp = 1; this._gripDwelling = false; // no climb gait while struggling in place
+      // BLOCKED — two flavors of "physics":
+      //  • JAM (tunnel: a too-long leg hits the ceiling; riser: the leg can't reach over a step) —
+      //    the leg is physically CAUGHT on geometry ⇒ the MOTOR STALLS: ω decays to ~0 so the leg
+      //    HOLDS against the obstacle (끼임-정지), it does NOT free-roll through it. Redraw a fitting
+      //    leg to free it (no soft-lock). A small backward recoil on the impact is applied in (3).
+      //  • SLIP (steep ramp, non-hook / ice): the leg finds NO grip ⇒ it SPINS (헛돎) at the natural
+      //    cadence while the body makes no forward progress (wheel spinning on the slope/ice).
+      const jammed = this._blockedByTunnel || this._blockedByRiser;
+      if (jammed) {
+        omega = (this._omega || 0) * Math.exp(-TUNE.jamMotorStop * dt);  // motor stalls — ease the spin to a stop, leg held
+        this._theta += omega * dt;
+        this._vTip = 0;
+        this._trying = false;     // it is JAMMED/held, not churning
+      } else {
+        const vNat = TUNE.baseSpeed * this.legSpeedFactor(this._reach) * this.paceFactor;
+        const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
+        omega = vNat / ryContact;   // SLIP: legs spin, no grip, no net progress
+        this._theta += omega * dt;
+        this._vTip = 0;
+        this._trying = true;
+      }
+      this._gripWarp = 1; this._gripDwelling = false; // no climb gait while blocked
     } else {
       this._vTip = 0;
       this._trying = false;
       this._gripWarp = 1; this._gripDwelling = false;
     }
     this._omega = omega; // rad/s — recorded on each leg.body in _syncLegs
+    // (CEILING JAM is enforced after the body Y is finalized — see the clamp just before _syncLegs.)
 
     // (c) BODY HEIGHT — TWO STATES: GROUNDED (the foot DEFINITELY touches the
     //     ground, no float) and AIRBORNE (a ballistic arc launched off a crest).
@@ -3162,6 +3257,21 @@ export class Physics {
     this.cube.velocity.x = v;
     this.cube.velocity.y = this._vy; // loft rate (0 when grounded/flat)
     this.cube.angle = this._angle;
+
+    // ── CEILING JAM (no penetration + 끼임) ── with the body Y now FINAL, if the current spin angle
+    //    pushes any leg point UP INTO a tunnel ceiling, ROLL the spin BACK a hair at a time until it
+    //    clears: the leg HOLDS against the ceiling and never rolls THROUGH it (the user's hard rule).
+    //    Next frame the motor advances θ again → re-clamps here ⇒ the leg oscillates at the contact =
+    //    a JAM (redraw a shorter leg to pass — no soft-lock). Bounded iterations; zero alloc.
+    if (this.legDrawn && this._chain && this._maxCeilingPen(this._theta, this._angle) > 0.001) {
+      const dir = (this._omega || 0) >= 0 ? 1 : -1;   // unwind opposite the spin
+      let guard = 0;
+      while (this._maxCeilingPen(this._theta, this._angle) > 0.001 && guard < 40) {
+        this._theta -= dir * TUNE.ceilBackStep;
+        guard++;
+      }
+      this._omega = 0;   // motor stalled — leg jammed at the ceiling
+    }
 
     // 6. sync the two leg visuals + their world parts. Foot lowest point is
     //    clamped to sit ON the surface (never below) — structural 0 penetration.

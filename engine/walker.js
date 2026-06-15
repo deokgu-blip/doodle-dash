@@ -153,6 +153,16 @@ const TUNE = {
   sharpAngleDeg: 40,     // degrees — a chain vertex must turn at LEAST this much to count as a "sharp" corner whose TURN DIRECTION we track (above finger-jitter; only genuine bends count for the scribble/reversal test)
   hookMaxReversals: 2,   // max direction reversals among sharp corners for a HOOK (clean/wobbly ㄱ/J/L ⇒ rev≤1; a real scribble alternates left-right-left across many big bends ⇒ rev=3 ⇒ FAILS — can't grip with a wiggle)
   hookTurnWindow: 2,     // chain-sample lookahead each side for the turn-angle measure (smooths arc jitter, keeps sharp corners)
+  // ── ICE RULE (아이젠/crampon gate — a NEW gimmick, the inverse-of-smooth) ──
+  // An ICE stretch is SLIPPERY: a smooth leg (wheel/arc/straight/limb) and even a HOOK find no
+  // grip and slip in place (struggle, legs spin like wheels on ice, no advance). ONLY a TOOTHED
+  // leg bites in: a MANY-corner zigzag (아이젠처럼 뾰족) — nSharp sharp corners that ALTERNATE
+  // (signReversals). So the player must DRAW A SPIKY LEG to cross (forces a distinct redraw from
+  // long/short/hook). Thresholds chosen so zigzag/scribble PASS (nSharp~4-5, rev~2-3) while every
+  // smooth shape (nSharp 0) and a clean hook (nSharp 1, rev≤1) are BLOCKED — clean separation.
+  iceGripSharpMin: 3,    // min sharp corners (teeth) for grip — a wheel/arc/straight=0, hook=1 ⇒ blocked; a zigzag/scribble≥3 ⇒ grips
+  iceGripRevMin: 2,      // min direction reversals among those teeth (a true zigzag alternates; a coherent curl does not) ⇒ excludes a multi-bend-but-one-way curl
+  iceEnterGap: 0.0,      // world-u — stop a non-grippy leg this far before the ice foot (0 = right at the slippery edge)
   // STEEP-RAMP GATE: an UPHILL ramp (physics slope<0) is "steep" (hook-gated) iff its
   // |slope| >= steepThresh. Gentle/medium uphills (|slope| < this) are NOT gated — any
   // leg climbs them (unchanged). GAP ramps are EXEMPT (a short leg must escape the
@@ -415,8 +425,12 @@ export class Physics {
     this._shape = null;              // shape descriptor (chain etc.)
     this._chain = null;              // axle-local chain (for both legs' visual)
     this._isHook = false;            // SHAPE gate: true ⇒ the drawn leg is a HOOK (sharp bend) — can grip-climb a steep ramp
+    this._isGrippy = false;          // SHAPE gate: true ⇒ a TOOTHED/zigzag (아이젠) leg — grips ICE; smooth/hook legs slip
     this._maxTurnDeg = 0;            // measured max turn angle (deg) of the current chain (hookiness metric)
+    this._signReversals = 0;         // measured # of sharp-corner direction reversals (zigzag/teeth metric)
+    this._nSharp = 0;                // measured # of sharp corners (teeth count) — drives the ice grip gate
     this._blockedBySteep = false;    // blocked specifically by a steep ramp (non-hook leg) — legs keep trying (struggle in place)
+    this._blockedByIce = false;      // blocked specifically by ICE (non-grippy/smooth leg slips) — legs keep trying (spin)
     this._legPhaseOffset = Math.PI;  // second leg is 180° out of phase
     this._blocked = false;           // true when stopped at an unclimbable step
     this._blockedByRiser = false;    // §C: blocked specifically by a riser (climb) — legs keep trying
@@ -537,6 +551,7 @@ export class Physics {
     this._riserHit = { found: false, x: 0, h: 0 };
     this._tunnelHit = { found: false, x: 0, clearance: 0 };
     this._steepHit = { found: false, x: 0, slope: 0 };
+    this._iceHit = { found: false, x: 0 };
     this._steepStairRuns = [];   // build-time list of steep-gated stairs run feet/windows
 
     // ── SPLIT-PATH FORK (a BRANCH the LEG SHAPE routes — commit-at-entrance) ──
@@ -598,6 +613,7 @@ export class Physics {
     this.legs = [];
     this.floorBodies = [];
     this.ceilingBodies = [];
+    this.iceBodies = [];            // ICE slippery render slabs ({ x0,x1, surfaceY }) — overlaid pale-cyan
     this.legDrawn = false;
     this._exploded = false;
     this._segs = [];
@@ -608,7 +624,9 @@ export class Physics {
     this._blockedByRiser = false;
     this._blockedByTunnel = false;
     this._blockedBySteep = false;
+    this._blockedByIce = false;
     this._isHook = false;
+    this._isGrippy = false;
     this._maxTurnDeg = 0;
     this._trying = false;
     this._vx = 0;
@@ -957,6 +975,21 @@ export class Physics {
         this.ceilingBodies.push({ x0: tx0, x1: tx1, ceilingY, floorY, clearance });
         cursorX += len;
         // surfaceY unchanged (flat floor through the tunnel).
+      } else if (seg.kind === 'ice') {
+        // ICE = a flat SLIPPERY stretch (a NEW gimmick, inverse-of-smooth). The floor is an
+        // ordinary flat surface; the OBSTACLE is the slip: a smooth leg (wheel/arc/straight/limb)
+        // or a HOOK finds no grip and is BLOCKED at the ice MOUTH (struggle-in-place — the legs
+        // SPIN like wheels on ice, no advance). The user must redraw a TOOTHED/zigzag (아이젠) leg
+        // that bites in (_isGrippy); a grippy leg crosses at full speed. Gated in update().
+        const ix0 = cursorX, ix1 = cursorX + len;
+        const iceY = surfaceY;                 // freeze the level (mutating-loop-var closure-bug guard)
+        addSlab(ix0 + len / 2, iceY, len, thick);
+        this._segs.push({ x0: ix0, x1: ix1, kind: 'ice', topYa: iceY, topYb: iceY, surfFn: () => iceY });
+        if (iceY < this._maxSurfaceTopY) this._maxSurfaceTopY = iceY;
+        // render body: a pale-cyan glossy overlay the renderer draws ON TOP of the flat road.
+        this.iceBodies.push({ x0: ix0, x1: ix1, surfaceY: iceY });
+        cursorX += len;
+        // surfaceY unchanged (flat slippery floor).
       } else if (seg.kind === 'balls') {
         // BALLS = a FLAT run with a PILE OF DYNAMIC PHYSICS SPHERES lying on it. The
         // floor is an ordinary flat surface (the cube walks it with the normal gait —
@@ -1566,7 +1599,7 @@ export class Physics {
     // FORK low-route ramps (the dip/underpass) carry an analytic slope too; high-route segs
     // are stairs/flat (slope 0, handled below). A fork flat lead-in/out has no slope ⇒ 0.
     if (s && s.kind === 'fork') return (typeof s.slope === 'number') ? s.slope : 0;
-    if (s && (s.kind === 'flat' || s.kind === 'stairs')) return 0;
+    if (s && (s.kind === 'flat' || s.kind === 'stairs' || s.kind === 'ice')) return 0;
     // CURVE: a flat curve has no slope (0); a sloped curve carries an analytic slope.
     if (s && s.kind === 'curve') return (typeof s.slope === 'number') ? s.slope : 0;
     if (s && s.kind === 'planks' && s.plank) return 0; // a plank board is level
@@ -1666,7 +1699,7 @@ export class Physics {
     if (seg && seg.kind === 'fork') {
       return (typeof seg.slope === 'number') ? clampMag(Math.atan(seg.slope) * TUNE.tiltGain, TUNE.tiltMax) : 0;
     }
-    if (seg && seg.kind === 'flat') return 0;
+    if (seg && (seg.kind === 'flat' || seg.kind === 'ice')) return 0; // flat / slippery floor is level
     if (seg && seg.kind === 'planks' && seg.plank) return 0; // a plank board is level
     // gap / unknown: finite-difference (and hold the current lean over a gap).
     const dx = TUNE.tiltDx;
@@ -1787,9 +1820,15 @@ export class Physics {
       const hm = hookMetrics(chain, TUNE.hookTurnWindow);
       this._maxTurnDeg = hm.maxTurnDeg;
       this._signReversals = hm.signReversals;
+      this._nSharp = hm.nSharp;
       // GENUINE HOOK: a sharp enough corner AND a directionally-coherent bend (curls ONE way
       // — a clean ㄱ/J/L), NOT a back-and-forth zigzag/scribble (you can't grip with a wiggle).
       this._isHook = (hm.maxTurnDeg >= TUNE.hookAngleDeg) && (hm.signReversals <= TUNE.hookMaxReversals);
+      // GRIPPY (아이젠/crampon): a MANY-TOOTHED zigzag — several sharp corners that ALTERNATE
+      // direction (left-right-left). This is the SHAPE that bites into ICE (the opposite of a
+      // smooth wheel/arc which slips). Distinct from a HOOK (one coherent bend, low reversals):
+      // a hook does NOT grip ice (it's not toothed), so ice forces yet ANOTHER leg shape.
+      this._isGrippy = (hm.nSharp >= TUNE.iceGripSharpMin) && (hm.signReversals >= TUNE.iceGripRevMin);
     }
 
     // 5. place / re-float the cube.
@@ -2004,6 +2043,19 @@ export class Physics {
     const h = this._tunnelHit;
     h.found = true; h.x = bestX; h.clearance = bestClr;
     return h;
+  }
+
+  /** Find the next ICE foot (an ice segment's x0) in (fromX, toX], or null. The foot is where
+   * a NON-GRIPPY (smooth/hook) leg slips and is stopped (struggle-in-place) until a TOOTHED
+   * zigzag (아이젠) leg is drawn. Mirrors _nextTunnel; reuses a scratch object (no per-frame alloc). */
+  _nextIce(fromX, toX) {
+    let bestX = Infinity, any = false;
+    for (const s of this._segs) {
+      if (s.kind !== 'ice') continue;
+      if (s.x0 > fromX && s.x0 <= toX) { if (!any || s.x0 < bestX) { bestX = s.x0; any = true; } }
+    }
+    if (!any) { this._iceHit.found = false; return null; }
+    const h = this._iceHit; h.found = true; h.x = bestX; return h;
   }
 
   /** Find the next STEEP UPHILL CLIMB foot whose x lies in (fromX, toX]. This covers BOTH
@@ -2640,6 +2692,7 @@ export class Physics {
       this._blockedByRiser = false;  // §C: a CLIMB block (vs a gap) ⇒ legs keep trying
       this._blockedByTunnel = false; // a LOW-CEILING block (too-long leg) ⇒ legs keep trying
       this._blockedBySteep = false;  // a STEEP-RAMP block (non-hook leg) ⇒ legs keep trying
+      this._blockedByIce = false;    // an ICE block (non-grippy/smooth leg slips) ⇒ legs keep trying
 
       // climb rule: if a stairs/wall step lies just ahead, gate on reach (LONG leg needed).
       const riser = this._nextRiser(this._x, lookX + 0.5);
@@ -2655,6 +2708,11 @@ export class Physics {
       // NO reach involvement: the hook gate SUPERSEDES the per-riser length gate here.
       const steep = this._nextSteep(this._x, lookX + 0.5);
       const steepBlocks = steep && !this._isHook;
+      // ICE rule (by SHAPE): if a slippery ICE foot lies just ahead, gate on GRIPPINESS. A
+      // TOOTHED zigzag (아이젠) crosses; a smooth/hook leg slips and STRUGGLES in place at the
+      // ice mouth (legs spin, no advance) until a spiky leg is drawn. Like steep, no reach.
+      const ice = this._nextIce(this._x, lookX + 0.5);
+      const iceBlocks = ice && !this._isGrippy;
       // SUPPRESS the per-riser LENGTH gate when the riser belongs to a STEEP-GATED STAIRCASE
       // run: on a steep staircase the HOOK gate is the only thing that matters (a non-hook is
       // already stopped at the foot by `steep`; a hook of ANY reach must climb — the tall step
@@ -2667,7 +2725,8 @@ export class Physics {
       const riserStopX = riserBlocks ? (riser.x - CUBE_SIZE * 0.5) : Infinity;
       const tunnelStopX = tunnelBlocks ? (tunnel.x - CUBE_SIZE * 0.5 - TUNE.tunnelEnterGap) : Infinity;
       const steepStopX = steepBlocks ? (steep.x - CUBE_SIZE * 0.5 - TUNE.steepEnterGap) : Infinity;
-      if (steepBlocks && steepStopX <= riserStopX && steepStopX <= tunnelStopX) {
+      const iceStopX = iceBlocks ? (ice.x - CUBE_SIZE * 0.5 - TUNE.iceEnterGap) : Infinity;
+      if (steepBlocks && steepStopX <= riserStopX && steepStopX <= tunnelStopX && steepStopX <= iceStopX) {
         // BLOCKED by the steep ramp: the leg is not a hook — it can't grip the slope, so
         // it slips and churns in place at the ramp foot (struggle, NO net advance) until
         // a HOOK leg is drawn. Not a soft-lock: redraw a hook ⇒ immediately climbs.
@@ -2675,7 +2734,7 @@ export class Physics {
         this._blocked = true;
         this._blockedBySteep = true;
         if (this._x > steepStopX) this._x = steepStopX;
-      } else if (tunnelBlocks && tunnelStopX <= riserStopX) {
+      } else if (tunnelBlocks && tunnelStopX <= riserStopX && tunnelStopX <= iceStopX) {
         // BLOCKED by the low ceiling: stop just before the tunnel mouth. The leg is too
         // long — it churns in place (struggle) and makes NO net forward progress until a
         // SHORTER leg is drawn (canPassTunnel). No artificial advance, not a soft-lock.
@@ -2683,6 +2742,14 @@ export class Physics {
         this._blocked = true;
         this._blockedByTunnel = true;
         if (this._x > tunnelStopX) this._x = tunnelStopX;
+      } else if (iceBlocks && iceStopX <= riserStopX) {
+        // BLOCKED by ICE: the leg is smooth (or a hook) — it finds no grip and slips, churning
+        // in place at the ice mouth (legs SPIN like wheels on ice, NO net advance) until a
+        // TOOTHED zigzag (아이젠) leg is drawn (_isGrippy). Not a soft-lock: redraw spiky ⇒ crosses.
+        v = 0;
+        this._blocked = true;
+        this._blockedByIce = true;
+        if (this._x > iceStopX) this._x = iceStopX;
       } else if (riserBlocks) {
         // blocked: stop just before the riser (a GENTLE staircase/wall step too tall for this
         // reach). A steep-gated staircase riser is NOT a riserBlocks (the hook gate governs it
@@ -2887,12 +2954,12 @@ export class Physics {
       this._theta += omega * dt;
       this._vTip = omega * ryContact; // == v_surface at a plant (planted foot stationary)
       this._trying = false;
-    } else if (drive && (this._blockedByRiser || this._blockedByTunnel || this._blockedBySteep) && this._reach > CUBE_SIZE * 0.5) {
-      // §C: struggle in place (riser climb OR low-ceiling tunnel OR steep ramp). Spin at
+    } else if (drive && (this._blockedByRiser || this._blockedByTunnel || this._blockedBySteep || this._blockedByIce) && this._reach > CUBE_SIZE * 0.5) {
+      // §C: struggle in place (riser climb OR low-ceiling tunnel OR steep ramp OR ICE). Spin at
       // the cadence the leg would have if walking on the flat (vNatural/effR) so the churn
       // looks like a real walking effort. The body x does NOT advance (v stays 0) — the
       // foot slips against the wall (riser) / spins into the low ceiling (tunnel) / slips
-      // back down the steep ramp (a non-hook leg can't grip).
+      // back down the steep ramp / SPINS on the ice (a smooth leg can't grip).
       const vNat = TUNE.baseSpeed * this.legSpeedFactor(this._reach) * this.paceFactor;
       const ryContact = Math.max(TUNE.effRadiusMin, this._supportDepth(this._theta, this._angle));
       omega = vNat / ryContact;
@@ -3295,9 +3362,14 @@ export class Physics {
   get blockedByRiser() { return !!this._blockedByRiser; }
   /** True while blocked specifically by a STEEP ramp (a NON-HOOK leg can't grip-climb it). */
   get blockedBySteep() { return !!this._blockedBySteep; }
+  /** True while blocked specifically by ICE (a smooth/hook leg slips — needs a toothed zigzag). */
+  get blockedByIce() { return !!this._blockedByIce; }
   /** Is the CURRENT drawn leg a HOOK (sharp bend ⇒ can grip-and-step over a steep ramp)?
    * SHAPE gate — independent of reach. False for straight bars / smooth arcs / circles. */
   get isHook() { return !!this._isHook; }
+  /** Is the CURRENT drawn leg GRIPPY (a toothed/zigzag 아이젠 ⇒ grips ICE)? SHAPE gate — many
+   * sharp corners that alternate. False for smooth shapes AND for a clean (one-way) hook. */
+  get isGrippy() { return !!this._isGrippy; }
 
   // ── SPLIT-PATH FORK getters (renderer + verifier read these) ──
   /** Number of forks on the track (0 ⇒ none). */

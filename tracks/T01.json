@@ -2,242 +2,53 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 275.5,
+  "finishX": 225,
+  "_design": "SHAPE-CHANGING RHYTHM (user principle: every gimmick must force a leg-shape change). The required leg cycles SHORT(tunnel) → LONG(gap/planks) → HOOK(steep ramp) → SPIKY(ice) so the player redraws at almost every beat. STAIRS were REMOVED (the kinematic engine can't sell foot-on-tread contact — the leg dangled in the step gaps yet still climbed). Climbs are now STEEP SMOOTH RAMPS (slope ~0.85 >= steepThresh 0.6 ⇒ hook-gated; a smooth/short leg slips at the foot, only a hook grips). ICE is the NEW gimmick: a smooth/hook leg slips in place, only a TOOTHED zigzag (아이젠) grips. balls/blocks/bumps are no-gate TEXTURE breathers between forcing gimmicks. Each steep UP ramp is paired with a DOWN ramp so the vertical profile stays bounded.",
   "segments": [
-    {
-      "kind": "flat",
-      "length": 10,
-      "rough": 0.9
-    },
-    {
-      "kind": "bumps",
-      "length": 10,
-      "amp": 0.45,
-      "freq": 2.5,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "stairs",
-      "length": 2.4,
-      "height": 0.95,
-      "steps": 2,
-      "rough": 0.9,
-      "_note": "WAS a `wall` (height 0.95) — a near-vertical riser that read as a TELEPORT up. Converted to a short STAIRCASE of the SAME total height so the climb is visibly STEPPED (2 treads, riser 0.475u over 1.2u run each). LENGTH-GATE preserved: overall slope 0.396 < steepThresh 0.6 ⇒ NOT hook-gated (a normal length-gated staircase); each riser 0.475u > maxClimb(0.6)=0.30 ⇒ a SHORT leg (reach ~0.6) is BLOCKED at the foot (struggle-in-place, no soft-lock), a LONG leg climbs it tread-by-tread. So a too-short leg is still blocked SOMEWHERE (NO-SINGLE-LEG holds) but there is NO vertical snap."
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "stairs",
-      "length": 3.7,
-      "height": 4.4,
-      "steps": 5,
-      "rough": 0.9,
-      "_note": "STEEP CLIMB = hook-gated STAIRCASE, ~50deg (overall slope 4.4/3.7=1.189 >= 0.6 => auto hook-gate). Matches the reference: TALL step edges (each step rise 0.88u > its run 0.74u) are the grip points. HEIGHT kept at 4.4 (course vertical profile preserved); the steeper angle comes from a SHORTER run, not a taller top. Only a HOOK leg grips & climbs; straight/round legs slip => struggle-in-place at the foot => redraw a hook to pass (no soft-lock). Reach-irrelevant. 5 steps over 3.7u => each 0.74u run / 0.88u rise (clearly stepped grip points, not micro-serrations)."
-    },
-    {
-      "kind": "ramp",
-      "length": 6,
-      "height": -3,
-      "rough": 0.9
-    },
-    {
-      "kind": "gap",
-      "width": 9,
-      "depth": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 6,
-      "rough": 0.9
-    },
-    {
-      "kind": "tunnel",
-      "length": 8,
-      "clearance": 0.95,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 3,
-      "rough": 0.9
-    },
-    {
-      "kind": "balls",
-      "length": 9,
-      "count": 16,
-      "ballR": 0.34,
-      "rough": 0.9,
-      "_note": "PHYSICS BALL PILE — a heap of dynamic spheres the cube must SHOVE aside. Plowing through slows the cube (resistance ∝ contacts, floored ⇒ no soft-lock); the balls roll/scatter ahead. Pure additive obstacle (no gate)."
-    },
-    {
-      "kind": "flat",
-      "length": 3,
-      "rough": 0.9
-    },
-    {
-      "kind": "planks",
-      "count": 6,
-      "plankLen": 1.4,
-      "gapLen": 1.0,
-      "gapDepth": 1.6,
-      "rough": 0.9,
-      "_note": "GAPPED PLANKS — long/fast leg (big stride) sails over the voids; short leg drops into the shallow recovery trench and crawls out (slow, no soft-lock). Long-favourable."
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "blocks",
-      "length": 10,
-      "blockCount": 4,
-      "blockW": 0.7,
-      "blockH": 0.8,
-      "debrisPerBlock": 5,
-      "rough": 0.9,
-      "_note": "BREAKING BLOCKS — a low wall of upright boxes barring the path. blockH 0.8 is JUST UNDER the cube (CUBE_SIZE 0.9) so the cube clearly SITS ON / rides OVER the blocks and the rubble (NOT buried among taller towers — was 1.4, which sank the cube). The cube SMASHES each on contact: the block bursts into debris that falls, litters the floor, and SLOWS the cube grinding over the rubble (resistance ∝ contacts, floored ⇒ no soft-lock). The cube always breaks through, riding on top. Reuses the ball-debris physics (gravity/clamp/separation/cube-push)."
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "bumps",
-      "length": 10,
-      "amp": 0.5,
-      "freq": 3,
-      "rough": 0.9,
-      "_note": "The SPLIT-PATH FORK that USED to sit between the preceding flat(4) and these bumps was REMOVED from the course (it read as a confusing split). The fork ENGINE code is kept (track_schema `fork` kind, walker fork build/_commitForkAt/forkLateralAt, renderer _buildForks) so it can be re-added later. The flat(4) ends at baseY=0 and these bumps start at baseY=0 (sin starts at 0, whole periods) => the join is continuous, NO discontinuity. finishX recomputed 331.5 -> 319.5 (removed the fork's 12u arc-length; the 35u run-out buffer past the last content is preserved)."
-    },
-    {
-      "kind": "flat",
-      "length": 10,
-      "rough": 0.9,
-      "_note": "STRAIGHT RUN — the winding 'curve' (도는 길) S-bend that USED to sit here was REMOVED per user request (the rotating/spiral road felt forced). The two `curve` segments (turn +65/-65 over 44u) were deleted and replaced by this single straight flat so the course stays coherent and the road no longer rotates. finishX recomputed 319.5 -> 275.5 (removed the 44u of curve arc-length; everything after shifts left 44u). The `curve` ENGINE code (track_schema `curve` kind, walker heading/yaw, renderer curving path) is KEPT dormant so a straight road is unaffected and curves could be re-added later. Lead-in flat(6) merged with the old flat(4) after the curves into flat(10)."
-    },
-    {
-      "kind": "stairs",
-      "length": 7,
-      "height": 2.2,
-      "steps": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "stairs",
-      "length": 2.6,
-      "height": 1.0,
-      "steps": 2,
-      "rough": 0.9,
-      "_note": "WAS a `wall` (height 1.0). Converted to a 2-step STAIRCASE of the SAME total height (riser 0.5u over 1.3u run each). slope 0.385 < 0.6 ⇒ length-gated (NOT hook-gated); riser 0.5u > maxClimb(0.6)=0.30 ⇒ short leg BLOCKED, long leg climbs stepped. No vertical snap."
-    },
-    {
-      "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "ramp",
-      "length": 6,
-      "height": -3.5,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "tunnel",
-      "length": 9,
-      "clearance": 0.85,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 6,
-      "rough": 0.9
-    },
-    {
-      "kind": "gap",
-      "width": 9,
-      "depth": 4.5,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "bumps",
-      "length": 10,
-      "amp": 0.5,
-      "freq": 3,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "stairs",
-      "length": 2.4,
-      "height": 0.95,
-      "steps": 2,
-      "rough": 0.9,
-      "_note": "WAS a `wall` (height 0.95). Converted to a 2-step STAIRCASE of the SAME total height (riser 0.475u over 1.2u run each). slope 0.396 < 0.6 ⇒ length-gated (NOT hook-gated); riser 0.475u > maxClimb(0.6)=0.30 ⇒ short leg BLOCKED, long leg climbs stepped. No vertical snap."
-    },
-    {
-      "kind": "flat",
-      "length": 5,
-      "rough": 0.9
-    },
-    {
-      "kind": "tunnel",
-      "length": 8,
-      "clearance": 0.95,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 6,
-      "rough": 0.9
-    },
-    {
-      "kind": "stairs",
-      "length": 6,
-      "height": 1.8,
-      "steps": 4,
-      "rough": 0.9
-    },
-    {
-      "kind": "flat",
-      "length": 14,
-      "rough": 0.9
-    }
+    { "kind": "flat", "length": 13, "rough": 0.9, "_note": "START lead-in — run straight, draw the first leg." },
+
+    { "kind": "tunnel", "length": 9, "clearance": 0.9, "rough": 0.9, "_note": "SHORT — low ceiling; a long leg's sweep strikes it, must draw a short leg." },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+    { "kind": "gap", "width": 9, "depth": 4, "rough": 0.9, "_note": "LONG — leap the V-trench; a short leg drops in and crawls (slow)." },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+    { "kind": "ramp", "length": 4, "height": 3.4, "rough": 0.9, "_note": "HOOK — steep UP ramp (slope 0.85 >= 0.6 ⇒ hook-gated). Only a hook grips & climbs; smooth/short legs slip at the foot (struggle-in-place)." },
+    { "kind": "ramp", "length": 5, "height": -3.4, "rough": 0.9, "_note": "recovery DOWN ramp (slope 0.68, descending ⇒ NOT gated)." },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+    { "kind": "ice", "length": 9, "rough": 0.9, "_note": "SPIKY — slippery; smooth/hook legs spin in place, only a TOOTHED zigzag (아이젠) grips & crosses." },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+
+    { "kind": "tunnel", "length": 8, "clearance": 0.95, "rough": 0.9, "_note": "SHORT" },
+    { "kind": "flat", "length": 4, "rough": 0.9 },
+    { "kind": "balls", "length": 9, "count": 12, "ballR": 0.34, "rough": 0.9, "_note": "TEXTURE — shove the ball pile aside (resistance, any leg). A breather between forcing gates." },
+    { "kind": "flat", "length": 13, "rough": 0.9, "_note": "clean RUN-OUT after the ball pile (≥11u so the cube outruns the forward-scattered balls and clearly recovers speed before the next gimmick — recovery window sits in here, away from the next gate's descent)." },
+    { "kind": "gap", "width": 9, "depth": 4.5, "rough": 0.9, "_note": "LONG" },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+    { "kind": "ramp", "length": 4, "height": 3.4, "rough": 0.9, "_note": "HOOK — steep UP ramp." },
+    { "kind": "ramp", "length": 5, "height": -3.4, "rough": 0.9, "_note": "recovery DOWN ramp." },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+    { "kind": "ice", "length": 9, "rough": 0.9, "_note": "SPIKY" },
+    { "kind": "flat", "length": 4, "rough": 0.9 },
+
+    { "kind": "planks", "count": 6, "plankLen": 1.4, "gapLen": 1.0, "gapDepth": 1.6, "rough": 0.9, "_note": "LONG — long stride sails over the plank voids; a short leg drops into the recovery trench (slow)." },
+    { "kind": "flat", "length": 4, "rough": 0.9 },
+    { "kind": "blocks", "length": 10, "blockCount": 4, "blockW": 0.7, "blockH": 0.8, "debrisPerBlock": 5, "rough": 0.9, "_note": "TEXTURE — smash the block wall (any leg, rubble resistance)." },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+
+    { "kind": "tunnel", "length": 8, "clearance": 0.9, "rough": 0.9, "_note": "SHORT" },
+    { "kind": "flat", "length": 4, "rough": 0.9 },
+    { "kind": "ramp", "length": 4, "height": 3.2, "rough": 0.9, "_note": "HOOK — steep UP ramp (slope 0.8)." },
+    { "kind": "ramp", "length": 5, "height": -3.2, "rough": 0.9, "_note": "recovery DOWN ramp." },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+    { "kind": "ice", "length": 8, "rough": 0.9, "_note": "SPIKY" },
+    { "kind": "flat", "length": 5, "rough": 0.9 },
+    { "kind": "bumps", "length": 10, "amp": 0.5, "freq": 3, "rough": 0.9, "_note": "TEXTURE — wavy run-up to the finish (any leg)." },
+    { "kind": "flat", "length": 16, "rough": 0.9, "_note": "RUN-OUT to the finish line (finishX 216 sits ~2.6u in; ~13u of track after for roll-out)." }
   ],
   "rival": {
     "legPreset": "limb_long",
     "pace": 0.83,
     "laneOffset": 2.8,
     "name": "BOLT",
-    "_note": "pace lowered 0.88 -> 0.83 when the winding CURVE (도는 길) was removed (course shortened 319.5 -> 275.5) AND the ball push was softened (gentler shove ⇒ the player grinds the pile a touch slower). Both shifted the race so the ADAPTIVE player finished just behind; re-tuned so the adaptive player WINS comfortably (rival finishes just behind) while a crippled player still LOSES (rival finishes well within budget). Earlier: 0.95 -> 0.88 when the SPLIT-PATH FORK was removed. Verified by scripts/verify_t01.mjs RACE fast->WIN / short->LOSE gates."
+    "_note": "BOLT auto-swaps its leg per gimmick (game.js _buildRivalSchedule: short@tunnel, long@gap/planks, hook@steep-ramp, zigzag@ice, long default). pace will be re-tuned by scripts/verify_t01.mjs RACE gates after this course redesign (stairs removed, ice + steep ramps added, course length changed)."
   }
 }

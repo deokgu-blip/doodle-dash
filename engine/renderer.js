@@ -14,6 +14,8 @@ const COL = {
   bgTop: 0xA6E05A, bgBottom: 0x7FC93C, hill: 0x6FB836,
   trackA: 0x8E3AAE, trackB: 0xC24FD6, trackEdge: 0x5E2480,
   player: 0x3CA5E5, playerFace: 0x0E2A3A, leg: 0x1A1A1A,
+  // ICE: a pale frosty cyan overlay laid on the road over a slippery stretch (the 빙판 gimmick).
+  ice: 0xBCEBFB, iceEdge: 0x8FD4EC,
   // RIVAL: our own opponent colour (NOT the original game's character). A bright
   // lime-emerald cube so it reads as a distinct racer on the parallel lane.
   rival: 0x35C44A, rivalFace: 0x0B3A18,
@@ -195,6 +197,12 @@ export class Renderer {
     // (render-cap beat-skip + fixed-timestep judder) were fixed separately, not by this cull.
     this._sideMat = new THREE.MeshBasicMaterial({ color: COL.trackEdge, side: THREE.DoubleSide });
 
+    // ICE overlay material (shared, built once): a translucent frosty cyan laid OVER the road
+    // on a slippery stretch so the 빙판 reads at a glance. Unlit + transparent so the purple
+    // road shows through faintly (it looks like a sheet of ice on the track). Protected in
+    // _isSharedMat so rebuilds don't dispose it.
+    this._iceMat = new THREE.MeshBasicMaterial({ color: COL.ice, transparent: true, opacity: 0.72, side: THREE.DoubleSide });
+
     // ── BALL-FIELD shared geometry + material (built ONCE, reused for every ball). ──
     // A modest-poly unit sphere (radius 1, scaled per ball) keeps the pile light: one
     // geometry + one material shared across all balls (player + rival), so a 14-ball pile
@@ -335,6 +343,11 @@ export class Renderer {
     // the gap height reads "how low" at a glance (WYSIWYG). One per lane.
     this._buildCeilings(physics, 0, topMat, sideMat);
     if (rivalSpec) this._buildCeilings(physics, this.rivalLaneZ, topMat, sideMat);
+
+    // ICE — a frosty pale-cyan sheet laid ON the road over each slippery stretch (the 빙판
+    // gimmick). Purely cosmetic (the slip is gated in physics); it just shows WHERE the ice is.
+    this._buildIce(physics, 0);
+    if (rivalSpec) this._buildIce(physics, this.rivalLaneZ);
 
     // SPLIT-PATH FORK — the HIGH ARCH (a hook-gated steep staircase up → flat top → staircase
     // down) rendered as its OWN ribbon ABOVE the lane. The LOW underpass route is part of the
@@ -802,6 +815,56 @@ export class Renderer {
       geo.computeVertexNormals();
       const mesh = new THREE.Mesh(geo, this._roadMat);
       mesh.userData.ribbon = true;
+      this.trackGroup.add(mesh);
+    }
+  }
+
+  /** Build the ICE overlay: a thin frosty pale-cyan sheet following the lane path over each
+   * `physics.iceBodies` region, sitting JUST above the road surface (a sheen of ice on the
+   * track). Cosmetic only — the slip is gated in physics (_blockedByIce). One welded strip per
+   * ice region per lane; shares _iceMat (one draw call each). The strip is a flat top face plus
+   * a shallow front lip so it reads as a raised frosty sheet from the side-ish camera. */
+  _buildIce(physics, laneZ) {
+    const ices = physics.iceBodies;
+    if (!ices || !ices.length) return;
+    const half = RIBBON_DEPTH / 2;
+    const LIFT = 0.06;     // world-u the sheet sits ABOVE the road top (so it doesn't z-fight the road)
+    const LIP = 0.12;      // shallow front/side lip depth so the sheet reads as a raised slab
+    for (const c of ices) {
+      const xs = [];
+      const span = c.x1 - c.x0;
+      const n = Math.max(1, Math.floor(span / RIBBON_DX));
+      for (let k = 0; k <= n; k++) xs.push(c.x0 + span * (k / n));
+      const topPy = c.surfaceY - LIFT;        // sheet top (physics y, +down ⇒ higher = smaller)
+      const lipPy = c.surfaceY + LIP;         // lip bottom, just into the road
+      const pos = [], idxA = [];
+      const N = xs.length;
+      const rb = (i) => i * 4;                // 4 verts/ring: near-top, far-top, near-lip, far-lip
+      for (let i = 0; i < N; i++) {
+        const x = xs[i];
+        const Nt = this.path.transform(x, laneZ - half, topPy, this._tpL);
+        const Ft = this.path.transform(x, laneZ + half, topPy, this._tpR);
+        const Nl = this.path.transform(x, laneZ - half, lipPy, this._tpLb);
+        const Fl = this.path.transform(x, laneZ + half, lipPy, this._tpRb);
+        pos.push(Nt.x, Nt.y, Nt.z,  Ft.x, Ft.y, Ft.z,  Nl.x, Nl.y, Nl.z,  Fl.x, Fl.y, Fl.z);
+        if (i > 0) {
+          const p = rb(i - 1), q = rb(i);
+          idxA.push(p + 0, q + 0, p + 1,  p + 1, q + 0, q + 1);   // TOP sheet
+          idxA.push(p + 0, p + 2, q + 0,  q + 0, p + 2, q + 2);   // near lip
+          idxA.push(p + 1, q + 1, p + 3,  p + 3, q + 1, q + 3);   // far lip
+        }
+        if (i === 0 || i === N - 1) {                            // end caps
+          const b = rb(i);
+          idxA.push(b + 0, b + 1, b + 2,  b + 2, b + 1, b + 3);
+        }
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+      geo.setIndex(idxA);
+      geo.computeVertexNormals();
+      const mesh = new THREE.Mesh(geo, this._iceMat);
+      mesh.userData.iceOverlay = true;       // NOT a road ribbon — a separate decorative sheet (excluded from the road-ribbon gates)
+      mesh.renderOrder = 2;                  // draw after the road so the translucent sheet blends over it
       this.trackGroup.add(mesh);
     }
   }
@@ -1644,7 +1707,7 @@ export class Renderer {
    * track/leg group is torn down, or the next build would render with a dead material. */
   _isSharedMat(m) {
     return m === this._legMat || m === this._roadMat || m === this._topMat || m === this._sideMat
-      || m === this._ballMat || m === this._blockMat || m === this._debrisMat;
+      || m === this._ballMat || m === this._blockMat || m === this._debrisMat || m === this._iceMat;
   }
 
   /** True for the SHARED textures (built once in the constructor, reused forever). The

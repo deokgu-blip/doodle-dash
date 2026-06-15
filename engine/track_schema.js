@@ -6,7 +6,7 @@
 // Engine MUST only LOAD this data; never hardcode level values.
 
 /**
- * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'|'blocks'|'fork'|'curve'} SegmentKind
+ * @typedef {'flat'|'stairs'|'ramp'|'gap'|'wall'|'bumps'|'tunnel'|'planks'|'balls'|'blocks'|'fork'|'curve'|'ice'} SegmentKind
  */
 
 /**
@@ -179,7 +179,7 @@ export const SEGMENT_DEFAULTS = Object.freeze({
 });
 
 /** @type {SegmentKind[]} */
-export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls', 'blocks', 'fork', 'curve'];
+export const SEGMENT_KINDS = ['flat', 'stairs', 'ramp', 'gap', 'wall', 'bumps', 'tunnel', 'planks', 'balls', 'blocks', 'fork', 'curve', 'ice'];
 
 /** Read a segment's heading change (degrees) — accepts either `turn` or `turnDeg`. Default 0. */
 export function segTurnDeg(s) {

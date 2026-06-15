@@ -200,6 +200,13 @@ export class Game {
       }
       else if (s.kind === 'wall' || s.kind === 'gap') gates.push({ x: s.x0, need: 'long' });
       else if (s.kind === 'ramp' && s.steepGate && !s.gap) gates.push({ x: s.x0, need: 'hook' });
+      else if (s.kind === 'ice') {
+        // ICE: only a TOOTHED zigzag (아이젠) grips — swap to 'zigzag' at the ice mouth, then
+        // RELEASE back to the fast default (long) at the ice EXIT (like the tunnel release) so the
+        // rival doesn't drag the short grippy leg across the open terrain after.
+        gates.push({ x: s.x0, need: 'grippy' });
+        gates.push({ x: s.x1, need: 'long', release: true });
+      }
       else if (s.kind === 'fork') {
         // SPLIT-PATH FORK: the LEG SHAPE routes the rival exactly like the player (commit-at-
         // entrance in walker.update from _isHook). We schedule a HOOK at the fork so BOLT takes
@@ -223,7 +230,7 @@ export class Game {
     // before the first gate typically wants to reach a wall/gap). Collapse consecutive
     // equal presets.
     const SWITCH_LEAD = 2.5; // world u before the gate to have swapped (clears countdown jitter)
-    const presetFor = (need) => (need === 'short' ? 'short' : (need === 'hook' ? 'hook' : 'long'));
+    const presetFor = (need) => (need === 'short' ? 'short' : (need === 'hook' ? 'hook' : (need === 'grippy' ? 'zigzag' : 'long')));
     const out = [{ x: -Infinity, preset: 'long' }];
     for (const gate of gates) {
       const p = presetFor(gate.need);

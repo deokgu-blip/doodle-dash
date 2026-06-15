@@ -129,15 +129,29 @@ const TUNE = {
   //       vertex and count DIRECTION REVERSALS (sign flips). A genuine hook turns the SAME
   //       way throughout (0 reversals); a zigzag alternates left-right-left (>=2 reversals).
   //       So a HOOK requires signReversals <= hookMaxReversals. This is LENGTH-ROBUST (a
-  //       SHORT clean ㄱ still has 0 reversals — unlike a sharp-fraction test that penalizes
+  //       SHORT clean ㄱ still has ~0 reversals — unlike a sharp-fraction test that penalizes
   //       short strokes), so a short hook IS a hook and a long scribble is NOT.
+  //       HAND-DRAW FORGIVING: a phone-drawn hook wobbles, so we only count REVERSALS among
+  //       corners sharper than `sharpAngleDeg` (40°, above finger-jitter) and tolerate up to
+  //       `hookMaxReversals` (2) honest wobble bends. A true scribble has MANY large (>40°)
+  //       alternating bends ⇒ rev=3 ⇒ still rejected. (Reproduced/tuned in _repro_hook.mjs.)
   // Measured on the normalized leg chain with a small lookahead window (so resampling
   // micro-jitter on a smooth arc/circle does not fake a corner). reach is IRRELEVANT — a
   // long straight leg is NOT a hook, a short clean ㄱ IS a hook, a long scribble is NOT.
   //   isHook = (maxTurnAngle >= hookAngleDeg) && (signReversals <= hookMaxReversals)
   hookAngleDeg: 70,      // degrees — a clear corner this sharp is needed (genuine hooks≈75–78°; non-hooks: wheel 50, limb_long 52, arc_big 44 ⇒ all below)
-  sharpAngleDeg: 20,     // degrees — a chain vertex turning at least this much counts as a "sharp" corner whose TURN DIRECTION we track (for the reversal/scribble test)
-  hookMaxReversals: 0,   // max direction reversals among sharp corners for a HOOK (clean ㄱ/J/L curls ONE way ⇒ 0; zigzag alternates ⇒ >=2 ⇒ FAILS — can't grip with a wiggle)
+  // FORGIVING SCRIBBLE TEST (hand-draw tuned): a phone-drawn hook has finger WOBBLE — small
+  // perpendicular jitter on the shaft. At a LOW sharp threshold (old 20°) that jitter fakes
+  // many tiny "sharp corners" that flip direction, so a clean ㄱ measured rev=3–5 and was
+  // WRONGLY rejected (the live-test regression). Reproduction (scripts/_repro_hook.mjs) with
+  // 0.05 finger-noise: every genuine hook stays at rev≤1 once micro-turns under 40° are
+  // ignored, while a true scribble/zigzag keeps rev=3 (many LARGE alternating bends). So we
+  // (a) raise the sharp-corner threshold to 40° (finger jitter is < this; only genuine bends
+  // count for the direction-reversal test) and (b) tolerate up to 2 reversals (a couple of
+  // honest wobble bends are forgiven). Sweep: sharp=40/maxRev=2 ⇒ 36/36 hooks PASS, 9/9
+  // scribbles REJECTED (clean separation). maxRev=3 would let scribbles through ⇒ stays 2.
+  sharpAngleDeg: 40,     // degrees — a chain vertex must turn at LEAST this much to count as a "sharp" corner whose TURN DIRECTION we track (above finger-jitter; only genuine bends count for the scribble/reversal test)
+  hookMaxReversals: 2,   // max direction reversals among sharp corners for a HOOK (clean/wobbly ㄱ/J/L ⇒ rev≤1; a real scribble alternates left-right-left across many big bends ⇒ rev=3 ⇒ FAILS — can't grip with a wiggle)
   hookTurnWindow: 2,     // chain-sample lookahead each side for the turn-angle measure (smooths arc jitter, keeps sharp corners)
   // STEEP-RAMP GATE: an UPHILL ramp (physics slope<0) is "steep" (hook-gated) iff its
   // |slope| >= steepThresh. Gentle/medium uphills (|slope| < this) are NOT gated — any
@@ -3452,6 +3466,23 @@ export function presetStroke(name) {
   // is by SHAPE not reach: this short hook CLIMBS the steep staircase while a long straight is
   // blocked. ONE clean ~90° corner that curls ONE way (0 direction reversals) ⇒ a HOOK; not a scribble.
   if (name === 'hook_short') return [{ x: 0.0, y: -0.5 }, { x: 0.0, y: 0.0 }, { x: 0.5, y: 0.0 }];
+  // a REALISTIC hand-drawn ㄱ hook with FINGER WOBBLE — a phone-drawn stroke is densely
+  // sampled with slight perpendicular jitter on the shaft and foot. A clean ㄱ (down-shaft,
+  // right-foot) with small zig-zag noise (~0.05u peak). This MUST still classify as a HOOK
+  // (the live-test regression was that wobble fooled the old strict gate). The single
+  // dominant ~90° bend dominates; the jitter never produces >40° genuine corners ⇒ rev≤1.
+  if (name === 'hook_wobble') return [
+    { x: -0.10, y: -0.70 }, { x: -0.07, y: -0.55 }, { x: -0.12, y: -0.40 }, { x: -0.08, y: -0.25 },
+    { x: -0.11, y: -0.10 }, { x: -0.07, y: 0.05 }, { x: -0.12, y: 0.20 }, { x: -0.08, y: 0.35 },
+    { x: -0.10, y: 0.48 }, { x: 0.04, y: 0.52 }, { x: 0.18, y: 0.47 }, { x: 0.32, y: 0.53 },
+    { x: 0.46, y: 0.48 }, { x: 0.60, y: 0.52 },
+  ];
+  // a CLEAR multi-zigzag scribble (NOT a hook): many LARGE alternating bends — must be
+  // REJECTED by the scribble gate (rev=3+ at sharp corners). Distinct alias of `zigzag`.
+  if (name === 'scribble') return [
+    { x: 0.0, y: 0.0 }, { x: 0.30, y: 0.18 }, { x: -0.12, y: 0.36 }, { x: 0.34, y: 0.54 },
+    { x: -0.08, y: 0.72 }, { x: 0.36, y: 0.90 }, { x: -0.05, y: 1.05 },
+  ];
   if (name === 'limb') return [{ x: 0.0, y: 0.0 }, { x: 0.0, y: 0.55 }, { x: 0.45, y: 0.95 }];
   // §E: a LONGER demo/verify limb so the drawn leg reads as a real long stride
   // (more pronounced two-leg gait). Farthest sample ≈1.6 (clamps under LEG_REACH_MAX 1.7).

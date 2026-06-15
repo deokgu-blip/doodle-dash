@@ -687,10 +687,13 @@ export class Renderer {
       pos.push(Nt.x, Nt.y, Nt.z,  Ft.x, Ft.y, Ft.z);
       uv.push(u, TOP_V,  u, TOP_V);
       col.push(1, 1, 1,  1, 1, 1);
-      // SIDE copies (edge colour, white-swatch zone): nearTop, nearBot, farTop, farBot.
+      // SIDE copies — STRIPED (white colour + STRIPE-zone V) so the band pattern WRAPS down the
+      // side faces (the reference look) instead of a solid edge tint. u = x ⇒ each band continues
+      // straight down the wall at its x (constant V down the wall ⇒ the top band's colour fills
+      // the side). nearTop, nearBot, farTop, farBot. (E/SIDE_V kept for any legacy caller.)
       pos.push(Nt.x, Nt.y, Nt.z,  Nb.x, Nb.y, Nb.z,  Ft.x, Ft.y, Ft.z,  Fb.x, Fb.y, Fb.z);
-      uv.push(u, SIDE_V,  u, SIDE_V,  u, SIDE_V,  u, SIDE_V);
-      col.push(E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2]);
+      uv.push(u, TOP_V,  u, TOP_V,  u, TOP_V,  u, TOP_V);
+      col.push(1, 1, 1,  1, 1, 1,  1, 1, 1,  1, 1, 1);
 
       const breakBefore = i > 0 && breakAfter[i - 1];
       if (i > 0 && !breakBefore) {
@@ -1531,11 +1534,15 @@ export class Renderer {
     //   BEHIND_T : behind the cube along -tangent (was the -3.2 in x)
     //   SIDE_LAT : to the +z camera side along +lateral (was the 10.6/11.2 in z)
     //   FWD_T    : look a little ahead along +tangent (was the +1.5 in x)
-    const BEHIND_T = -3.2;
-    const SIDE_LAT = racing ? 11.2 : 10.6;
-    const camYoff = racing ? 5.0 : 4.5;
-    const FWD_T = 1.5;
-    const lookLat = racing ? this.rivalLaneZ * 0.30 : 0;
+    // FAR reference framing (user: "카메라 더 멀리"): pulled back ~50% so the cube reads small
+    // and a long stretch of the winding ribbon(s) is visible, like the reference clip. Racing
+    // pulls back MORE + looks toward the mid-point between the lanes so BOTH the player and the
+    // far-side rival track frame together.
+    const BEHIND_T = -5.0;
+    const SIDE_LAT = racing ? 17.5 : 15.0;
+    const camYoff = racing ? 8.0 : 7.0;
+    const FWD_T = 2.0;
+    const lookLat = racing ? this.rivalLaneZ * 0.42 : 0;
     const cosH = Math.cos(hc), sinH = Math.sin(hc);
     // path-local basis in the horizontal (XZ) plane:
     //   tangent  T   = ( cosH, sinH)   (+x at hc=0)

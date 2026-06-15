@@ -14,7 +14,7 @@
     { "kind": "ramp", "length": 4, "height": 3.4, "rough": 0.9, "_note": "HOOK — steep UP ramp (slope 0.85 >= 0.6 ⇒ hook-gated). Only a hook grips & climbs; smooth/short legs slip at the foot (struggle-in-place)." },
     { "kind": "ramp", "length": 5, "height": -3.4, "rough": 0.9, "_note": "recovery DOWN ramp (slope 0.68, descending ⇒ NOT gated)." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
-    { "kind": "ice", "length": 9, "rough": 0.9, "_note": "SPIKY — slippery; smooth/hook legs spin in place, only a TOOTHED zigzag (아이젠) grips & crosses." },
+    { "kind": "flat", "length": 9, "rough": 0.9, "_note": "ICE gimmick REMOVED per user request — was a slippery 'ice' segment; replaced with flat (same length) so the course/finishX is unchanged. Ice engine code kept dormant." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
 
     { "kind": "tunnel", "length": 8, "clearance": 0.95, "rough": 0.9, "_note": "SHORT" },
@@ -26,7 +26,7 @@
     { "kind": "ramp", "length": 4, "height": 3.4, "rough": 0.9, "_note": "HOOK — steep UP ramp." },
     { "kind": "ramp", "length": 5, "height": -3.4, "rough": 0.9, "_note": "recovery DOWN ramp." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
-    { "kind": "ice", "length": 9, "rough": 0.9, "_note": "SPIKY" },
+    { "kind": "flat", "length": 9, "rough": 0.9, "_note": "ICE removed → flat (same length)." },
     { "kind": "flat", "length": 4, "rough": 0.9 },
 
     { "kind": "planks", "count": 6, "plankLen": 1.4, "gapLen": 1.0, "gapDepth": 1.6, "rough": 0.9, "_note": "LONG — long stride sails over the plank voids; a short leg drops into the recovery trench (slow)." },
@@ -39,7 +39,7 @@
     { "kind": "ramp", "length": 4, "height": 3.2, "rough": 0.9, "_note": "HOOK — steep UP ramp (slope 0.8)." },
     { "kind": "ramp", "length": 5, "height": -3.2, "rough": 0.9, "_note": "recovery DOWN ramp." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
-    { "kind": "ice", "length": 8, "rough": 0.9, "_note": "SPIKY" },
+    { "kind": "flat", "length": 8, "rough": 0.9, "_note": "ICE removed → flat (same length)." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
     { "kind": "bumps", "length": 10, "amp": 0.5, "freq": 3, "rough": 0.9, "_note": "TEXTURE — wavy run-up to the finish (any leg)." },
     { "kind": "flat", "length": 16, "rough": 0.9, "_note": "RUN-OUT to the finish line (finishX 216 sits ~2.6u in; ~13u of track after for roll-out)." }
@@ -47,7 +47,7 @@
   "rival": {
     "legPreset": "limb_long",
     "pace": 0.83,
-    "laneOffset": 2.8,
+    "laneOffset": 7.0,
     "name": "BOLT",
     "_note": "BOLT auto-swaps its leg per gimmick (game.js _buildRivalSchedule: short@tunnel, long@gap/planks, hook@steep-ramp, zigzag@ice, long default). pace will be re-tuned by scripts/verify_t01.mjs RACE gates after this course redesign (stairs removed, ice + steep ramps added, course length changed)."
   }

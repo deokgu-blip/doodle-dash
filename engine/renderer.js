@@ -148,9 +148,22 @@ export class Renderer {
     // band colour changes along the path's U axis (forward x), so as the cube advances it
     // crosses one band after another (a striped road), NOT a busy checker grid.
     this._stripeTex = this._makeStripes();
-    // TOP is UNLIT (MeshBasicMaterial): the stripe top ignores scene lighting and
-    // always renders at the texture's full vivid colour at ANY camera angle.
-    // DoubleSide so the top face shows regardless of triangle winding.
+    // ── ONE ROAD MATERIAL (ONE draw call per welded road mesh) ──────────────────────────
+    // The whole road (stripe TOP + edge-coloured SIDES/risers/bottom/caps) renders from a
+    // SINGLE unlit material now, so each welded lane mesh is ONE draw call instead of two
+    // (the old top-strip + side-strip were two materials = two draws). It uses the two-zone
+    // stripe texture (_makeStripes) + PER-VERTEX colour: top verts sample the STRIPE zone
+    // with WHITE vertex colour (stripe shows at full), side/riser/bottom/cap verts sample the
+    // WHITE swatch zone with the EDGE colour as vertex colour (white×edge = solid edge tint).
+    // UNLIT (MeshBasicMaterial): the road ignores scene lighting (flat vivid colour at any
+    // angle). DoubleSide so faces show regardless of winding (and the ㅁ end caps stay solid).
+    this._roadMat = new THREE.MeshBasicMaterial({ map: this._stripeTex, vertexColors: true, side: THREE.DoubleSide });
+    // edge colour as a normalised RGB triple reused for every side vertex colour (no alloc in
+    // the hot build loop). trackEdge = 0x5E2480.
+    this._edgeRGB = [((COL.trackEdge >> 16) & 255) / 255, ((COL.trackEdge >> 8) & 255) / 255, (COL.trackEdge & 255) / 255];
+    // LEGACY top/side materials kept for any non-welded caller (none after this change). The
+    // welded builders use _roadMat. (_topMat retained so older capture scripts referencing it
+    // don't crash; both are protected as shared in _isSharedMat.)
     this._topMat = new THREE.MeshBasicMaterial({ map: this._stripeTex, side: THREE.DoubleSide });
     // The side/under/end faces of the CLOSED box. PERF (§B.2): FrontSide (default
     // back-face culling) — the box is FULLY CLOSED (near+far walls, bottom, AND first/
@@ -604,95 +617,97 @@ export class Renderer {
     };
     const half = RIBBON_DEPTH / 2;
 
-    // Build a top strip (2 rails) + a bottom strip (2 rails, dropped RIBBON_DOWN) so
-    // we get a top face (stripes) + the two side walls + a bottom (edge colour).
-    const topPos = [], topUV = [], topIdx = [];
-    const sidePos = [], sideIdx = [];
-    let topV = 0, sideV = 0;
-    let prevX = null;
-    const N = xs.length;
-    // STRIPE mapping: the stripe texture has STRIPE_BANDS bands per repeat that change
-    // along the U axis (the path's FORWARD x). U = x*RIBBON_USCALE, so one band spans
-    // (1/RIBBON_USCALE)/STRIPE_BANDS ≈ 1.19u of world-x — a clean transverse rhythm (a
-    // band a touch under the 1.5u path width reads as the reference's chunky bars, not a
-    // busy grid). V is the across-path coord (0→1) — the stripes are CONSTANT in V (they
-    // run straight across the band), so vRepeat is just a single span.
+    // ── ONE WELDED ROAD MESH per lane, ONE material, ONE DRAW CALL (no z-fighting) ──────
+    // The OLD builder made TWO separate strips (top strip + side strip). At every STAIR
+    // RISER the two same-x rings made the TOP strip emit a vertical riser quad (plane
+    // x=const) AND the SIDE strip emit its near-wall + far-wall + bottom quads — which,
+    // because BOTH rings share that x, ALSO collapse into the SAME plane x=const. So 3 side
+    // faces + 1 top face stacked coplanar at every riser ⇒ Z-FIGHTING ⇒ the "자글자글"
+    // flickering seams on the moving phone (root cause confirmed: 15 coplanar [1,0,0] face
+    // pairs across the two strips on a 5-step staircase). And being two meshes/materials it
+    // was two draw calls per lane.
+    //
+    // THE FIX: build the whole road — tread tops, ramp/flat tops, the vertical RISER fronts,
+    // the side walls, the bottom, the ㅁ end caps — as ONE welded BufferGeometry rendered by
+    // ONE material (_roadMat). At a riser we emit the step front ONCE and SKIP the degenerate
+    // zero-x-length side walls/bottom that used to collapse onto it ⇒ NO overlapping faces.
+    // The look (purple stripe TOP, edge-coloured SIDES) comes from PER-VERTEX COLOUR + the
+    // two-zone stripe texture: TOP-surface verts are WHITE + sample the stripe zone (stripe
+    // shows full); SIDE verts are the EDGE colour + sample the white swatch (white×edge =
+    // solid edge). nearTop/farTop are DUPLICATED (a white top copy + an edge side copy) so a
+    // shared vertex never has to be both colours. One material ⇒ ONE draw call per lane.
+    const pos = [], uv = [], col = [];
+    const idxA = [];                       // single index buffer (one material, one draw)
     const uScale = RIBBON_USCALE;
-    const vRepeat = 1;
+    const TOP_V = 0.25, SIDE_V = 0.75;     // stripe zone (V<0.5) vs white swatch zone (V>=0.5)
+    const E = this._edgeRGB;               // [r,g,b] edge colour for side verts
+    const N = xs.length;
+    // Per ring: 6 verts — 0,1 = TOP-surface copies (nearTop, farTop): WHITE, stripe UV (used
+    // by the TOP face); 2,3,4,5 = SIDE copies (nearTop, nearBot, farTop, farBot): EDGE colour,
+    // white-swatch UV (used by walls/bottom/risers/caps). Risers reference the SIDE copies so
+    // the step front is a solid edge-coloured face (the reference look).
+    const rb = (i) => i * 6;
     for (let i = 0; i < N; i++) {
       const x = xs[i];
       const sy = surfY(x, yHints[i]);       // physics surface y (+down) — exact profile y at risers
       const syB = sy + RIBBON_DOWN;         // slab bottom (dropped) in physics y
-      // PATH TRANSFORM: the band's two long edges are PERPENDICULAR to the heading at
-      // L = laneZ ± half, so the band TURNS WITH THE PATH (no z-shear). At heading 0 these
-      // reduce to (x, -sy, laneZ∓half) — identical to the old zN/zF placement.
-      const N0 = this.path.transform(x, laneZ - half, sy, this._tpL);   // near edge top
-      const F0 = this.path.transform(x, laneZ + half, sy, this._tpR);   // far edge top
-      const nTx = N0.x, nTy = N0.y, nTz = N0.z, fTx = F0.x, fTy = F0.y, fTz = F0.z;
-      // TOP strip: 2 verts (near, far) at the surface.
-      topPos.push(nTx, nTy, nTz, fTx, fTy, fTz);
-      topUV.push(x * uScale, 0, x * uScale, vRepeat);
-      // SIDE/bottom strip: top edges (= surface) + bottom edges (dropped). The bottom
-      // edges share the SAME lateral L (perpendicular), just a lower height.
-      const Nb = this.path.transform(x, laneZ - half, syB, this._tpL);  // near edge bottom
-      const nBx = Nb.x, nBy = Nb.y, nBz = Nb.z;
-      const Fb = this.path.transform(x, laneZ + half, syB, this._tpR);  // far edge bottom
-      const fBx = Fb.x, fBy = Fb.y, fBz = Fb.z;
-      sidePos.push(
-        nTx, nTy, nTz,  nBx, nBy, nBz,   // near wall top, bottom
-        fTx, fTy, fTz,  fBx, fBy, fBz    // far wall top, bottom
-      );
-      // PLANKS VOID: a break BEFORE this ring (the previous span was a void) ⇒ do NOT
-      // bridge a quad across the empty space, and the previous ring CLOSES its board.
+      // PATH TRANSFORM: band edges PERPENDICULAR to the heading at L = laneZ ± half (turns
+      // with the path, no z-shear). At heading 0 ⇒ (x, -sy, laneZ∓half) — old placement.
+      const Nt = this.path.transform(x, laneZ - half, sy, this._tpL);   // near top
+      const Ft = this.path.transform(x, laneZ + half, sy, this._tpR);   // far top
+      const Nb = this.path.transform(x, laneZ - half, syB, this._tpL);  // near bottom
+      const Fb = this.path.transform(x, laneZ + half, syB, this._tpR);  // far bottom
+      const u = x * uScale;
+      // TOP-surface copies (white, stripe zone). V is constant in the stripe zone (stripes
+      // vary only along U), so both rails sit at TOP_V.
+      pos.push(Nt.x, Nt.y, Nt.z,  Ft.x, Ft.y, Ft.z);
+      uv.push(u, TOP_V,  u, TOP_V);
+      col.push(1, 1, 1,  1, 1, 1);
+      // SIDE copies (edge colour, white-swatch zone): nearTop, nearBot, farTop, farBot.
+      pos.push(Nt.x, Nt.y, Nt.z,  Nb.x, Nb.y, Nb.z,  Ft.x, Ft.y, Ft.z,  Fb.x, Fb.y, Fb.z);
+      uv.push(u, SIDE_V,  u, SIDE_V,  u, SIDE_V,  u, SIDE_V);
+      col.push(E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2]);
+
       const breakBefore = i > 0 && breakAfter[i - 1];
       if (i > 0 && !breakBefore) {
-        // TOP quad between ring i-1 and i.
-        const a = (i - 1) * 2, b = a + 1, c = i * 2, d = c + 1;
-        topIdx.push(a, c, b, b, c, d);
-        // SIDE walls (near + far) + bottom quad. Each ring has 4 side verts:
-        //   base+0 nearTop, +1 nearBot, +2 farTop, +3 farBot.
-        const p = (i - 1) * 4, q = i * 4;
-        // near wall (facing -z / camera): nearTop/nearBot
-        sideIdx.push(p + 0, p + 1, q + 0, q + 0, p + 1, q + 1);
-        // far wall (facing +z)
-        sideIdx.push(p + 2, q + 2, p + 3, p + 3, q + 2, q + 3);
-        // bottom (facing down): nearBot/farBot
-        sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);
+        const p = rb(i - 1), q = rb(i);
+        // SIDE-copy offsets within a ring: +2 nearTop, +3 nearBot, +4 farTop, +5 farBot.
+        const isRiser = Math.abs(xs[i] - xs[i - 1]) < 1e-6;
+        if (isRiser) {
+          // RISER: the two rings share x ⇒ a vertical step FRONT. Emit it ONCE (edge colour),
+          // SKIP the degenerate near/far/bottom quads that would collapse onto this plane and
+          // z-fight (the old bug). Near/far walls stay continuous via the shared SIDE verts.
+          idxA.push(p + 2, p + 4, q + 2,  q + 2, p + 4, q + 4);   // step front (edge colour)
+        } else {
+          // FLAT / RAMP / TREAD-TOP span: TOP face (white→stripe) + near/far walls + bottom
+          // (edge colour). Distinct planes — no coplanar duplication.
+          idxA.push(p + 0, q + 0, p + 1,  p + 1, q + 0, q + 1);   // TOP face (top copies 0,1)
+          idxA.push(p + 2, p + 3, q + 2,  q + 2, p + 3, q + 3);   // near wall (-z)
+          idxA.push(p + 4, q + 4, p + 5,  p + 5, q + 4, q + 5);   // far wall (+z)
+          idxA.push(p + 3, p + 5, q + 3,  q + 3, p + 5, q + 5);   // bottom (-y)
+        }
       }
-      // ── END CAPS (ㅁ closure): the cross-section quad so every box is fully closed —
-      //    no hollow see-through at the path ends OR at a PLANKS void boundary. We cap
-      //    the FIRST/LAST ring of the whole lane AND the ring on EACH side of a void
-      //    (this ring if a break is BEFORE it = a board's left face; or if a break is
-      //    AFTER it = a board's right face). Each ring's 4 side verts (nearTop +0,
-      //    nearBot +1, farTop +2, farBot +3) form the cap quad; DoubleSide ⇒ solid. ──
+      // ── END CAPS (ㅁ closure): cross-section quad at the lane ends + each side of a PLANKS
+      //    void so every box is fully closed. Double-wound ⇒ solid from either face. Uses the
+      //    SIDE copies (edge colour) so the cap is the same edge tone as the walls. ──
       const capHere = (i === 0 || i === N - 1) || breakBefore || breakAfter[i];
       if (capHere) {
-        const b4 = i * 4;
-        sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
-        // ...AND the reverse winding so the cap is solid from EITHER face. The side
-        // material is FrontSide (perf): a single-winding cap got back-face-culled from
-        // the camera ⇒ the cross-section read as an OPEN ㄷ. Both windings ⇒ filled ㅁ.
-        // (Only the cap quads are double-wound — negligible fill; walls stay culled.)
-        sideIdx.push(b4 + 0, b4 + 3, b4 + 2, b4 + 0, b4 + 1, b4 + 3);
+        const b = rb(i);
+        idxA.push(b + 2, b + 4, b + 5,  b + 2, b + 5, b + 3);
+        idxA.push(b + 2, b + 5, b + 4,  b + 2, b + 3, b + 5);
       }
-      prevX = x;
     }
-    const topGeo = new THREE.BufferGeometry();
-    topGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(topPos), 3));
-    topGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(topUV), 2));
-    topGeo.setIndex(topIdx);
-    topGeo.computeVertexNormals();
-    const topMesh = new THREE.Mesh(topGeo, topMat);
-    topMesh.userData.ribbon = true;
-    this.trackGroup.add(topMesh);
-
-    const sideGeo = new THREE.BufferGeometry();
-    sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
-    sideGeo.setIndex(sideIdx);
-    sideGeo.computeVertexNormals();
-    const sideMesh = new THREE.Mesh(sideGeo, sideMat);
-    sideMesh.userData.ribbon = true;
-    this.trackGroup.add(sideMesh);
+    // ONE geometry, ONE mesh, ONE material ⇒ ONE draw call per lane. Welded — top + sides +
+    // risers share one vertex buffer with NO duplicate coplanar faces ⇒ no z-fighting.
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uv), 2));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col), 3));
+    geo.setIndex(idxA);
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, this._roadMat);
+    mesh.userData.ribbon = true;
+    this.trackGroup.add(mesh);
   }
 
   /** Build the TUNNEL as a ROOF made of the SAME TRACK RIBBON laid OVERHEAD (the
@@ -730,59 +745,50 @@ export class Renderer {
       const underPy = c.ceilingY;            // underside physics y (the surface a too-long leg hits)
       const topPy = c.ceilingY - RIBBON_DOWN; // bright stripe top of the overhead board (physics y)
 
-      const topPos = [], topUV = [], topIdx = [];
-      const sidePos = [], sideIdx = [];
+      // ONE welded overhead board per tunnel, ONE material, ONE draw call (top stripes +
+      // walls + underside). No risers (it's a flat board). Same per-vertex-colour scheme as
+      // the floor ribbon: TOP-surface verts WHITE + stripe UV, SIDE verts EDGE colour + white
+      // swatch UV. 6 verts/ring (2 top copies + 4 side copies) so a vert is never two colours.
+      const pos = [], uv = [], col = [];
+      const idxA = [];
+      const E = this._edgeRGB, TOP_V = 0.25, SIDE_V = 0.75;
       const N = xs.length;
+      const rb = (i) => i * 6;
       for (let i = 0; i < N; i++) {
         const x = xs[i];
         // PATH TRANSFORM: same lane centre + heading as the floor, edges perpendicular.
         const Nt = this.path.transform(x, laneZ - half, topPy, this._tpL);
         const Ft = this.path.transform(x, laneZ + half, topPy, this._tpR);
-        const ntX = Nt.x, ntY = Nt.y, ntZ = Nt.z, ftX = Ft.x, ftY = Ft.y, ftZ = Ft.z;
-        // TOP strip (checker) at the board's top face.
-        topPos.push(ntX, ntY, ntZ, ftX, ftY, ftZ);
-        topUV.push(x * uScale, 0, x * uScale, vRepeat);
-        // SIDE/underside strip: top edges (= board top) + bottom edges (= underside).
-        const Nu = this.path.transform(x, laneZ - half, underPy, this._tpL);
-        const Fu = this.path.transform(x, laneZ + half, underPy, this._tpR);
-        sidePos.push(
-          ntX, ntY, ntZ,  Nu.x, Nu.y, Nu.z,    // near wall top, bottom (underside)
-          ftX, ftY, ftZ,  Fu.x, Fu.y, Fu.z     // far wall top, bottom (underside)
-        );
+        const Nu = this.path.transform(x, laneZ - half, underPy, this._tpL);  // near underside
+        const Fu = this.path.transform(x, laneZ + half, underPy, this._tpR);  // far underside
+        const u = x * uScale;
+        pos.push(Nt.x, Nt.y, Nt.z,  Ft.x, Ft.y, Ft.z);                        // TOP copies (white)
+        uv.push(u, TOP_V,  u, TOP_V); col.push(1, 1, 1,  1, 1, 1);
+        pos.push(Nt.x, Nt.y, Nt.z,  Nu.x, Nu.y, Nu.z,  Ft.x, Ft.y, Ft.z,  Fu.x, Fu.y, Fu.z); // SIDE copies (edge)
+        uv.push(u, SIDE_V,  u, SIDE_V,  u, SIDE_V,  u, SIDE_V);
+        col.push(E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2]);
         if (i > 0) {
-          const a = (i - 1) * 2, b = a + 1, cc = i * 2, d = cc + 1;
-          topIdx.push(a, cc, b, b, cc, d);
-          const p = (i - 1) * 4, q = i * 4;
-          // near wall
-          sideIdx.push(p + 0, p + 1, q + 0, q + 0, p + 1, q + 1);
-          // far wall
-          sideIdx.push(p + 2, q + 2, p + 3, p + 3, q + 2, q + 3);
-          // UNDERSIDE (faces down — the head-room surface a long leg strikes)
-          sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);
+          const p = rb(i - 1), q = rb(i);
+          idxA.push(p + 0, q + 0, p + 1,  p + 1, q + 0, q + 1);   // TOP (stripes; copies 0,1)
+          idxA.push(p + 2, p + 3, q + 2,  q + 2, p + 3, q + 3);   // near wall
+          idxA.push(p + 4, q + 4, p + 5,  p + 5, q + 4, q + 5);   // far wall
+          idxA.push(p + 3, p + 5, q + 3,  q + 3, p + 5, q + 5);   // UNDERSIDE (head-room)
         }
-        // END CAPS (ㅁ closure): cross-section quad at the FIRST and LAST ring so the
-        // overhead board is a fully closed box too — no hollow see-through at the ends.
-        if (i === 0 || i === N - 1) {
-          const b4 = i * 4;
-          sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
-          // reverse winding too ⇒ cap solid from either face (FrontSide side material).
-          sideIdx.push(b4 + 0, b4 + 3, b4 + 2, b4 + 0, b4 + 1, b4 + 3);
+        if (i === 0 || i === N - 1) {              // END CAPS (ㅁ closure)
+          const b = rb(i);
+          idxA.push(b + 2, b + 4, b + 5,  b + 2, b + 5, b + 3);
+          idxA.push(b + 2, b + 5, b + 4,  b + 2, b + 3, b + 5);
         }
       }
-      const topGeo = new THREE.BufferGeometry();
-      topGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(topPos), 3));
-      topGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(topUV), 2));
-      topGeo.setIndex(topIdx);
-      topGeo.computeVertexNormals();
-      const topMesh = new THREE.Mesh(topGeo, topMat);
-      this.trackGroup.add(topMesh);
-
-      const sideGeo = new THREE.BufferGeometry();
-      sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
-      sideGeo.setIndex(sideIdx);
-      sideGeo.computeVertexNormals();
-      const sideMesh = new THREE.Mesh(sideGeo, sideMat);
-      this.trackGroup.add(sideMesh);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uv), 2));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col), 3));
+      geo.setIndex(idxA);
+      geo.computeVertexNormals();
+      const mesh = new THREE.Mesh(geo, this._roadMat);
+      mesh.userData.ribbon = true;
+      this.trackGroup.add(mesh);
     }
   }
 
@@ -836,9 +842,16 @@ export class Renderer {
         const dx = b.x - a.x;
         return dx > 1e-9 ? a.y + (b.y - a.y) * ((x - a.x) / dx) : a.y;
       };
-      const topPos = [], topUV = [], topIdx = [];
-      const sidePos = [], sideIdx = [];
+      // ONE welded arch mesh per fork, ONE material, ONE draw call (top stripes + walls +
+      // bottom + the staircase RISER fronts). Same per-vertex-colour scheme as the floor
+      // ribbon: TOP-surface verts WHITE + stripe UV, SIDE verts EDGE colour + white swatch
+      // UV; 6 verts/ring (2 top copies + 4 side copies). Risers emit ONE edge-coloured step
+      // front and SKIP the degenerate side walls (no coplanar z-fight on the arch steps).
+      const pos = [], uv = [], col = [];
+      const idxA = [];
+      const E = this._edgeRGB, TOP_V = 0.25, SIDE_V = 0.75;
       const N = xs.length;
+      const rb = (i) => i * 6;
       for (let i = 0; i < N; i++) {
         const x = xs[i];
         const sy = profY(x);                       // arch surface physics y (+down)
@@ -851,42 +864,41 @@ export class Renderer {
         // PATH TRANSFORM: same lane centre + heading as the floor (+ the lateral split), edges perpendicular.
         const Nt = this.path.transform(x, laneZ + flat - half, sy, this._tpL);
         const Ft = this.path.transform(x, laneZ + flat + half, sy, this._tpR);
-        const ntX = Nt.x, ntY = Nt.y, ntZ = Nt.z, ftX = Ft.x, ftY = Ft.y, ftZ = Ft.z;
-        topPos.push(ntX, ntY, ntZ, ftX, ftY, ftZ);
-        topUV.push(x * uScale, 0, x * uScale, vRepeat);
         const Nb = this.path.transform(x, laneZ + flat - half, syB, this._tpL);
         const Fb = this.path.transform(x, laneZ + flat + half, syB, this._tpR);
-        sidePos.push(ntX, ntY, ntZ, Nb.x, Nb.y, Nb.z, ftX, ftY, ftZ, Fb.x, Fb.y, Fb.z);
+        const u = x * uScale;
+        pos.push(Nt.x, Nt.y, Nt.z,  Ft.x, Ft.y, Ft.z);                        // TOP copies (white)
+        uv.push(u, TOP_V,  u, TOP_V); col.push(1, 1, 1,  1, 1, 1);
+        pos.push(Nt.x, Nt.y, Nt.z,  Nb.x, Nb.y, Nb.z,  Ft.x, Ft.y, Ft.z,  Fb.x, Fb.y, Fb.z); // SIDE copies (edge)
+        uv.push(u, SIDE_V,  u, SIDE_V,  u, SIDE_V,  u, SIDE_V);
+        col.push(E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2],  E[0], E[1], E[2]);
         if (i > 0) {
-          const a = (i - 1) * 2, b = a + 1, cc = i * 2, d = cc + 1;
-          topIdx.push(a, cc, b, b, cc, d);
-          const p = (i - 1) * 4, q = i * 4;
-          sideIdx.push(p + 0, p + 1, q + 0, q + 0, p + 1, q + 1);     // near wall
-          sideIdx.push(p + 2, q + 2, p + 3, p + 3, q + 2, q + 3);     // far wall
-          sideIdx.push(p + 1, p + 3, q + 1, q + 1, p + 3, q + 3);     // bottom
+          const p = rb(i - 1), q = rb(i);
+          const isRiser = Math.abs(xs[i] - xs[i - 1]) < 1e-6;
+          if (isRiser) {
+            idxA.push(p + 2, p + 4, q + 2,  q + 2, p + 4, q + 4);   // step front (edge colour)
+          } else {
+            idxA.push(p + 0, q + 0, p + 1,  p + 1, q + 0, q + 1);   // TOP (stripes; copies 0,1)
+            idxA.push(p + 2, p + 3, q + 2,  q + 2, p + 3, q + 3);   // near wall
+            idxA.push(p + 4, q + 4, p + 5,  p + 5, q + 4, q + 5);   // far wall
+            idxA.push(p + 3, p + 5, q + 3,  q + 3, p + 5, q + 5);   // bottom
+          }
         }
         if (i === 0 || i === N - 1) {              // END CAPS (ㅁ closure)
-          const b4 = i * 4;
-          sideIdx.push(b4 + 0, b4 + 2, b4 + 3, b4 + 0, b4 + 3, b4 + 1);
-          sideIdx.push(b4 + 0, b4 + 3, b4 + 2, b4 + 0, b4 + 1, b4 + 3);
+          const b = rb(i);
+          idxA.push(b + 2, b + 4, b + 5,  b + 2, b + 5, b + 3);
+          idxA.push(b + 2, b + 5, b + 4,  b + 2, b + 3, b + 5);
         }
       }
-      const topGeo = new THREE.BufferGeometry();
-      topGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(topPos), 3));
-      topGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(topUV), 2));
-      topGeo.setIndex(topIdx);
-      topGeo.computeVertexNormals();
-      const topMesh = new THREE.Mesh(topGeo, topMat);
-      topMesh.userData.ribbon = true;             // counts as a track ribbon mesh
-      this.trackGroup.add(topMesh);
-
-      const sideGeo = new THREE.BufferGeometry();
-      sideGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sidePos), 3));
-      sideGeo.setIndex(sideIdx);
-      sideGeo.computeVertexNormals();
-      const sideMesh = new THREE.Mesh(sideGeo, sideMat);
-      sideMesh.userData.ribbon = true;
-      this.trackGroup.add(sideMesh);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uv), 2));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col), 3));
+      geo.setIndex(idxA);
+      geo.computeVertexNormals();
+      const mesh = new THREE.Mesh(geo, this._roadMat);
+      mesh.userData.ribbon = true;
+      this.trackGroup.add(mesh);
     }
   }
 
@@ -1517,22 +1529,30 @@ export class Renderer {
    * are the design-token track purples (--track-a #8E3AAE deep / --track-b #C24FD6
    * bright), staying vivid + on-palette. */
   _makeStripes() {
+    // TWO-ZONE texture so the WHOLE road renders in ONE draw call (one material) while still
+    // showing the purple STRIPE top AND the solid EDGE-coloured sides:
+    //   • V in [0, 0.5)  = the STRIPE zone: STRIPE_BANDS purple bands across U (the top rhythm).
+    //   • V in [0.5, 1]  = a solid WHITE swatch. SIDE/riser/bottom/cap verts sample HERE and
+    //     carry a per-vertex EDGE colour ⇒ white×edge = the solid edge colour (no stripe shows
+    //     through). TOP verts carry WHITE vertex colour ⇒ the stripe shows at full vivid tone.
+    // U wraps (RepeatWrapping) for the endless stripe rhythm; V is CLAMPED so the two zones
+    // never bleed under wrap. NearestFilter keeps band edges + the zone split crisp.
     const c = document.createElement('canvas');
-    c.width = 64; c.height = 8;            // small (1-D stripe along U); cached once
+    c.width = 64; c.height = 16;           // top 8px = stripes, bottom 8px = white swatch
     const ctx = c.getContext('2d');
-    // STRIPE_BANDS bands across the texture width; each band is a flat purple tone. With
-    // an even band count the wrap is seamless (last band of one repeat ≠ first of the next
-    // only if odd, so we keep it even).
     const bandW = c.width / STRIPE_BANDS;
     const TONES = ['#8E3AAE', '#C24FD6'];  // --track-a (deep) ↔ --track-b (bright)
     for (let i = 0; i < STRIPE_BANDS; i++) {
       ctx.fillStyle = TONES[i % 2];
-      ctx.fillRect(Math.round(i * bandW), 0, Math.ceil(bandW), c.height);
+      ctx.fillRect(Math.round(i * bandW), 0, Math.ceil(bandW), 8);   // STRIPE zone (top half)
     }
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 8, c.width, 8);        // WHITE swatch (bottom half) ⇒ ×edge-colour on sides
     const tex = new THREE.CanvasTexture(c);
     tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.magFilter = THREE.NearestFilter;   // crisp band edges (no muddy blur)
+    tex.wrapS = THREE.RepeatWrapping;      // endless stripe rhythm along U
+    tex.wrapT = THREE.ClampToEdgeWrapping; // keep the two V zones from bleeding into each other
+    tex.magFilter = THREE.NearestFilter;   // crisp band edges + zone split (no muddy blur)
     tex.minFilter = THREE.NearestFilter;   // and crisp at distance (avoid mip-averaging to a blob)
     tex.generateMipmaps = false;
     return tex;
@@ -1594,8 +1614,8 @@ export class Renderer {
    * in the constructor, reused on every rebuild). They must NEVER be disposed when a
    * track/leg group is torn down, or the next build would render with a dead material. */
   _isSharedMat(m) {
-    return m === this._legMat || m === this._topMat || m === this._sideMat || m === this._ballMat
-      || m === this._blockMat || m === this._debrisMat;
+    return m === this._legMat || m === this._roadMat || m === this._topMat || m === this._sideMat
+      || m === this._ballMat || m === this._blockMat || m === this._debrisMat;
   }
 
   /** True for the SHARED textures (built once in the constructor, reused forever). The

@@ -2,7 +2,7 @@
   "id": "T01",
   "theme": "first-steps",
   "startX": 0,
-  "finishX": 331.5,
+  "finishX": 319.5,
   "segments": [
     {
       "kind": "flat",
@@ -113,22 +113,12 @@
       "rough": 0.9
     },
     {
-      "kind": "fork",
-      "length": 12.0,
-      "highRise": 2.4,
-      "highSteps": 5,
-      "flatTop": 4,
-      "lowDip": 1.4,
-      "reachThresh": 1.0,
-      "rough": 0.9,
-      "_note": "SPLIT-PATH FORK (FIX 1) — the LEG LENGTH routes the cube (commit-at-entrance). LONG leg (reach >= reachThresh 1.0) => HIGH route: a MODERATE step-UP onto a RAISED parallel road (each up/down staircase run = (length-flatTop)/2 = (12-4)/2 = 4.0u; highRise 2.4 over 5 steps => each riser 0.48u, climbable by a long reach via canClimb but NOT a short one; NOT hook-gated — a length branch, not the steep-staircase gimmick) -> flat top on the raised road -> step back down -> rejoin. SHORT leg (reach < 1.0) => LOW route: a shallow ground valley (lowDip 1.4) -> back up -> rejoin. The two roads are CLEARLY SEPARATE PARALLEL lanes: the HIGH road is held off the lane centre on the lateral z-split (forkHighLat 2.6) AND raised, the LOW road stays on the centre lane AND dipped — separated in BOTH z and y the whole way, rejoining only at the ends. Both routes REJOIN at the same x and base y; this is a BRANCH not a gate (no soft-lock — every leg progresses). Route is committed once at the fork mouth by length and ridden out (mid-fork redraw does NOT switch roads => no teleport). BOTH routes are always rendered (high raised road + low ground road) so it reads as two parallel roads that merge."
-    },
-    {
       "kind": "bumps",
       "length": 10,
       "amp": 0.5,
       "freq": 3,
-      "rough": 0.9
+      "rough": 0.9,
+      "_note": "The SPLIT-PATH FORK that USED to sit between the preceding flat(4) and these bumps was REMOVED from the course (it read as a confusing split). The fork ENGINE code is kept (track_schema `fork` kind, walker fork build/_commitForkAt/forkLateralAt, renderer _buildForks) so it can be re-added later. The flat(4) ends at baseY=0 and these bumps start at baseY=0 (sin starts at 0, whole periods) => the join is continuous, NO discontinuity. finishX recomputed 331.5 -> 319.5 (removed the fork's 12u arc-length; the 35u run-out buffer past the last content is preserved)."
     },
     {
       "kind": "flat",
@@ -264,8 +254,9 @@
   ],
   "rival": {
     "legPreset": "limb_long",
-    "pace": 0.95,
+    "pace": 0.88,
     "laneOffset": 2.8,
-    "name": "BOLT"
+    "name": "BOLT",
+    "_note": "pace lowered 0.95 -> 0.88 when the SPLIT-PATH FORK was removed from the course. The fork's hook gate used to hand the rival a FAST (hook) leg through mid-course; removing it (plus the tunnel-exit leg RELEASE added in game.js _buildRivalSchedule) changed the rival's mid-course pace, so the pace is re-tuned so the ADAPTIVE player still WINS (rival finishes just behind) while a crippled player still LOSES (rival finishes well within budget). Verified by scripts/verify_t01.mjs RACE fast->WIN / short->LOSE gates."
   }
 }

@@ -188,7 +188,16 @@ export class Game {
     let prevStairX1 = -Infinity;
     let prevForkX1 = -Infinity;
     for (const s of segs) {
-      if (s.kind === 'tunnel') gates.push({ x: s.x0, need: 'short' });
+      if (s.kind === 'tunnel') {
+        gates.push({ x: s.x0, need: 'short' });
+        // RELEASE after the tunnel EXIT: a SHORT leg is only needed UNDER the low ceiling.
+        // Once past the tunnel the rival should return to its fast default (LONG) leg —
+        // otherwise it drags the slow short leg across all following NON-gated terrain
+        // (open flats / bumps / curve) until the NEXT gate, crawling needlessly. Emitted
+        // AT the exit (no SWITCH_LEAD ⇒ not inside the tunnel) and collapsed away if a
+        // gate immediately follows. Derived from the DATA (tunnel x1), never hardcoded.
+        gates.push({ x: s.x1, need: 'long', release: true });
+      }
       else if (s.kind === 'wall' || s.kind === 'gap') gates.push({ x: s.x0, need: 'long' });
       else if (s.kind === 'ramp' && s.steepGate && !s.gap) gates.push({ x: s.x0, need: 'hook' });
       else if (s.kind === 'fork') {
@@ -220,7 +229,9 @@ export class Game {
       const p = presetFor(gate.need);
       const last = out[out.length - 1];
       if (last.preset === p) continue;          // already on the right leg
-      out.push({ x: gate.x - SWITCH_LEAD, preset: p });
+      // RELEASE entries swap back AT the obstacle exit (no lead — the lead would land the
+      // swap back INSIDE the obstacle); normal gates swap SWITCH_LEAD BEFORE the obstacle.
+      out.push({ x: gate.release ? gate.x : gate.x - SWITCH_LEAD, preset: p });
     }
     return out;
   }

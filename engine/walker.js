@@ -487,6 +487,7 @@ export class Physics {
     this._stepClimbActive = false;   // true while doing the stepped (vs glide) climb on a steep-gated stair run
     this._stepCommitY = null;        // physics-y of the tread top the body is currently STANDING on (advances one tread per plant)
     this._stepLevelY = null;         // eased body-stand level toward _stepCommitY (the visible hold-then-step-up motion)
+    this._stepBodyEasedY = null;     // physics-y of the CUBE BODY centre, eased toward the discrete committed tread (the cube itself STEPS, not just the camera)
     this._stepPlantArmed = true;     // plant-edge hysteresis: armed between plants, fires once per plant to advance the tread
     this._stepProfile = 0;           // last stepped-vs-grounded lift applied (diagnostic for the verifier)
     // ── FIX ㉣ — GRIP-CLIMB leg gait (dwell-reach phase warp) state ──
@@ -799,7 +800,12 @@ export class Physics {
         // here at build time (no per-frame cost). Sign: stairs always rise (height>0),
         // so the run climbs up — |overall slope| = height/length.
         const stairSlope = seg.height / len;             // overall run slope (rise/run, positive = up)
-        const stairSteep = Math.abs(stairSlope) >= TUNE.steepThresh;
+        // HOOK GATE: a staircase forces a HOOK leg either (a) explicitly via seg.hookGate (DECOUPLED
+        // from slope — so GENTLE steps with small risers can still demand a hook for the shape-change
+        // gimmick WITHOUT the steep geometry that forces the body to float to clear the leg's forward
+        // sweep), or (b) implicitly when its overall slope is steep (legacy). Gentle + un-flagged
+        // staircases stay length-gated (any leg climbs), exactly as before.
+        const stairSteep = (seg.hookGate != null) ? !!seg.hookGate : (Math.abs(stairSlope) >= TUNE.steepThresh);
         for (let i = 0; i < steps; i++) {
           surfaceY -= stepH;                // each step rises (y up = negative)
           // CAPTURE the tread top in a per-step CONST — `surfaceY` is a mutating
@@ -3199,6 +3205,7 @@ export class Physics {
         this._stepClimbActive = true;
         this._stepCommitY = treadTop;                      // seed at the current tread (no pop)
         this._stepLevelY = treadTop;
+        this._stepBodyEasedY = groundedY;                  // seed the body ease at the current grounded pose (no pop)
         this._stepPlantArmed = true;
       }
       // PLANT EDGE (cos(2θ) peaks ≈1 at θ≈0,π — a leg straight down catching a step edge): on the
@@ -3227,6 +3234,7 @@ export class Physics {
       this._stepClimbActive = false;
       this._stepCommitY = null;
       this._stepLevelY = null;
+      this._stepBodyEasedY = null;
       this._stepPlantArmed = true;
     }
     // body sits at the grounded (foot-grazing) pose RAISED by the loft AND the grip-cadence hitch
@@ -3235,7 +3243,29 @@ export class Physics {
     // base (below) so the on-screen climb reads as steps; the cube body keeps grazing the real
     // treads (so the foot stays planted, no float-bug).
     this._stepProfile = stepActive ? (this._stepLevelY - reachR - this._bodyBaseY) : 0; // signed: how far the held tread leads the camera (>0 in physics-y = camera below the held tread)
-    this._bodyY = groundedY - this._loft - this._grip;
+    // ── FIX ㉡(2) — STEP THE CUBE BODY ITSELF, not just the camera ──
+    // Earlier the discrete stepping lived ONLY in the camera base while the cube body kept grazing
+    // the smooth surface (_bodyY = groundedY), so the cube GLIDED up the hypotenuse and read as a
+    // SLIDE even with a hook (the user's exact complaint). Here the body's STAND LEVEL eases toward
+    // the discrete committed tread (_stepLevelY): at each PLANT the target jumps up a tread, the body
+    // rises to it (the foot lifts off the lower tread and lands on the higher one — a real step),
+    // then HOLDS as the cube walks forward along that tread → "한 칸씩" cadence. CLAMPED never below
+    // the grounded pose (Math.min on physics-y picks the HIGHER position) ⇒ the foot is never driven
+    // into a riser (zero penetration preserved structurally, regardless of the commit lead).
+    let standY = groundedY;
+    if (stepActive && this._stepBodyEasedY != null) {
+      // TARGET = the tread DIRECTLY UNDER the body (groundSurf), NOT a lead-ahead commit. Sampling the
+      // tread under the cube keeps the body on the step it is actually over (a stepped flat-then-jump
+      // profile), so it can never float far above the staircase (the lead-ahead commit launched the
+      // body several treads up = a fly-up). Easing this stepped target gives "한 칸씩": flat on a tread,
+      // a quick eased RISE as x crosses each riser, flat again. CLAMPED to groundedY (the deepest-foot
+      // grazing level) so a forward foot's clearance is respected ⇒ zero penetration, structurally.
+      const stepTargetY = groundSurf - reachR;              // body centre standing on the tread under it
+      const a = 1 - Math.exp(-TUNE.stepRiseLerp * dt);
+      this._stepBodyEasedY += (stepTargetY - this._stepBodyEasedY) * a;
+      standY = Math.min(this._stepBodyEasedY, groundedY);   // smaller y = higher; never below grounded ⇒ no penetration
+    }
+    this._bodyY = standY - this._loft - this._grip;
     // vertical velocity of the body (for cube.velocity / render) — the loft's rate.
     this._vy = -(this._loft - (this._prevLoft || 0)) / Math.max(1e-4, dt);
     this._prevLoft = this._loft;

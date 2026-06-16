@@ -82,9 +82,11 @@ const TUNE = {
   // ── FORGIVING MOMENTUM (관성) — cube speed is an integrated state easing toward the motor
   // target (the leg/terrain-derived speed). Ramps from rest + builds over continuous running;
   // drag bleeds it; capped (no runaway). momAccel > momDrag ⇒ speeds up faster than it coasts down.
-  momAccel: 4.0,         // 1/s — propulsion ease rate toward the motor target (acceleration / inertia build-up).
-                         // Continuous gait push (alternating feet hand off), not a stuttering pulse. ω tracks the
-                         // resulting speed (no-slip) so the gripping feet drive it.
+  momAccel: 5.0,         // 1/s — peak propulsion ease rate toward the motor target (inertia build-up). Modulated
+                         // by the planted-foot stance (pushStanceFloor..1) so the push ripples with the gait but
+                         // never gaps — continuous alternating-foot drive, not a steady force or a stutter.
+  pushStanceFloor: 0.4,  // min propulsion fraction when no foot is well-planted (the hand-off moment). 0.4 ⇒ the
+                         // push clearly RIPPLES with each footfall (gait feel) but never stutters/dies to a stop.
   momDrag: 2.0,          // 1/s — ease rate toward a LOWER target (coast-down / drag when the motor eases)
   momMaxV: 11.0,         // world-u/s hard cap on the cube's forward speed (forgiving — no runaway)
   // JAM (끼임-정지): when a leg is physically caught on geometry (too-long leg hits a tunnel ceiling,
@@ -2931,7 +2933,15 @@ export class Physics {
           this._v = -TUNE.jamRecoil;                                 // JAM IMPACT — small backward bounce
         } else {
           const tgt = v;
-          const rate = (tgt > this._v) ? TUNE.momAccel : TUNE.momDrag;  // accel toward target; drag when easing
+          // GAIT-DRIVEN PUSH (planted-foot, alternating, CONTINUOUS — not a steady force, not a
+          // gappy pulse): scale the propulsion by how well a foot is PLANTED right now. _supportDepth
+          // is the MAX of the two legs' down-reach, so as the back foot lifts the front foot is
+          // already planting (hand-off) ⇒ it stays high and only RIPPLES → continuous, no stutter,
+          // yet the force comes from the pushing foot. Floored so it never fully gaps.
+          const sup = this._supportDepth(this._theta, this._angle);
+          const stance = clamp01(sup / Math.max(1e-4, this._reach + LEG_LINE_RADIUS));
+          const stanceGate = TUNE.pushStanceFloor + (1 - TUNE.pushStanceFloor) * stance;
+          const rate = (tgt > this._v) ? (TUNE.momAccel * stanceGate) : TUNE.momDrag;  // gait-modulated accel; drag always
           this._v += (tgt - this._v) * (1 - Math.exp(-rate * dt));
         }
         this._wasJammed = jammedNow;

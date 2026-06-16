@@ -82,12 +82,15 @@ const TUNE = {
   // ── FORGIVING MOMENTUM (관성) — cube speed is an integrated state easing toward the motor
   // target (the leg/terrain-derived speed). Ramps from rest + builds over continuous running;
   // drag bleeds it; capped (no runaway). momAccel > momDrag ⇒ speeds up faster than it coasts down.
-  momAccel: 4.5,         // 1/s — propulsion ease rate toward a HIGHER target (acceleration). Boosted because
-                         // it's now GATED by tip-contact (~half-duty, the plant phase), so the peak rate is higher.
+  momAccel: 9.0,         // 1/s — PEAK propulsion ease rate during the push-off. High because the push is now a
+                         // brief PULSE (gated by pushGate ≈ planted^pushPow, ~0 in the swing), so the body surges
+                         // on each footfall and COASTS between — real walk-gait propulsion, not a steady push.
   momDrag: 2.0,          // 1/s — ease rate toward a LOWER target (coast-down / drag when the motor eases)
   momMaxV: 11.0,         // world-u/s hard cap on the cube's forward speed (forgiving — no runaway)
-  tipGripFloor: 0.25,    // min propulsion fraction mid-float (0=propel ONLY at the exact plant, 1=ignore tip phase).
-                         // 0.25 ⇒ a planted stride always bites, with a clear surge-on-footfall pulse.
+  tipGripFloor: 0.02,    // tiny residual push in the swing (anti-stall safety so the cube never fully stops
+                         // between footfalls); near-0 ⇒ propulsion is essentially a pure push-off PULSE.
+  pushPow: 2.5,          // exponent on the plant pulse — higher ⇒ force is CONCENTRATED into the push-off and
+                         // ~0 during the swing (the "딛고 밀 때만" feel). 1 = the old broad/steady push.
   // JAM (끼임-정지): when a leg is physically caught on geometry (too-long leg hits a tunnel ceiling,
   // or a step too tall to climb), the motor STALLS — the leg holds against the obstacle instead of
   // free-rolling through. A small backward recoil bounces the cube on the impact (뒤로 살짝).
@@ -2926,9 +2929,15 @@ export class Physics {
           this._v = -TUNE.jamRecoil;                                 // JAM IMPACT — small backward bounce
         } else {
           const tgt = v;
-          const planted = 0.5 * (1 + Math.cos(2 * this._theta));     // 1 at a foot-plant, 0 mid-float
-          const tipGrip = TUNE.tipGripFloor + (1 - TUNE.tipGripFloor) * planted;
-          const rate = (tgt > this._v) ? (TUNE.momAccel * tipGrip) : TUNE.momDrag;  // propel only on tip-contact; drag always
+          // PUSH-OFF PULSE (실제 걷기처럼): propulsion is given ONLY during the plant / back-foot
+          // push-off (a leg straight down → behind), and ~0 while the leg is in the air swinging
+          // forward — between pushes the cube COASTS on momentum. Not a steady push. `planted`
+          // peaks at each footfall (cos(2θ); two legs 180° out ⇒ a push twice per rotation);
+          // raising it to pushPow concentrates the force into the push-off and drops it to ~0 in
+          // the swing (no floor). momAccel is boosted since the push is now brief.
+          const planted = 0.5 * (1 + Math.cos(2 * this._theta));     // 1 at a foot-plant, 0 mid-swing
+          const pushGate = Math.pow(planted, TUNE.pushPow) + TUNE.tipGripFloor;  // pulse at the push-off, ~0 in swing
+          const rate = (tgt > this._v) ? (TUNE.momAccel * pushGate) : TUNE.momDrag;  // PROPEL only on the push-off; drag always
           this._v += (tgt - this._v) * (1 - Math.exp(-rate * dt));
         }
         this._wasJammed = jammedNow;

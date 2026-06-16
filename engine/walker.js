@@ -82,15 +82,11 @@ const TUNE = {
   // ── FORGIVING MOMENTUM (관성) — cube speed is an integrated state easing toward the motor
   // target (the leg/terrain-derived speed). Ramps from rest + builds over continuous running;
   // drag bleeds it; capped (no runaway). momAccel > momDrag ⇒ speeds up faster than it coasts down.
-  momAccel: 9.0,         // 1/s — PEAK propulsion ease rate during the push-off. High because the push is now a
-                         // brief PULSE (gated by pushGate ≈ planted^pushPow, ~0 in the swing), so the body surges
-                         // on each footfall and COASTS between — real walk-gait propulsion, not a steady push.
+  momAccel: 4.0,         // 1/s — propulsion ease rate toward the motor target (acceleration / inertia build-up).
+                         // Continuous gait push (alternating feet hand off), not a stuttering pulse. ω tracks the
+                         // resulting speed (no-slip) so the gripping feet drive it.
   momDrag: 2.0,          // 1/s — ease rate toward a LOWER target (coast-down / drag when the motor eases)
   momMaxV: 11.0,         // world-u/s hard cap on the cube's forward speed (forgiving — no runaway)
-  tipGripFloor: 0.02,    // tiny residual push in the swing (anti-stall safety so the cube never fully stops
-                         // between footfalls); near-0 ⇒ propulsion is essentially a pure push-off PULSE.
-  pushPow: 2.5,          // exponent on the plant pulse — higher ⇒ force is CONCENTRATED into the push-off and
-                         // ~0 during the swing (the "딛고 밀 때만" feel). 1 = the old broad/steady push.
   // JAM (끼임-정지): when a leg is physically caught on geometry (too-long leg hits a tunnel ceiling,
   // or a step too tall to climb), the motor STALLS — the leg holds against the obstacle instead of
   // free-rolling through. A small backward recoil bounces the cube on the impact (뒤로 살짝).
@@ -2924,20 +2920,18 @@ export class Physics {
         // twice per rotation ⇒ propulsion PULSES with the gait (surge on each footfall, coast between)
         // — forward on tip-contact, not on a mid-leg/body touch. Drag always applies; floored so a
         // planted stride always bites.
+        // SMOOTH GAIT MOMENTUM (continuous, alternating-foot push — NOT a stuttering pulse): the
+        // cube's speed EASES toward the motor target (the back foot's push hands off to the front
+        // foot, so propulsion is continuous — never a dead gap), bleeding via drag when the motor
+        // eases. Builds from rest (inertia ⇒ 점점 빨라짐). The leg ω (section b) TRACKS this _v so
+        // the gripping feet (no-slip) drive it continuously — gait-driven, not a steady force, not
+        // a gappy pulse (the user: '속도가 죽거나 멈칫거리는건 안 돼').
         const jammedNow = this._blockedByTunnel || this._blockedByRiser;
         if (jammedNow && !this._wasJammed) {
           this._v = -TUNE.jamRecoil;                                 // JAM IMPACT — small backward bounce
         } else {
           const tgt = v;
-          // PUSH-OFF PULSE (실제 걷기처럼): propulsion is given ONLY during the plant / back-foot
-          // push-off (a leg straight down → behind), and ~0 while the leg is in the air swinging
-          // forward — between pushes the cube COASTS on momentum. Not a steady push. `planted`
-          // peaks at each footfall (cos(2θ); two legs 180° out ⇒ a push twice per rotation);
-          // raising it to pushPow concentrates the force into the push-off and drops it to ~0 in
-          // the swing (no floor). momAccel is boosted since the push is now brief.
-          const planted = 0.5 * (1 + Math.cos(2 * this._theta));     // 1 at a foot-plant, 0 mid-swing
-          const pushGate = Math.pow(planted, TUNE.pushPow) + TUNE.tipGripFloor;  // pulse at the push-off, ~0 in swing
-          const rate = (tgt > this._v) ? (TUNE.momAccel * pushGate) : TUNE.momDrag;  // PROPEL only on the push-off; drag always
+          const rate = (tgt > this._v) ? TUNE.momAccel : TUNE.momDrag;  // accel toward target; drag when easing
           this._v += (tgt - this._v) * (1 - Math.exp(-rate * dt));
         }
         this._wasJammed = jammedNow;

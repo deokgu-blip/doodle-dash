@@ -3,7 +3,7 @@
   "theme": "first-steps",
   "startX": 0,
   "finishX": 226,
-  "_design": "SHAPE-CHANGING RHYTHM (user principle: every gimmick must force a leg-shape change). The required leg cycles SHORT(tunnel) → LONG(gap/planks) → HOOK(stairs) so the player redraws at almost every beat. STAIRS are HOOK-GATED (hookGate:true, DECOUPLED from slope): a flat/long leg slips & jams at the foot, only a HOOK grips the step edges & climbs. The risers are kept GENTLE (0.5u) so the body does NOT have to float to clear the spinning leg's forward sweep — the cube STEPS tread-by-tread (its stand level tracks the tread directly under it, eased = 한 칸씩, hook legs visibly catching each step) instead of sliding up the hypotenuse (the user's repeated complaint). balls/blocks/bumps are no-gate TEXTURE breathers between forcing gimmicks. Each stairs run is paired with a matched DOWN ramp so the vertical profile stays bounded.",
+  "_design": "SHAPE-CHANGING RHYTHM (user principle: every gimmick must force a leg-shape change). The required leg cycles SHORT(tunnel) → LONG(gap/planks/stairs) so the player redraws at almost every beat. STAIRS are GENTLE + LENGTH-gated (riser 0.5u): ANY sufficiently-long leg climbs (no fragile hook-shape gate — the angle/sharpness metric could not tell a hand-drawn hook from a round arc, so it wrongly rejected real hooks and the user 'couldn't climb'); a TOO-SHORT leg can't reach the next tread ⇒ jams (redraw longer — the shape-change beat right after the tunnel's short leg). The real anti-slide fix is the STEPPED-BODY-DRIVE: the cube's stand level eases to the tread directly under it (한 칸씩, hold-then-rise per tread) so it STEPS up tread-by-tread for EVERY leg shape (float <0.7u, zero penetration) instead of sliding smoothly up the hypotenuse (the user's repeated complaint). The gentle riser keeps the float small. balls/blocks/bumps are no-gate TEXTURE breathers. Each stairs run is paired with a matched DOWN ramp so the vertical profile stays bounded.",
   "segments": [
     { "kind": "flat", "length": 13, "rough": 0.9, "_note": "START lead-in — run straight, draw the first leg." },
 
@@ -11,7 +11,7 @@
     { "kind": "flat", "length": 5, "rough": 0.9 },
     { "kind": "gap", "width": 9, "depth": 4, "rough": 0.9, "_note": "LONG — leap the V-trench; a short leg drops in and crawls (slow)." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
-    { "kind": "stairs", "length": 4.3, "height": 2.0, "steps": 4, "hookGate": true, "rough": 0.9, "_note": "STAIRS climb — HOOK-gated (계단형). riser 0.5u / run ~1.08u. hookGate:true forces a HOOK shape (decoupled from slope): a flat/long leg SLIPS & jams at the foot, only a hook GRIPS the step edges & climbs. GENTLE riser (0.5) keeps the body from floating to clear the leg's forward sweep, so the cube STEPS tread-by-tread (the body's stand level tracks the tread directly under it, eased = 한 칸씩) with the hook legs visibly catching each step — NOT a smooth slide up the hypotenuse. Climb only on the tread face." },
+    { "kind": "stairs", "length": 4.3, "height": 2.0, "steps": 4, "rough": 0.9, "_note": "STAIRS climb (계단형) — GENTLE + length-gated. riser 0.5u / run ~1.08u. ANY sufficiently-long leg climbs (the user's hook, a long leg, etc. — no fragile hook-shape gate that rejected hand-drawn hooks); a TOO-SHORT leg can't reach the next tread ⇒ jams (redraw longer — the shape-change beat after the tunnel's short leg). The GENTLE riser (0.5) + the stepped-body-drive make the cube STEP tread-by-tread (its stand level eases to the tread directly under it = 한 칸씩, float <0.7u, zero penetration) instead of sliding up the hypotenuse — the fix for the user's slide complaint, for EVERY leg shape." },
     { "kind": "ramp", "length": 5, "height": -2.0, "rough": 0.9, "_note": "recovery DOWN ramp (slope 0.4, descending ⇒ NOT gated). Matched to the stairs rise so the vertical profile stays bounded." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
     { "kind": "flat", "length": 9, "rough": 0.9, "_note": "ICE gimmick REMOVED per user request — was a slippery 'ice' segment; replaced with flat (same length) so the course/finishX is unchanged. Ice engine code kept dormant." },
@@ -23,7 +23,7 @@
     { "kind": "flat", "length": 13, "rough": 0.9, "_note": "clean RUN-OUT after the ball pile (≥11u so the cube outruns the forward-scattered balls and clearly recovers speed before the next gimmick — recovery window sits in here, away from the next gate's descent)." },
     { "kind": "gap", "width": 9, "depth": 4.5, "rough": 0.9, "_note": "LONG" },
     { "kind": "flat", "length": 5, "rough": 0.9 },
-    { "kind": "stairs", "length": 4.3, "height": 2.0, "steps": 4, "hookGate": true, "rough": 0.9, "_note": "STAIRS climb — HOOK-gated (계단형). riser 0.5u. A flat leg slips & jams; a hook grips the edges & STEPS up tread-by-tread." },
+    { "kind": "stairs", "length": 4.3, "height": 2.0, "steps": 4, "rough": 0.9, "_note": "STAIRS climb (계단형) — GENTLE + length-gated. riser 0.5u. Any long-enough leg climbs; the stepped-body-drive makes it STEP up tread-by-tread (not slide). Too-short jams." },
     { "kind": "ramp", "length": 5, "height": -2.0, "rough": 0.9, "_note": "recovery DOWN ramp (matched to the stairs rise)." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
     { "kind": "flat", "length": 9, "rough": 0.9, "_note": "ICE removed → flat (same length)." },
@@ -36,7 +36,7 @@
 
     { "kind": "tunnel", "length": 8, "clearance": 0.9, "rough": 0.9, "_note": "SHORT" },
     { "kind": "flat", "length": 4, "rough": 0.9 },
-    { "kind": "stairs", "length": 4, "height": 2.0, "steps": 4, "hookGate": true, "rough": 0.9, "_note": "STAIRS climb — HOOK-gated (계단형). riser 0.5u. A flat leg slips & jams; a hook grips the edges & STEPS up tread-by-tread." },
+    { "kind": "stairs", "length": 4, "height": 2.0, "steps": 4, "rough": 0.9, "_note": "STAIRS climb (계단형) — GENTLE + length-gated. riser 0.5u. Any long-enough leg climbs; the stepped-body-drive makes it STEP up tread-by-tread (not slide). Too-short jams." },
     { "kind": "ramp", "length": 5, "height": -2.0, "rough": 0.9, "_note": "recovery DOWN ramp (matched to the stairs rise)." },
     { "kind": "flat", "length": 5, "rough": 0.9 },
     { "kind": "flat", "length": 8, "rough": 0.9, "_note": "ICE removed → flat (same length)." },

@@ -1538,11 +1538,11 @@ export class Renderer {
     // and a long stretch of the winding ribbon(s) is visible, like the reference clip. Racing
     // pulls back MORE + looks toward the mid-point between the lanes so BOTH the player and the
     // far-side rival track frame together.
-    const BEHIND_T = -5.0;
-    const SIDE_LAT = racing ? 17.5 : 15.0;
-    const camYoff = racing ? 8.0 : 7.0;
-    const FWD_T = 2.0;
-    const lookLat = racing ? this.rivalLaneZ * 0.42 : 0;
+    const BEHIND_T = -2.5;                          // less "chase from behind" → more SIDE-ON (travel reads left→right, not diagonal)
+    const SIDE_LAT = racing ? 16.0 : 15.0;          // side distance → moderate zoom (character reads clearly, like reference)
+    const camYoff = racing ? 5.5 : 5.0;             // lower → side profile (was looking down = diagonal bands)
+    const FWD_T = 2.5;
+    const lookLat = 0;                              // look straight at the PLAYER (not the rival midpoint) → side-on, not angled
     const cosH = Math.cos(hc), sinH = Math.sin(hc);
     // path-local basis in the horizontal (XZ) plane:
     //   tangent  T   = ( cosH, sinH)   (+x at hc=0)
